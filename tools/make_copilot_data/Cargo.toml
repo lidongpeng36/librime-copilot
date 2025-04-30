@@ -1,5 +1,5 @@
 [package]
-name = "make_copilot_data"
+name = "make_predict_data"
 version = "0.1.0"
 edition = "2018"
 

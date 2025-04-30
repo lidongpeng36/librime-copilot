@@ -7,9 +7,9 @@ use std::iter::FromIterator;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
-type CopilotData = BTreeMap<String, Vec<(String, u32)>>;
+type PredictData = BTreeMap<String, Vec<(String, u32)>>;
 
-fn add_record(data: &mut CopilotData, key: &str, value: &str, weight: u32) {
+fn add_record(data: &mut PredictData, key: &str, value: &str, weight: u32) {
     if let Some(ref mut entry) = data.get_mut(key) {
         if let Some(ref mut r) = entry.iter_mut().find(|r| r.0 == value) {
             if r.1 < weight {
@@ -39,7 +39,7 @@ struct Cli {
 fn main() -> Result<()> {
     env_logger::init();
     let args = Cli::from_args();
-    let mut data = CopilotData::new();
+    let mut data = PredictData::new();
     for file_path in args.input_files {
         info!("reading file {:?}", file_path);
         let file = File::open(file_path)?;

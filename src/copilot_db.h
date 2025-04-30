@@ -2,14 +2,14 @@
 #define RIME_PREDICT_DB_H_
 
 #include <darts.h>
-#include <rime/resource.h>
 #include <rime/dict/mapped_file.h>
 #include <rime/dict/string_table.h>
 #include <rime/dict/table.h>
+#include <rime/resource.h>
 
 namespace rime {
 
-namespace predict {
+namespace copilot {
 
 struct Metadata {
   static const int kFormatMaxLength = 32;
@@ -30,26 +30,23 @@ struct RawEntry {
 
 using RawData = map<string, vector<RawEntry>>;
 
-}  // namespace predict
+}  // namespace copilot
 
-class PredictDb : public MappedFile {
+class CopilotDb : public MappedFile {
  public:
-  PredictDb(const path& file_path)
-      : MappedFile(file_path),
-        key_trie_(new Darts::DoubleArray),
-        value_trie_(new StringTable) {}
+  CopilotDb(const path& file_path)
+      : MappedFile(file_path), key_trie_(new Darts::DoubleArray), value_trie_(new StringTable) {}
 
   bool Load();
   bool Save();
-  bool Build(const predict::RawData& data);
-  predict::Candidates* Lookup(const string& query);
+  bool Build(const copilot::RawData& data);
+  copilot::Candidates* Lookup(const string& query);
   string GetEntryText(const ::rime::table::Entry& entry);
 
  private:
-  int WriteCandidates(const vector<predict::RawEntry>& candidates,
-                      const table::Entry* entry);
+  int WriteCandidates(const vector<copilot::RawEntry>& candidates, const table::Entry* entry);
 
-  predict::Metadata* metadata_ = nullptr;
+  copilot::Metadata* metadata_ = nullptr;
   the<Darts::DoubleArray> key_trie_;
   the<StringTable> value_trie_;
 };

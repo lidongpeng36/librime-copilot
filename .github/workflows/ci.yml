@@ -29,7 +29,7 @@ jobs:
       - name: Checkout last commit
         uses: actions/checkout@v4
         with:
-          path: plugins/predict
+          path: plugins/copilot
 
       - name: Install dependency
         run: ./action-install-linux.sh
@@ -44,8 +44,8 @@ jobs:
         run: |
           wget https://github.com/rime/librime-predict/releases/download/data-1.0/predict.txt
           wget -O release.db https://github.com/rime/librime-predict/releases/download/data-1.0/predict.db
-          cat predict.txt | ../plugins/predict/bin/build_predict
-          diff predict.db release.db
+          cat predict.txt | ../plugins/predict/bin/build_copilot
+          diff copilot.db release.db
 
       - name: Test
         working-directory: build/bin

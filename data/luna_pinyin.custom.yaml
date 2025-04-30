@@ -1,10 +1,10 @@
 patch:
-  'engine/processors/@after 0': predictor
-  'engine/translators/@before 0': predict_translator
+  'engine/processors/@after 0': copilot
+  'engine/translators/@before 0': copilot_translator
   'switches/+':
-    - name: prediction
+    - name: copilot
       reset: 1
-  predictor:
-    db: predict.db
+  copilot:
+    db: copilot.db
     max_iterations: 3
     max_candidates: 10
