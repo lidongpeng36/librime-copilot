@@ -105,6 +105,7 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   string db_name = "copilot.db";
   int max_candidates = 0;
   int max_iterations = 0;
+  int max_hints = 0;
 
   string model_name = "";
   int n_predict = 8;
@@ -115,6 +116,9 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     }
     if (!config->GetInt("copilot/max_candidates", &max_candidates)) {
       LOG(INFO) << "copilot/max_candidates is not set in schema";
+    }
+    if (!config->GetInt("copilot/max_hints", &max_iterations)) {
+      LOG(INFO) << "copilot/max_hints is not set in schema";
     }
     if (!config->GetInt("copilot/max_iterations", &max_iterations)) {
       LOG(INFO) << "copilot/max_iterations is not set in schema";
@@ -136,7 +140,7 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   if (auto db = db_pool_.GetDb(db_name)) {
     if (db->IsOpen() || db->Load()) {
       LOG(INFO) << "[copilot] DB: " << db_name;
-      providers.push_back(std::make_shared<DBProvider>(db, max_candidates));
+      providers.push_back(std::make_shared<DBProvider>(db, history, max_candidates, max_hints));
     } else {
       LOG(ERROR) << "failed to load copilot db: " << db_name;
     }

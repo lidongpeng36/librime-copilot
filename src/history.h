@@ -19,6 +19,7 @@ class History {
   bool empty() const { return pos_.empty(); }
   std::string back() const;
   std::string gets(size_t n) const;
+  std::string get_chars(size_t n) const;
 
   struct Pos {
     size_t total;

@@ -214,4 +214,30 @@ std::string History::gets(size_t n) const {
   return input_.substr(input_.size() - pos);
 }
 
+std::string History::get_chars(size_t n) const {
+  if (pos_.empty()) {
+    return "";
+  }
+  int pos = 0;
+  for (int j = pos_.size() - 1; j >= 0; --j) {
+    auto& p = pos_[j].pos;
+    if (p.empty()) {
+      continue;
+    }
+    if (p.size() <= n) {
+      pos += pos_[j].total;
+      n -= p.size();
+      if (n == 0) {
+        break;
+      }
+      continue;
+    }
+    for (size_t i = p.size() - n; i < p.size(); ++i) {
+      pos += p[i];
+    }
+    break;
+  }
+  return input_.substr(input_.size() - pos);
+}
+
 }  // namespace copilot
