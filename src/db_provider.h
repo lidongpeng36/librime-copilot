@@ -10,7 +10,11 @@ namespace rime {
 
 class DBProvider : public Provider {
  public:
-  DBProvider(const std::shared_ptr<CopilotDb>& db, int max) : db_(db), max_candidates_(max) {}
+  DBProvider(const std::shared_ptr<CopilotDb>& db, int max) : db_(db) {
+    if (max > 0) {
+      max_candidates_ = max;
+    }
+  }
   virtual ~DBProvider() = default;
 
   void Clear() override { candidates_.clear(); }

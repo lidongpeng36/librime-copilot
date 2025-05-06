@@ -31,8 +31,8 @@ Copilot::~Copilot() {
 
 static inline bool IsNavigationKey(const KeyEvent& key_event) {
   auto keycode = key_event.keycode();
-  return key_event.ctrl() &&
-         (keycode == XK_f || keycode == XK_b || keycode == XK_n || keycode == XK_p);
+  // return (keycode >= XK_Up && keycode <= XK_Down);
+  return (keycode >= XK_Left && keycode <= XK_Begin);
 }
 
 static inline bool IsContinuingInput(const KeyEvent& key_event) {
@@ -40,9 +40,10 @@ static inline bool IsContinuingInput(const KeyEvent& key_event) {
     return true;
   }
   auto keycode = key_event.keycode();
+  bool is_modifier = keycode >= XK_Shift_L && keycode <= XK_Hyper_R;
   bool is_alphabet = ((keycode >= XK_0 && keycode <= XK_9) ||
                       (keycode >= XK_a && keycode <= XK_z) || (keycode >= XK_A && keycode <= XK_Z));
-  return is_alphabet;
+  return is_modifier || is_alphabet;
 }
 
 ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
@@ -55,6 +56,7 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
   // LOG(INFO) << "IsCompusing: " << ctx->IsComposing() << ", HasMenu:" << ctx->HasMenu()
   //           << ", Preedit:" << ctx->GetPreedit().text;
 
+  // LOG(INFO) << "Modifier: " << key_event.modifier() << ", Keycode: " << key_event.keycode();
   auto keycode = key_event.keycode();
   if (keycode == XK_BackSpace) {
     last_action_ = kDelete;
@@ -78,7 +80,8 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
   }
   bool is_punct =
       (keycode > XK_space && keycode <= XK_slash) || (keycode >= XK_colon && keycode <= XK_at);
-  if (keycode == XK_Escape || keycode == XK_Return || keycode == XK_KP_Enter || is_punct) {
+  // if (keycode == XK_Escape || keycode == XK_Return || keycode == XK_KP_Enter || is_punct) {
+  if (!IsContinuingInput(key_event)) {
     last_action_ = kSpecial;
     copilot_engine_->Clear();
     iteration_counter_ = 0;

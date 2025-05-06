@@ -66,7 +66,7 @@ void LLMProvider::Backspace(const std::shared_ptr<Session>& session) {}
 void LLMProvider::Commit(const std::string& input, const std::shared_ptr<Session>& session) {
   constexpr size_t kMaxHistory = 5;
   std::string prompt = history_->gets(kMaxHistory);
-  LOG(INFO) << "[LLM] Prompt: '" << prompt << "'";
+  DLOG(INFO) << "[LLM] Prompt: '" << prompt << "'";
   session->response.clear();
   session->promise = std::make_shared<std::promise<std::string>>();
   session->future = session->promise->get_future().share();
@@ -136,7 +136,7 @@ bool LLMProvider::Predict(const std::string& input) {
     return false;
   }
   std::string prompt = history_->gets(kMaxHistory);
-  LOG(INFO) << "[LLM] Predict: '" << prompt << "'";
+  DLOG(INFO) << "[LLM] Predict: '" << prompt << "'";
   client_->clear();
   promise_ = std::make_shared<std::promise<std::string>>();
   future_ = promise_->get_future().share();
@@ -160,7 +160,7 @@ std::vector<copilot::Entry> LLMProvider::Retrive(int timeout_us) const {
 #else
   auto response = GetResults(session_, timeout_us);
 #endif
-  LOG(INFO) << "[LLM] response: '" << response << "'";
+  DLOG(INFO) << "[LLM] response: '" << response << "'";
   if (response.empty()) {
     return {};
   }

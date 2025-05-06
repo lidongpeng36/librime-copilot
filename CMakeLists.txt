@@ -3,11 +3,13 @@ cmake_minimum_required(VERSION 3.10)
 
 option(BUILD_TOOLS "Build tools" ON)
 
-# ✨ 加载 LlamaConfig
-if(NOT DEFINED LLAMA_DIR)
-  set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp")
-endif()
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/LlamaConfig.cmake)
+set(BUILD_SHARED_LIBS OFF)
+include(FetchContent)
+FetchContent_Declare(
+  llama
+  GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
+  GIT_TAG b5289)
+FetchContent_MakeAvailable(llama)
 
 aux_source_directory(src copilot_src)
 
