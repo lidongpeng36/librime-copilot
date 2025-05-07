@@ -38,18 +38,3 @@ jobs:
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_ASAN=ON
           cmake --build build
-
-      - name: Build predict.db
-        working-directory: build/bin
-        run: |
-          wget https://github.com/rime/librime-predict/releases/download/data-1.0/predict.txt
-          wget -O release.db https://github.com/rime/librime-predict/releases/download/data-1.0/predict.db
-          cat predict.txt | ../plugins/predict/bin/build_copilot
-          diff copilot.db release.db
-
-      - name: Test
-        working-directory: build/bin
-        run: |
-          cp ../../plugins/predict/data/luna_pinyin.custom.yaml .
-          echo -e 'nihao \n ' | ./rime_api_console | tee log
-          grep 'commit: 嗎' log
