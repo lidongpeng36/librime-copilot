@@ -36,11 +36,10 @@ class DBProvider : public Provider {
       return result;
     }
     uint32_t size = std::min(candidates->size, max_candidates_);
-    result.resize(size);
     auto* it = candidates->begin();
     for (uint32_t i = 0; i < size; ++i, ++it) {
       auto text = db_->GetEntryText(*it);
-      result.push_back({text, it->weight});
+      result.push_back({text, it->weight, ::copilot::ProviderType::kDB});
     }
     return result;
   }

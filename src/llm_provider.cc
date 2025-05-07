@@ -38,18 +38,20 @@ inline std::string StripAndNormalize(const std::string& input) {
 }
 }  // namespace
 
-LLMProvider::LLMProvider(const std::string& model,
-                         const std::shared_ptr<::copilot::History>& history, int n_predict)
-    : model_(model), history_(history), n_predict_(n_predict) {
+LLMProvider::LLMProvider(const Config& c, const std::shared_ptr<::copilot::History>& history)
+    : config_(c), history_(history) {
+  --config_.rank;
 #ifdef USE_SIMPLE_CLIENT
   ClientConfig config;
-  config.n_predict = n_predict_;
-  client_ =
-      std::make_unique<llama::ClientSimple>(config, model_, [this](const std::string& response) {
-        if (promise_) {
-          promise_->set_value(response);
-        }
-      });
+  config.n_predict = c.n_predict;
+  LOG(INFO) << "LLM model: '" << config_.model << "', n_predict:" << config_.n_predict
+            << ", rank:" << config_.rank;
+  client_ = std::make_unique<llama::ClientSimple>(config, config_.model,
+                                                  [this](const std::string& response) {
+                                                    if (promise_) {
+                                                      promise_->set_value(response);
+                                                    }
+                                                  });
   client_->commit("WarmUp");
   client_->clear();
 #else
@@ -64,8 +66,7 @@ LLMProvider::~LLMProvider() {}
 void LLMProvider::Backspace(const std::shared_ptr<Session>& session) {}
 
 void LLMProvider::Commit(const std::string& input, const std::shared_ptr<Session>& session) {
-  constexpr size_t kMaxHistory = 5;
-  std::string prompt = history_->gets(kMaxHistory);
+  std::string prompt = history_->gets(config_.max_history);
   DLOG(INFO) << "[LLM] Prompt: '" << prompt << "'";
   session->response.clear();
   session->promise = std::make_shared<std::promise<std::string>>();
@@ -103,12 +104,12 @@ std::shared_ptr<LLMProvider::Session> LLMProvider::CreateSession(const std::stri
   session->history = std::make_shared<::copilot::History>(100);
   ClientConfig config;
   config.apply_chat_template = false;
-  config.n_predict = n_predict_;
+  config.n_predict = config_.n_predict;
   config.no_perf = false;
 
   auto& manager = llama::LLMManager::Instance();
   std::weak_ptr<Session> weak_session = session;
-  session->client = manager.CreateClient(model_, app_id, config, nullptr,
+  session->client = manager.CreateClient(config_.model, app_id, config, nullptr,
                                          [weak_session](const std::string& response) {
                                            if (auto session = weak_session.lock()) {
                                              session->promise->set_value(response);
@@ -131,11 +132,10 @@ void LLMProvider::Clear(const std::shared_ptr<Session>& session) { session->clie
 
 bool LLMProvider::Predict(const std::string& input) {
 #ifdef USE_SIMPLE_CLIENT
-  constexpr size_t kMaxHistory = 10;
   if (history_->size() < 3) {
     return false;
   }
-  std::string prompt = history_->gets(kMaxHistory);
+  std::string prompt = history_->gets(config_.max_history);
   DLOG(INFO) << "[LLM] Predict: '" << prompt << "'";
   client_->clear();
   promise_ = std::make_shared<std::promise<std::string>>();
@@ -164,7 +164,7 @@ std::vector<copilot::Entry> LLMProvider::Retrive(int timeout_us) const {
   if (response.empty()) {
     return {};
   }
-  return {copilot::Entry{response, 4.0}};
+  return {copilot::Entry{response, 4.0, copilot::ProviderType::kLLM}};
 }
 
 }  // namespace rime

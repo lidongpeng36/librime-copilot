@@ -17,8 +17,13 @@ namespace rime {
 
 class LLMProvider : public Provider {
  public:
-  LLMProvider(const std::string& model, const std::shared_ptr<::copilot::History>& history,
-              int n_predict = 8);
+  struct Config {
+    std::string model;
+    int max_history = 10;
+    int n_predict = 8;
+    int rank = 5;
+  };
+  LLMProvider(const Config& config, const std::shared_ptr<::copilot::History>& history);
   virtual ~LLMProvider();
 
   // 提交输入，异步发起推理
@@ -34,6 +39,7 @@ class LLMProvider : public Provider {
 
   // Provider interface
   void OnBackspace() override {}
+  int Rank() const override { return config_.rank; }
   bool Predict(const std::string& input) override;
   std::vector<::copilot::Entry> Retrive(int timeout_us) const override;
 
@@ -60,8 +66,7 @@ class LLMProvider : public Provider {
   std::shared_ptr<Session> session_;
   std::shared_ptr<::copilot::History> history_;
 
-  std::string model_;
-  int n_predict_;
+  Config config_;
 
   std::unique_ptr<llama::ClientSimple> client_;
   std::shared_ptr<std::promise<std::string>> promise_;

@@ -1,5 +1,7 @@
 #include "copilot_engine.h"
 
+#include <map>
+
 #include <rime/candidate.h>
 #include <rime/context.h>
 #include <rime/dict/db_pool_impl.h>
@@ -11,7 +13,6 @@
 #include <rime/service.h>
 #include <rime/ticket.h>
 #include <rime/translation.h>
-#include "copilot_db.h"
 
 #include "db_provider.h"
 #include "llm_provider.h"
@@ -76,19 +77,47 @@ void CopilotEngine::BackSpace() {
 }
 
 const std::vector<::copilot::Entry>& CopilotEngine::candidates() {
-  // if (!cands_.empty()) {
-  //   return cands_;
-  // }
   cands_.clear();
+
+  std::multimap<size_t, std::vector<::copilot::Entry>> ranks;
   for (auto& provider : providers_) {
     auto cands = provider->Retrive(200'000);
-    if (!cands.empty()) {
+    if (cands.empty()) {
+      continue;
+    }
+    if (provider->Rank() > 0) {
+      ranks.emplace(provider->Rank(), std::move(cands));
+    } else {
       cands_.insert(cands_.end(), cands.begin(), cands.end());
     }
   }
   std::sort(cands_.begin(), cands_.end(), [](const ::copilot::Entry& a, const ::copilot::Entry& b) {
     return a.weight < b.weight;
   });
+  for (auto& rank : ranks) {
+    auto& entries = rank.second;
+    std::sort(
+        entries.begin(), entries.end(),
+        [](const ::copilot::Entry& a, const ::copilot::Entry& b) { return a.weight < b.weight; });
+    size_t pos = std::min(rank.first, cands_.size());
+    cands_.insert(cands_.begin() + pos, entries.begin(), entries.end());
+  }
+
+  /*
+  for (size_t i = 0; i < cands_.size(); ++i) {
+    if (cands_[i].text.empty()) {
+      continue;
+    }
+    size_t n = std::min(i + 15, cands_.size());
+    std::stringstream ss;
+    for (int j = i; j < n; ++j) {
+      ss << "\n* " << j + 1 << ":" << cands_[j];
+    }
+    LOG(INFO) << "candidates:" << ss.str();
+    break;
+  }
+  */
+
   return cands_;
 }
 
@@ -107,8 +136,8 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   int max_iterations = 0;
   int max_hints = 0;
 
+  LLMProvider::Config llm_config;
   string model_name = "";
-  int n_predict = 8;
   if (auto* schema = ticket.schema) {
     auto* config = schema->config();
     if (config->GetString("copilot/db", &db_name)) {
@@ -123,8 +152,10 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     if (!config->GetInt("copilot/max_iterations", &max_iterations)) {
       LOG(INFO) << "copilot/max_iterations is not set in schema";
     }
-    if (config->GetString("copilot/model", &model_name)) {
-      config->GetInt("copilot/n_predict", &n_predict);
+    if (config->GetString("copilot/llm/model", &model_name)) {
+      config->GetInt("copilot/llm/max_history", &llm_config.max_history);
+      config->GetInt("copilot/llm/n_predict", &llm_config.n_predict);
+      config->GetInt("copilot/llm/rank", &llm_config.rank);
     }
   }
   std::shared_ptr<::copilot::History> history = std::make_shared<::copilot::History>(100);
@@ -134,7 +165,8 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     auto model_path = r->ResolvePath(model_name);
     if (std::filesystem::exists(model_path)) {
       LOG(INFO) << "[copilot] LLM: " << model_path;
-      providers.push_back(std::make_shared<LLMProvider>(model_path, history, n_predict));
+      llm_config.model = model_path;
+      providers.push_back(std::make_shared<LLMProvider>(llm_config, history));
     }
   }
   if (auto db = db_pool_.GetDb(db_name)) {

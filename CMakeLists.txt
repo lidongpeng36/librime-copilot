@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.10)
 
 option(BUILD_TOOLS "Build tools" ON)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(BUILD_SHARED_LIBS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(FetchContent)
