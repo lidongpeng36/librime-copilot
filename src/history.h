@@ -2,9 +2,25 @@
 
 #include <deque>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace copilot {
+
+class UTF8 {
+ public:
+  explicit UTF8(const std::string& data);
+  size_t size() const;
+  std::string_view operator[](int i) const;
+  std::string_view operator()(int start, int end) const;
+
+  std::string_view left() const;
+  std::string_view right() const;
+
+ private:
+  std::string_view data_;
+  std::vector<size_t> pos_;
+};
 
 class History {
  public:
@@ -21,6 +37,8 @@ class History {
   std::string back() const;
   std::string gets(size_t n) const;
   std::string get_chars(size_t n) const;
+
+  std::string_view last() const;
 
   struct Pos {
     size_t total;

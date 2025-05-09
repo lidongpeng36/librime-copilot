@@ -1,5 +1,4 @@
-#ifndef RIME_PREDICTOR_H_
-#define RIME_PREDICTOR_H_
+#pragma once
 
 #include <rime/processor.h>
 
@@ -31,6 +30,9 @@ class Copilot : public Processor {
   connection select_connection_;
   connection context_update_connection_;
   connection delete_connection_;
+
+  int last_keycode_ = 0;
+  std::vector<std::shared_ptr<Processor>> processors_;
 };
 
 class CopilotComponent : public Copilot::Component {
@@ -45,5 +47,3 @@ class CopilotComponent : public Copilot::Component {
 };
 
 }  // namespace rime
-
-#endif  // RIME_PREDICTOR_H_

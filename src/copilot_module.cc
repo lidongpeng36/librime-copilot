@@ -6,6 +6,10 @@
 #include "copilot_engine.h"
 #include "copilot_translator.h"
 
+#include "auto_spacer.h"
+#include "auto_spacer_filter.h"
+#include "select_character.h"
+
 using namespace rime;
 
 static void rime_copilot_initialize() {
@@ -13,6 +17,11 @@ static void rime_copilot_initialize() {
   an<CopilotEngineComponent> engine_factory = New<CopilotEngineComponent>();
   r.Register("copilot", new CopilotComponent(engine_factory));
   r.Register("copilot_translator", new CopilotTranslatorComponent(engine_factory));
+
+  r.Register("auto_spacer", new CopilotPluginComponent<AutoSpacer>());
+  r.Register("select_character", new CopilotPluginComponent<SelectCharacter>());
+
+  r.Register("auto_spacer_filter", new Component<AutoSpacerFilter>);
 }
 
 static void rime_copilot_finalize() {}

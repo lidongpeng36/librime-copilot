@@ -23,23 +23,24 @@ an<Translation> CopilotTranslator::Query(const string& input, const Segment& seg
   }
   // LOG(INFO) << "[copilot] CopilotTranslator::Query: " << input;
   if (copilot_engine_->query().empty()) {
-    // LOG(INFO) << "[copilot] query empty";
     return nullptr;
   }
   if (!segment.HasTag("copilot")) {
-    // LOG(INFO) << "[copilot] no tag";
     return nullptr;
   }
   const auto& candidates = copilot_engine_->candidates();
   if (candidates.empty()) {
-    // LOG(INFO) << "[copilot] candidates empty";
     return nullptr;
   }
   auto translation = New<FifoTranslation>();
   for (const auto& c : candidates) {
     if (c.text.empty()) continue;
     size_t end = segment.end;
-    translation->Append(New<SimpleCandidate>("copilot", end, end, c.text));
+    std::string comment = "";
+    if (c.type == ::copilot::ProviderType::kLLM) {
+      comment = u8"𝓛";
+    }
+    translation->Append(New<SimpleCandidate>("copilot", end, end, c.text, comment));
   }
   return translation;
 }
