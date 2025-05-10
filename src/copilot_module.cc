@@ -8,6 +8,7 @@
 
 #include "auto_spacer.h"
 #include "auto_spacer_filter.h"
+#include "raw_input_filter.h"
 #include "select_character.h"
 
 using namespace rime;
@@ -22,6 +23,7 @@ static void rime_copilot_initialize() {
   r.Register("select_character", new CopilotPluginComponent<SelectCharacter>());
 
   r.Register("auto_spacer_filter", new Component<AutoSpacerFilter>);
+  r.Register("raw_input_filter", new Component<RawInputFilter>);
 }
 
 static void rime_copilot_finalize() {}
