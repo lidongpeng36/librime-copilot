@@ -22,6 +22,7 @@ class LLMProvider : public Provider {
     int max_history = 10;
     int n_predict = 8;
     int rank = 5;
+    bool battery_active = false;
   };
   LLMProvider(const Config& config, const std::shared_ptr<::copilot::History>& history);
   virtual ~LLMProvider();
@@ -67,6 +68,7 @@ class LLMProvider : public Provider {
   std::shared_ptr<::copilot::History> history_;
 
   Config config_;
+  std::atomic<bool> is_on_ac_{true};
 
   std::unique_ptr<llama::ClientSimple> client_;
   std::shared_ptr<std::promise<std::string>> promise_;

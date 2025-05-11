@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include "llm.h"
+#include "utils.h"
 
 #define USE_SIMPLE_CLIENT
 
@@ -59,6 +60,15 @@ LLMProvider::LLMProvider(const Config& c, const std::shared_ptr<::copilot::Histo
   Predict("WarmUp");
   Clear(session_);
 #endif
+  if (!config_.battery_active) {
+    is_on_ac_ = copilot::IsACPowerConnected();
+    copilot::RegisterPowerChange([this](bool is_ac_power) {
+      if (is_ac_power != is_on_ac_) {
+        is_on_ac_ = is_ac_power;
+        DLOG(INFO) << "[LLM]: AC Power Connected:" << is_on_ac_;
+      }
+    });
+  }
 }
 
 LLMProvider::~LLMProvider() {}
@@ -131,6 +141,9 @@ std::shared_ptr<LLMProvider::Session> LLMProvider::GetOrCreateSession(const std:
 void LLMProvider::Clear(const std::shared_ptr<Session>& session) { session->client->clear(); }
 
 bool LLMProvider::Predict(const std::string& input) {
+  if (!is_on_ac_) {
+    return false;
+  }
 #ifdef USE_SIMPLE_CLIENT
   if (history_->size() < 3) {
     return false;
@@ -149,6 +162,9 @@ bool LLMProvider::Predict(const std::string& input) {
 }
 
 std::vector<copilot::Entry> LLMProvider::Retrive(int timeout_us) const {
+  if (!is_on_ac_) {
+    return {};
+  }
 #ifdef USE_SIMPLE_CLIENT
   if (!future_.valid()) {
     return {};

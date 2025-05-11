@@ -133,11 +133,9 @@ CopilotEngineComponent::~CopilotEngineComponent() {}
 CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   std::vector<std::shared_ptr<Provider>> providers;
   string db_name = "copilot.db";
-  int max_candidates = 0;
   int max_iterations = 0;
-  int max_hints = 0;
-  bool enable_llm = false;
 
+  DBProvider::Config db_config;
   LLMProvider::Config llm_config;
   string model_name = "";
   if (auto* schema = ticket.schema) {
@@ -145,10 +143,10 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     if (config->GetString("copilot/db", &db_name)) {
       LOG(INFO) << "custom copilot/db: " << db_name;
     }
-    if (!config->GetInt("copilot/max_candidates", &max_candidates)) {
+    if (!config->GetInt("copilot/max_candidates", &db_config.max_candidates)) {
       LOG(INFO) << "copilot/max_candidates is not set in schema";
     }
-    if (!config->GetInt("copilot/max_hints", &max_hints)) {
+    if (!config->GetInt("copilot/max_hints", &db_config.max_hints)) {
       LOG(INFO) << "copilot/max_hints is not set in schema";
     }
     if (!config->GetInt("copilot/max_iterations", &max_iterations)) {
@@ -158,9 +156,7 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
       config->GetInt("copilot/llm/max_history", &llm_config.max_history);
       config->GetInt("copilot/llm/n_predict", &llm_config.n_predict);
       config->GetInt("copilot/llm/rank", &llm_config.rank);
-      bool battery_active = false;
-      config->GetBool("copilot/llm/battery_active", &battery_active);
-      enable_llm = battery_active || ::copilot::IsACPowerConnected();
+      config->GetBool("copilot/llm/battery_active", &llm_config.battery_active);
     }
   }
   std::shared_ptr<::copilot::History> history = std::make_shared<::copilot::History>(100);
@@ -168,7 +164,7 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     auto r =
         the<ResourceResolver>(Service::instance().CreateResourceResolver(kCopilotLLMResourceType));
     auto model_path = r->ResolvePath(model_name);
-    if (enable_llm && std::filesystem::exists(model_path)) {
+    if (std::filesystem::exists(model_path)) {
       LOG(INFO) << "[copilot] LLM: " << model_path;
       llm_config.model = model_path;
       providers.push_back(std::make_shared<LLMProvider>(llm_config, history));
@@ -177,7 +173,7 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   if (auto db = db_pool_.GetDb(db_name)) {
     if (db->IsOpen() || db->Load()) {
       LOG(INFO) << "[copilot] DB: " << db_name;
-      providers.push_back(std::make_shared<DBProvider>(db, history, max_candidates, max_hints));
+      providers.push_back(std::make_shared<DBProvider>(db, history, db_config));
     } else {
       LOG(ERROR) << "failed to load copilot db: " << db_name;
     }

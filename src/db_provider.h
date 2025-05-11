@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -11,14 +12,18 @@ namespace rime {
 
 class DBProvider : public Provider {
  public:
+  struct Config {
+    int max_candidates = -1;
+    int max_hints = -1;
+  };
   DBProvider(const std::shared_ptr<CopilotDb>& db,
-             const std::shared_ptr<::copilot::History>& history, int max, uint32_t hints)
-      : db_(db), history_(history) {
-    if (max > 0) {
-      max_candidates_ = max;
+             const std::shared_ptr<::copilot::History>& history, const Config& config)
+      : db_(db), history_(history), config_(config) {
+    if (config_.max_candidates <= 0) {
+      config_.max_candidates = std::numeric_limits<int>::max();
     }
-    if (hints > 0) {
-      max_hints_ = std::min<uint32_t>(max_hints_, hints);
+    if (config_.max_hints <= 0) {
+      config_.max_hints = std::numeric_limits<int>::max();
     }
   }
   virtual ~DBProvider() = default;
@@ -35,7 +40,7 @@ class DBProvider : public Provider {
     if (!candidates) {
       return result;
     }
-    uint32_t size = std::min(candidates->size, max_candidates_);
+    uint32_t size = std::min<int>(candidates->size, config_.max_candidates);
     auto* it = candidates->begin();
     for (uint32_t i = 0; i < size; ++i, ++it) {
       auto text = db_->GetEntryText(*it);
@@ -45,8 +50,7 @@ class DBProvider : public Provider {
   }
   std::shared_ptr<CopilotDb> db_;
   std::vector<::copilot::Entry> candidates_;
-  uint32_t max_candidates_ = static_cast<uint32_t>(-1);
-  uint32_t max_hints_ = 10;
+  Config config_;
   std::shared_ptr<::copilot::History> history_;
 };
 
@@ -54,10 +58,10 @@ inline bool DBProvider::Predict(const std::string& input) {
   candidates_.clear();
   auto hist = history_->back();
   auto candidates = Lookup(hist);
-  for (uint32_t i = 2; i < max_hints_; ++i) {
+  for (uint32_t i = 2; i < config_.max_hints; ++i) {
     auto curr = history_->get_chars(i);
     // LOG(INFO) << "DBProvider::Predict: " << i << ", curr: " << curr << ", hist: " << hist
-    //           << " max_hints_: " << max_hints_;
+    //           << " max_hints: " << config_.max_hints;
     if (curr == hist) {
       // LOG(INFO) << "DBProvider::Predict: " << i << ", curr == hist";
       break;
@@ -73,7 +77,7 @@ inline bool DBProvider::Predict(const std::string& input) {
       [](const ::copilot::Entry& a, const ::copilot::Entry& b) { return a.weight > b.weight; });
   candidates_ = {
       candidates.begin(),
-      std::next(candidates.begin(), std::min<uint32_t>(candidates.size(), max_candidates_))};
+      std::next(candidates.begin(), std::min<uint32_t>(candidates.size(), config_.max_candidates))};
   return true;
 }
 
