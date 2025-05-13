@@ -25,6 +25,23 @@ inline std::string AddSpace(int keycode) {
   return " " + std::string(1, static_cast<char>(keycode));
 }
 
+inline bool IsLastCharAlnum(const std::string& str) {
+  if (str.empty()) return false;
+
+  // 从最后一个字节开始向前查找 UTF-8 字符的起始字节
+  int i = static_cast<int>(str.size()) - 1;
+  // 找到首字节标志 (最高位不为 10 的字节)
+  while (i >= 0 && (static_cast<unsigned char>(str[i]) & 0xC0) == 0x80) {
+    --i;
+  }
+  if (i < 0) return false;  // 非法 UTF-8 序列
+
+  unsigned char c = static_cast<unsigned char>(str[i]);
+  if ((c & 0x80) != 0) return false;  // 非 ASCII 字符
+
+  // 判断是否为字母或数字
+  return (('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9'));
+}
 }  // namespace
 
 ProcessResult AutoSpacer::Process(const KeyEvent& key_event) {
@@ -74,6 +91,10 @@ ProcessResult AutoSpacer::Process(const KeyEvent& key_event) {
   ascii_mode_ = ascii_mode;
   has_space_ = has_space;
   if (change_to_ascii_mode) {
+    if (!ctx->commit_history().empty() && IsLastCharAlnum(ctx->commit_history().back().text)) {
+      // LOG(INFO) << "[AutoSpacerProcessor]: last is ascii, skip";
+      return kNoop;
+    }
     engine_->CommitText(AddSpace(keycode));
   } else if (change_from_ascii_mode) {
     ctx->set_input(AddSpace(keycode));
