@@ -152,6 +152,7 @@ bool RawInputFilterTranslation::Replenish() {
     }
   }
   cache_.push_back(raw);
+  cache_.push_back(next);
   return true;
 }
 
