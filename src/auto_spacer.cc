@@ -44,6 +44,57 @@ inline bool IsLastCharAlnum(const std::string& str) {
 }
 }  // namespace
 
+ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
+  const auto keycode = key_event.keycode();
+
+  const auto& latest_text = ctx->commit_history().latest_text();
+
+  const bool ascii_mode = ctx->get_option("ascii_mode");
+  // LOG(INFO) << "[AutoSpacer] " << std::showbase << std::hex << "  keycode=" << keycode
+  //           << ", input='" << ctx->input() << "'"
+  //           << ", prev_ascii_mode=" << ascii_mode_ << ", ascii_mode=" << ascii_mode
+  //           << ", latest_text='" << latest_text << "', modifier=" << key_event.modifier();
+
+  if (latest_text.empty()) {
+    return kNoop;
+  }
+
+  if (IsNumKey(keycode)) {
+    return kNoop;
+  }
+
+  if (IsSpaceKey(keycode)) {
+    return kNoop;
+  }
+
+  if (key_event.modifier()) {
+    return kNoop;
+  }
+
+  const bool is_alphabet = IsAlphabetKey(keycode);
+  if (!is_alphabet) {
+    return kNoop;
+  }
+
+  const bool has_input = !ctx->input().empty();
+  if (!has_input && latest_text != " ") {
+    bool is_last_alnum = IsLastCharAlnum(latest_text);
+    if (is_last_alnum && !ascii_mode) {
+      // LOG(INFO) << "为**中文**添加空格";
+      ctx->set_input(AddSpace(keycode));
+      return kAccepted;
+    }
+
+    if (!is_last_alnum && ascii_mode) {
+      // LOG(INFO) << "为 ascii mode 添加空格";
+      engine_->CommitText(AddSpace(keycode));
+      return kAccepted;
+    }
+  }
+
+  return kNoop;
+}
+
 ProcessResult AutoSpacer::Process(const KeyEvent& key_event) {
   if (!engine_ || key_event.release()) {
     return kNoop;
@@ -52,55 +103,10 @@ ProcessResult AutoSpacer::Process(const KeyEvent& key_event) {
   if (!ctx) {
     return kNoop;
   }
-  const auto keycode = key_event.keycode();
-
   const bool ascii_mode = ctx->get_option("ascii_mode");
-  const bool is_alphabet = IsAlphabetKey(keycode);
-  const bool has_input = !ctx->input().empty();
-
-  // LOG(INFO) << "[AutoSpacer] has_space_=" << has_space_ << std::showbase << std::hex
-  //           << ", keycode=" << keycode << ", input='" << ctx->input() << "'"
-  //           << ", prev_ascii_mode=" << ascii_mode_ << ", ascii_mode=" << ascii_mode;
-
-  bool has_space = has_space_;
-  if (IsSpaceKey(keycode)) {
-    // DLOG(INFO) << "HasMenu: " << ctx->HasMenu() << ", IsComposing: " << ctx->IsComposing()
-    //            << ", Input: '" << ctx->input() << "'";
-    has_space = !has_input;
-  } else if (is_alphabet || keycode == XK_BackSpace || keycode == XK_Delete) {
-    has_space = false;
-  }
-
-  if (ascii_mode_ == ascii_mode || has_space_ || !is_alphabet || count_ == 0) {
-    // LOG(INFO) << "Skip [HasSpace/NoAlpha]: (has_space_ || !is_alphabet || count_==0) = "
-    //           << has_space_ << " || " << !is_alphabet << " || " << count_ << " == 0]";
-    if (ascii_mode_ == ascii_mode) {
-      count_ += (is_alphabet && !has_input) || (IsSelectionKey(keycode) && has_input);
-    } else {
-      count_ = 0;
-    }
-    ascii_mode_ = ascii_mode;
-    has_space_ = has_space;
-    return kNoop;
-  }
-
-  // LOG(INFO) << "MODE CHANGE: ascii_mode=" << ascii_mode << ", count_=" << count_;
-  count_ = 0;
-  bool change_to_ascii_mode = (!ascii_mode_ && ascii_mode);
-  bool change_from_ascii_mode = (ascii_mode_ && !ascii_mode);
+  auto ret = Process(ctx, key_event);
   ascii_mode_ = ascii_mode;
-  has_space_ = has_space;
-  if (change_to_ascii_mode) {
-    if (!ctx->commit_history().empty() && IsLastCharAlnum(ctx->commit_history().back().text)) {
-      // LOG(INFO) << "[AutoSpacerProcessor]: last is ascii, skip";
-      return kNoop;
-    }
-    engine_->CommitText(AddSpace(keycode));
-  } else if (change_from_ascii_mode) {
-    ctx->set_input(AddSpace(keycode));
-  }
-  return kAccepted;
-  // return kNoop;
+  return ret;
 }
 
 }  // namespace rime
