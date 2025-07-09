@@ -4,6 +4,7 @@
 
 namespace rime {
 
+class Context;
 class AutoSpacer : public CopilotPlugin<AutoSpacer> {
  public:
   using CopilotPlugin<AutoSpacer>::CopilotPlugin;
@@ -11,10 +12,8 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
   ProcessResult Process(const KeyEvent& key_event);
 
  private:
+  ProcessResult Process(Context* ctx, const KeyEvent& key_event);
   bool ascii_mode_ = false;
-  bool has_space_ = false;
-
-  int count_ = 0;
 };
 
 }  // namespace rime
