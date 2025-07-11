@@ -25,23 +25,24 @@ inline std::string AddSpace(int keycode) {
   return " " + std::string(1, static_cast<char>(keycode));
 }
 
-inline bool IsLastCharAlnum(const std::string& str) {
-  if (str.empty()) return false;
+inline int LastAsciiCharCode(const std::string& str) {
+  if (str.empty()) return -1;
 
-  // 从最后一个字节开始向前查找 UTF-8 字符的起始字节
   int i = static_cast<int>(str.size()) - 1;
-  // 找到首字节标志 (最高位不为 10 的字节)
-  while (i >= 0 && (static_cast<unsigned char>(str[i]) & 0xC0) == 0x80) {
+  // 回溯查找 UTF-8 字符的起始字节
+  while (i >= 0 && (static_cast<uint8_t>(str[i]) & 0xC0) == 0x80) {
     --i;
   }
-  if (i < 0) return false;  // 非法 UTF-8 序列
+  if (i < 0) return -1;  // 非法 UTF-8 序列
 
-  unsigned char c = static_cast<unsigned char>(str[i]);
-  if ((c & 0x80) != 0) return false;  // 非 ASCII 字符
+  uint8_t c = static_cast<uint8_t>(str[i]);
+  if (c < 0x80) {
+    return c;  // 是 ASCII 字符，直接返回其数值
+  }
 
-  // 判断是否为字母或数字
-  return (('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9'));
+  return -1;  // 非 ASCII 字符
 }
+
 }  // namespace
 
 ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
@@ -64,6 +65,14 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   }
 
   if (IsSpaceKey(keycode)) {
+    if (keycode == XK_Return || keycode == XK_KP_Enter) {
+      ctx->commit_history().push_back({"thru", std::string(1, keycode)});
+    }
+    return kNoop;
+  }
+
+  if (IsSpaceKey(keycode_)) {
+    // LOG(INFO) << "上一个按键是空格键，跳过处理: " << keycode;
     return kNoop;
   }
 
@@ -78,14 +87,14 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
 
   const bool has_input = !ctx->input().empty();
   if (!has_input && latest_text != " ") {
-    bool is_last_alnum = IsLastCharAlnum(latest_text);
-    if (is_last_alnum && !ascii_mode) {
-      // LOG(INFO) << "为**中文**添加空格";
+    const auto last_ascii_char = LastAsciiCharCode(latest_text);
+    if (IsAlphabetKey(last_ascii_char) && !ascii_mode) {
+      // LOG(INFO) << "为**中文**添加空格: " << keycode;
       ctx->set_input(AddSpace(keycode));
       return kAccepted;
     }
 
-    if (!is_last_alnum && ascii_mode) {
+    if (last_ascii_char < 0 && ascii_mode) {
       // LOG(INFO) << "为 ascii mode 添加空格";
       engine_->CommitText(AddSpace(keycode));
       return kAccepted;
@@ -103,9 +112,12 @@ ProcessResult AutoSpacer::Process(const KeyEvent& key_event) {
   if (!ctx) {
     return kNoop;
   }
-  const bool ascii_mode = ctx->get_option("ascii_mode");
   auto ret = Process(ctx, key_event);
-  ascii_mode_ = ascii_mode;
+  ascii_mode_ = ctx->get_option("ascii_mode");
+  const auto& keycode = key_event.keycode();
+  if (keycode < XK_Shift_L) {
+    keycode_ = keycode;
+  }
   return ret;
 }
 

@@ -14,6 +14,7 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
  private:
   ProcessResult Process(Context* ctx, const KeyEvent& key_event);
   bool ascii_mode_ = false;
+  int keycode_ = 0;
 };
 
 }  // namespace rime

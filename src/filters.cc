@@ -53,9 +53,15 @@ an<Translation> TranslationCreator<AutoSpacerFilterTranslation>::operator()(
   if (ctx->commit_history().empty()) {
     return translation;
   }
-  const auto& last = ctx->commit_history().back().text;
+  const auto& latest = ctx->commit_history().back();
+  DLOG(INFO) << "[Filter] latest commit: '" << latest.text << "' [" << latest.type << "]";
+  if (latest.type == "thru") {
+    DLOG(INFO) << "[Filter] last commit is thru. skip";
+    return translation;
+  }
+  const auto& last = latest.text;
   const auto& input = ctx->input();
-  DLOG(INFO) << "last_commit: '" << last << "'" << ", input:'" << ctx->input() << "'";
+  DLOG(INFO) << "[Filter] last_commit: '" << last << "'" << ", input:'" << ctx->input() << "'";
 
   if (last.empty() || std::isspace(static_cast<unsigned char>(last.back()))) {
     return translation;
