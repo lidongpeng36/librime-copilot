@@ -10,13 +10,19 @@ namespace {
 
 inline bool IsNumKey(int keycode) { return (keycode >= XK_0 && keycode <= XK_9); }
 
-inline bool IsAlphabetKey(int keycode) {
-  return (IsNumKey(keycode) || (keycode >= XK_a && keycode <= XK_z) ||
-          (keycode >= XK_A && keycode <= XK_Z));
+inline bool IsLetterKey(int keycode) {
+  return (keycode >= XK_a && keycode <= XK_z) || (keycode >= XK_A && keycode <= XK_Z);
+}
+
+inline bool IsAlphabetKey(int keycode) { return (IsNumKey(keycode) || IsLetterKey(keycode)); }
+
+inline bool IsPunctKey(int keycode) {
+  return keycode == XK_period || keycode == XK_comma || keycode == XK_colon;
 }
 
 inline bool IsSpaceKey(int keycode) {
-  return (keycode == XK_space || keycode == XK_Return || keycode == XK_KP_Enter);
+  return (keycode == XK_space || keycode == XK_Return || keycode == XK_KP_Enter ||
+          keycode == XK_Tab || keycode == XK_ISO_Enter || keycode == XK_KP_Space);
 }
 
 inline bool IsSelectionKey(int keycode) { return IsNumKey(keycode) || IsSpaceKey(keycode); }
@@ -43,6 +49,31 @@ inline int LastAsciiCharCode(const std::string& str) {
   return -1;  // 非 ASCII 字符
 }
 
+inline bool IsDelete(const KeyEvent& key_event) {
+  const auto keycode = key_event.keycode();
+  if (keycode == XK_BackSpace || keycode == XK_Delete || keycode == XK_KP_Delete ||
+      keycode == XK_Clear) {
+    return true;
+  }
+  if (!key_event.ctrl()) {
+    return false;
+  }
+  return (keycode == XK_h || keycode == XK_k);
+}
+
+inline bool IsNavigating(const KeyEvent& key_event) {
+  const auto keycode = key_event.keycode();
+  if ((keycode >= XK_Left && keycode <= XK_Down) || (keycode == XK_Tab) ||
+      (keycode == XK_ISO_Left_Tab)) {
+    return true;
+  }
+  if (!key_event.ctrl()) {
+    return false;
+  }
+  return (keycode == XK_a || keycode == XK_b || keycode == XK_e || keycode == XK_f ||
+          keycode == XK_n || keycode == XK_p);
+}
+
 }  // namespace
 
 ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
@@ -50,13 +81,37 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
 
   const auto& latest_text = ctx->commit_history().latest_text();
 
+  const auto& input = ctx->input();
   const bool ascii_mode = ctx->get_option("ascii_mode");
-  // LOG(INFO) << "[AutoSpacer] " << std::showbase << std::hex << "  keycode=" << keycode
-  //           << ", input='" << ctx->input() << "'"
-  //           << ", prev_ascii_mode=" << ascii_mode_ << ", ascii_mode=" << ascii_mode
-  //           << ", latest_text='" << latest_text << "', modifier=" << key_event.modifier();
+  /*
+  LOG(INFO) << "[AutoSpacer] " << std::showbase << std::hex << " keycode=" << keycode << "("
+            << string(1, keycode) << ")" << ", input='" << input << "'"
+            << ", prev_ascii_mode=" << ascii_mode_ << ", ascii_mode=" << ascii_mode
+            << ", latest_text='" << latest_text << "', modifier=" << key_event.modifier();
+  LOG(INFO) << "prev_input=" << input_ << ", input=" << input;
+  LOG(INFO) << "[AutoSpacer] caret_pos=" << ctx->caret_pos()
+            << ", composition=" << ctx->composition().GetDebugText();
+  */
+
+  // TODO:(@dongpeng) .[中文]
+  if (input[0] == ' ' && IsLetterKey(keycode)) {
+    DLOG(INFO) << "强制刷新";
+    ctx->set_input(input + std::string(1, keycode));
+    return kAccepted;
+  }
 
   if (latest_text.empty()) {
+    return kNoop;
+  }
+
+  if (IsDelete(key_event)) {
+    LOG(INFO) << "按键是 BackSpace 键，清除输入: " << keycode;
+    ctx->commit_history().clear();
+    return kNoop;
+  }
+  if (!ctx->HasMenu() && IsNavigating(key_event)) {
+    DLOG(INFO) << "按键是导航键，跳过处理: " << keycode;
+    ctx->commit_history().clear();
     return kNoop;
   }
 
@@ -65,6 +120,7 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   }
 
   if (IsSpaceKey(keycode)) {
+    DLOG(INFO) << "按键是空格键，跳过处理: " << keycode;
     if (keycode == XK_Return || keycode == XK_KP_Enter) {
       ctx->commit_history().push_back({"thru", std::string(1, keycode)});
     }
@@ -88,8 +144,8 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   const bool has_input = !ctx->input().empty();
   if (!has_input && latest_text != " ") {
     const auto last_ascii_char = LastAsciiCharCode(latest_text);
-    if (IsAlphabetKey(last_ascii_char) && !ascii_mode) {
-      // LOG(INFO) << "为**中文**添加空格: " << keycode;
+    if ((IsAlphabetKey(last_ascii_char) || IsPunctKey(last_ascii_char)) && !ascii_mode) {
+      DLOG(INFO) << "为**中文**添加空格: " << string(1, keycode);
       ctx->set_input(AddSpace(keycode));
       return kAccepted;
     }
@@ -118,6 +174,7 @@ ProcessResult AutoSpacer::Process(const KeyEvent& key_event) {
   if (keycode < XK_Shift_L) {
     keycode_ = keycode;
   }
+  input_ = ctx->input();
   return ret;
 }
 

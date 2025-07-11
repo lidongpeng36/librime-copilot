@@ -21,6 +21,7 @@ class Copilot : public Processor {
   void CopilotAndUpdate(Context* ctx, const string& context_query);
 
  private:
+  ProcessResult RunProcessors(const KeyEvent& key_event);
   enum Action { kUnspecified, kSelect, kDelete, kSpecial };
   Action last_action_ = kUnspecified;
   bool self_updating_ = false;

@@ -43,9 +43,7 @@ inline bool IsContinuingInput(const KeyEvent& key_event) {
   if (IsNavigationKey(keycode)) {
     return true;
   }
-  bool is_modifier = keycode >= XK_Shift_L && keycode <= XK_Hyper_R;
-  bool is_alphabet = ((keycode >= XK_0 && keycode <= XK_9) ||
-                      (keycode >= XK_a && keycode <= XK_z) || (keycode >= XK_A && keycode <= XK_Z));
+  bool is_modifier = (keycode >= XK_Shift_L && keycode <= XK_Hyper_R);
   return is_modifier || IsAlphabetKey(keycode);
 }
 }  // namespace
@@ -69,6 +67,16 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
 Copilot::~Copilot() {
   select_connection_.disconnect();
   context_update_connection_.disconnect();
+}
+
+ProcessResult Copilot::RunProcessors(const KeyEvent& key_event) {
+  for (auto& p : processors_) {
+    auto result = p->ProcessKeyEvent(key_event);
+    if (result != kNoop) {
+      return result;
+    }
+  }
+  return kNoop;
 }
 
 ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
@@ -103,7 +111,6 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
     last_keycode_ = keycode;
     copilot_engine_->Clear();
     iteration_counter_ = 0;
-    auto* ctx = engine_->context();
     if (ctx) {
       if (tag != SegmentTag::kTagAbc) {
         copilot_engine_->BackSpace();
@@ -112,36 +119,33 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
         ctx->Clear();
       }
     }
-    return kNoop;
+    return RunProcessors(key_event);
   }
   if (keycode == XK_space) {
     // 仅在输入状态启用预测: 预测候选仅能通过数字选择
     if (!ctx->input().empty() || IsNavigationKey(last_keycode_)) {
       last_action_ = kUnspecified;
       last_keycode_ = keycode;
-      return kNoop;
+      return RunProcessors(key_event);
     }
   }
 
   last_keycode_ = keycode;
   auto last_action = last_action_;
   last_action_ = kUnspecified;
-  for (auto& p : processors_) {
-    auto result = p->ProcessKeyEvent(key_event);
-    if (result != kNoop) {
-      return result;
-    }
+  auto result = RunProcessors(key_event);
+  if (result != kNoop) {
+    // LOG(INFO) << "Processor result: " << result;
+    return result;
   }
   last_action_ = last_action;
 
-  bool is_punct =
-      (keycode > XK_space && keycode <= XK_slash) || (keycode >= XK_colon && keycode <= XK_at);
   if (!IsContinuingInput(key_event)) {
     last_action_ = kSpecial;
-    last_keycode_ = keycode;
     copilot_engine_->Clear();
     iteration_counter_ = 0;
-    auto* ctx = engine_->context();
+    bool is_punct =
+        (keycode > XK_space && keycode <= XK_slash) || (keycode >= XK_colon && keycode <= XK_at);
     if (is_punct) {
       copilot_engine_->history()->add(std::string(1, static_cast<char>(keycode)));
     }
@@ -194,7 +198,7 @@ void Copilot::OnContextUpdate(Context* ctx) {
   }
   if (last_commit.type == "copilot") {
     int max_iterations = copilot_engine_->max_iterations();
-    iteration_counter_++;
+    ++iteration_counter_;
     if (max_iterations > 0 && iteration_counter_ >= max_iterations) {
       copilot_engine_->Clear();
       iteration_counter_ = 0;
