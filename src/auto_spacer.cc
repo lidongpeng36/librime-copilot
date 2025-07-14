@@ -4,6 +4,9 @@
 #include <rime/engine.h>
 #include <rime/key_event.h>
 
+#include <rime/menu.h>
+#include <rime/schema.h>
+
 namespace rime {
 
 namespace {
@@ -76,6 +79,37 @@ inline bool IsNavigating(const KeyEvent& key_event) {
 
 }  // namespace
 
+ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const int keycode) const {
+  static const auto page_size = engine_->schema()->page_size();
+  int num = keycode - XK_0;
+  const auto& input = ctx->input();
+  if (input.empty()) {
+    return kNoop;
+  }
+  if (num == 0 || num > page_size) {
+    // ctx->set_input(input + std::string(1, keycode));
+    engine_->CommitText(input + std::string(1, keycode));
+    ctx->Clear();
+    return kAccepted;
+  }
+  int n_cand = -1;
+  const auto& composition = ctx->composition();
+  if (!composition.empty()) {
+    int cand_count = composition.back().menu->candidate_count();
+    if (cand_count) {
+      int mod = cand_count % page_size;
+      n_cand = mod == 0 ? page_size : mod;
+    }
+  }
+  DLOG(INFO) << "Input Num=" << num << ", n_cand=" << n_cand;
+  if (num > n_cand && !input.empty()) {
+    engine_->CommitText(input + std::string(1, keycode));
+    ctx->Clear();
+    return kAccepted;
+  }
+  return kNoop;
+}
+
 ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   const auto keycode = key_event.keycode();
 
@@ -93,6 +127,19 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
             << ", composition=" << ctx->composition().GetDebugText();
   */
 
+  if (IsDelete(key_event)) {
+    DLOG(INFO) << "按键是 BackSpace 键，清除输入: " << keycode;
+    ctx->commit_history().clear();
+    return kNoop;
+  }
+  if (IsNavigating(key_event)) {
+    DLOG(INFO) << "按键是导航键，跳过处理: " << keycode;
+    if (!ctx->HasMenu()) {
+      ctx->commit_history().clear();
+    }
+    return kNoop;
+  }
+
   // TODO:(@dongpeng) .[中文]
   if (input[0] == ' ' && IsLetterKey(keycode)) {
     DLOG(INFO) << "强制刷新";
@@ -100,22 +147,11 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
     return kAccepted;
   }
 
-  if (latest_text.empty()) {
-    return kNoop;
-  }
-
-  if (IsDelete(key_event)) {
-    LOG(INFO) << "按键是 BackSpace 键，清除输入: " << keycode;
-    ctx->commit_history().clear();
-    return kNoop;
-  }
-  if (!ctx->HasMenu() && IsNavigating(key_event)) {
-    DLOG(INFO) << "按键是导航键，跳过处理: " << keycode;
-    ctx->commit_history().clear();
-    return kNoop;
-  }
-
   if (IsNumKey(keycode)) {
+    return HandleNumberKey(ctx, keycode);
+  }
+
+  if (latest_text.empty()) {
     return kNoop;
   }
 
