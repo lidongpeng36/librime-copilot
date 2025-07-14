@@ -13,6 +13,8 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
 
  private:
   ProcessResult Process(Context* ctx, const KeyEvent& key_event);
+
+  ProcessResult HandleNumberKey(Context* ctx, const int keycode) const;
   bool ascii_mode_ = false;
   int keycode_ = 0;
   std::string input_;

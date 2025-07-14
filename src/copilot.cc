@@ -149,7 +149,7 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
     if (is_punct) {
       copilot_engine_->history()->add(std::string(1, static_cast<char>(keycode)));
     }
-    if (!ctx->composition().empty() && ctx->composition().back().HasTag("copilot")) {
+    if (tag == SegmentTag::kTagCopilot) {
       ctx->Clear();
       // return kAccepted;
       return kNoop;
