@@ -11,6 +11,34 @@ namespace rime {
 
 namespace {
 
+// 将 UTF-8 字符串转为 Unicode 码点
+inline uint32_t Utf8ToCodepoint(const std::string& s) {
+  uint32_t code = 0;
+  const unsigned char* bytes = reinterpret_cast<const unsigned char*>(s.data());
+  size_t len = s.size();
+
+  if (len == 1) {
+    code = bytes[0];
+  } else if (len == 2) {
+    code = ((bytes[0] & 0x1F) << 6) | (bytes[1] & 0x3F);
+  } else if (len == 3) {
+    code = ((bytes[0] & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
+  } else if (len == 4) {
+    code = ((bytes[0] & 0x07) << 18) | ((bytes[1] & 0x3F) << 12) | ((bytes[2] & 0x3F) << 6) |
+           (bytes[3] & 0x3F);
+  }
+  return code;
+}
+
+// 判断是否是中文标点符号
+inline bool IsChinesePunctuation(const std::string& s) {
+  if (s.empty() || s.size() > 4) return false;
+
+  uint32_t cp = Utf8ToCodepoint(s);
+  return (cp >= 0x3000 && cp <= 0x303F) ||  // CJK 符号和标点
+         (cp >= 0xFF00 && cp <= 0xFFEF);    // 全角标点等
+}
+
 inline bool IsNumKey(int keycode) { return (keycode >= XK_0 && keycode <= XK_9); }
 
 inline bool IsLetterKey(int keycode) {
@@ -141,10 +169,12 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   }
 
   // TODO:(@dongpeng) .[中文]
-  if (input[0] == ' ' && IsLetterKey(keycode)) {
-    DLOG(INFO) << "强制刷新";
-    ctx->set_input(input + std::string(1, keycode));
-    return kAccepted;
+  if (IsLetterKey(keycode)) {
+    if ((!input.empty() && input[0] == ' ') || (!ascii_mode && latest_text == "。")) {
+      DLOG(INFO) << "强制刷新";
+      ctx->set_input(input + std::string(1, keycode));
+      return kAccepted;
+    }
   }
 
   if (IsNumKey(keycode)) {
@@ -155,16 +185,21 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
     return kNoop;
   }
 
+  if (IsChinesePunctuation(latest_text)) {
+    return kNoop;
+  }
+
   if (IsSpaceKey(keycode)) {
     DLOG(INFO) << "按键是空格键，跳过处理: " << keycode;
     if (keycode == XK_Return || keycode == XK_KP_Enter) {
       ctx->commit_history().push_back({"thru", std::string(1, keycode)});
+      if (key_event.modifier() == 0 && !input.empty()) {
+        if (input[0] != ' ' && latest_text != " ") {
+          DLOG(INFO) << "[AutoSpacer] Add space for Enter";
+          ctx->set_input(" " + input);
+        }
+      }
     }
-    return kNoop;
-  }
-
-  if (IsSpaceKey(keycode_)) {
-    // LOG(INFO) << "上一个按键是空格键，跳过处理: " << keycode;
     return kNoop;
   }
 
