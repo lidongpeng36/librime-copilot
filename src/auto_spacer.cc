@@ -105,9 +105,33 @@ inline bool IsNavigating(const KeyEvent& key_event) {
           keycode == XK_n || keycode == XK_p);
 }
 
+inline bool IsPunctString(const std::string latest_text) {
+  if (latest_text.size() != 1) {
+    return false;
+  }
+  const auto& c = latest_text.front();
+  DLOG(INFO) << "[AutoSpacer] IsPunctString: c=" << std::showbase << std::hex
+             << static_cast<int>(c);
+  return (c >= XK_space && c <= XK_slash) || (c >= XK_bracketleft && c <= XK_quoteleft);
+}
+
+inline bool NeedAddSpace(Context* ctx, const KeyEvent& key_event) {
+  const auto& latest_text = ctx->commit_history().latest_text();
+  const auto& input = ctx->input();
+  DLOG(INFO) << "[AutoSpacer] NeedAddSpace: latest_text='" << latest_text << "', input='" << input
+             << "'";
+  if (key_event.modifier() == 0 && !input.empty()) {
+    if (input[0] != ' ' && !IsPunctString(latest_text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
-ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const int keycode) const {
+ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_event) const {
+  const auto& keycode = key_event.keycode();
   static const auto page_size = engine_->schema()->page_size();
   int num = keycode - XK_0;
   const auto& input = ctx->input();
@@ -116,7 +140,8 @@ ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const int keycode) const
   }
   if (num == 0 || num > page_size) {
     // ctx->set_input(input + std::string(1, keycode));
-    engine_->CommitText(input + std::string(1, keycode));
+    auto str = input + std::string(1, keycode);
+    engine_->CommitText(NeedAddSpace(ctx, key_event) ? " " + str : str);
     ctx->Clear();
     return kAccepted;
   }
@@ -131,7 +156,8 @@ ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const int keycode) const
   }
   DLOG(INFO) << "Input Num=" << num << ", n_cand=" << n_cand;
   if (num > n_cand && !input.empty()) {
-    engine_->CommitText(input + std::string(1, keycode));
+    auto str = input + std::string(1, keycode);
+    engine_->CommitText(NeedAddSpace(ctx, key_event) ? " " + str : str);
     ctx->Clear();
     return kAccepted;
   }
@@ -178,7 +204,7 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   }
 
   if (IsNumKey(keycode)) {
-    return HandleNumberKey(ctx, keycode);
+    return HandleNumberKey(ctx, key_event);
   }
 
   if (latest_text.empty()) {
@@ -192,13 +218,11 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   if (IsSpaceKey(keycode)) {
     DLOG(INFO) << "按键是空格键，跳过处理: " << keycode;
     if (keycode == XK_Return || keycode == XK_KP_Enter) {
-      ctx->commit_history().push_back({"thru", std::string(1, keycode)});
-      if (key_event.modifier() == 0 && !input.empty()) {
-        if (input[0] != ' ' && latest_text != " ") {
-          DLOG(INFO) << "[AutoSpacer] Add space for Enter";
-          ctx->set_input(" " + input);
-        }
+      if (NeedAddSpace(ctx, key_event)) {
+        DLOG(INFO) << "[AutoSpacer] Add space for Enter";
+        ctx->set_input(" " + input);
       }
+      ctx->commit_history().push_back({"thru", std::string(1, keycode)});
     }
     return kNoop;
   }
