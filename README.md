@@ -59,6 +59,7 @@ copilot:
   ime_bridge:
     enable: true
     socket_path: /tmp/rime_copilot_ime.sock
+    client_timeout_minutes: 30  # auto-cleanup stale clients
     debug: false
 ```
 
@@ -66,13 +67,18 @@ copilot:
 
 IME Bridge allows external editors to control Rime's `ascii_mode` via Unix Domain Socket.
 
+### Client Libraries
+
+- **Neovim**: [clients/neovim](clients/neovim/)
+
 ### Protocol
 
 JSON Lines format:
 ```json
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim"},"data":{"action":"set","ascii":true}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim"},"data":{"action":"restore"}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim"},"data":{"action":"reset","restore":true}}
+{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"set","ascii":true}}
+{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"restore"}}
+{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"reset","restore":true}}
+{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"unregister"}}
 ```
 
 ### Actions
@@ -81,8 +87,10 @@ JSON Lines format:
 |--------|-------------|
 | `set` | Set `ascii_mode` to specified value, saves previous state |
 | `restore` | Restore to previous state (supports nested calls) |
-| `reset` | Clear all state for this client |
+| `reset` | Clear state and optionally restore original mode |
+| `unregister` | Remove client registration (on exit) |
 | `ping` | Health check |
 
 * Deploy and enjoy.
+
 

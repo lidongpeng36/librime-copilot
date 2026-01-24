@@ -117,12 +117,25 @@ inline bool IsPunctString(const std::string latest_text) {
 }
 
 inline bool NeedAddSpace(Context* ctx, const KeyEvent& key_event) {
-  const auto& latest_text = ctx->commit_history().latest_text();
+  const auto& history = ctx->commit_history();
+  const auto& latest_text = history.latest_text();
   const auto& input = ctx->input();
   DLOG(INFO) << "[AutoSpacer] NeedAddSpace: latest_text='" << latest_text << "', input='" << input
              << "'";
   if (key_event.modifier() == 0 && !input.empty()) {
     if (input[0] != ' ' && !IsPunctString(latest_text)) {
+      // 检查是否是连续的 raw/thru 英文上屏，如果是则不加空格
+      if (!history.empty()) {
+        const auto& last_record = history.back();
+        if (last_record.type == "raw" || last_record.type == "thru") {
+          // 如果上一次是直接上屏的 ASCII 内容，不加空格
+          int last_char = LastAsciiCharCode(latest_text);
+          if (IsAlphabetKey(last_char)) {
+            DLOG(INFO) << "[AutoSpacer] NeedAddSpace: skip for consecutive raw ASCII";
+            return false;
+          }
+        }
+      }
       return true;
     }
   }
@@ -240,7 +253,25 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   const bool has_input = !ctx->input().empty();
   if (!has_input && latest_text != " ") {
     const auto last_ascii_char = LastAsciiCharCode(latest_text);
+    
+    // 检查是否是回车直接上屏的英文（type = "thru")
+    // 如果是，不应该添加空格，因为这是连续的英文输入
+    const auto& history = ctx->commit_history();
+    bool is_thru_commit = false;
+    if (!history.empty()) {
+      const auto& last_record = history.back();
+      // "thru" 类型表示按键直接上屏（如回车键让拼音直接上屏）
+      if (last_record.type == "thru" || last_record.type == "raw") {
+        is_thru_commit = true;
+      }
+    }
+    
     if ((IsAlphabetKey(last_ascii_char) || IsPunctKey(last_ascii_char)) && !ascii_mode) {
+      // 如果是回车直接上屏的英文，不添加空格
+      if (is_thru_commit && IsAlphabetKey(last_ascii_char)) {
+        DLOG(INFO) << "[AutoSpacer] Skip space: previous was thru/raw commit";
+        return kNoop;
+      }
       DLOG(INFO) << "为**中文**添加空格: " << string(1, keycode);
       ctx->set_input(AddSpace(keycode));
       return kAccepted;
