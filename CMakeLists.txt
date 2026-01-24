@@ -11,7 +11,7 @@ include(FetchContent)
 FetchContent_Declare(
   llama
   GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
-  GIT_TAG b5310)
+  GIT_TAG b7820)
 FetchContent_MakeAvailable(llama)
 
 aux_source_directory(src copilot_src)

@@ -48,7 +48,8 @@ inline bool IsLetterKey(int keycode) {
 inline bool IsAlphabetKey(int keycode) { return (IsNumKey(keycode) || IsLetterKey(keycode)); }
 
 inline bool IsPunctKey(int keycode) {
-  return keycode == XK_period || keycode == XK_comma || keycode == XK_colon;
+  return keycode == XK_period || keycode == XK_comma || keycode == XK_colon ||
+         keycode == XK_exclam || keycode == XK_question || keycode == XK_semicolon;
 }
 
 inline bool IsSpaceKey(int keycode) {
