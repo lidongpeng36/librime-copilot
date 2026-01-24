@@ -11,8 +11,11 @@
 #include <rime/service.h>
 #include <rime/translation.h>
 
+#include <set>
+
 #include "auto_spacer.h"
 #include "copilot_engine.h"
+#include "ime_bridge.h"
 #include "select_character.h"
 
 namespace rime {
@@ -56,12 +59,35 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
   context_update_connection_ =
       context->update_notifier().connect([this](Context* ctx) { OnContextUpdate(ctx); });
 
-  processors_.emplace_back(std::make_shared<AutoSpacer>(ticket));
-  processors_.emplace_back(std::make_shared<SelectCharacter>(ticket, [this](const string& text) {
-    auto* ctx = engine_->context();
-    CopilotAndUpdate(ctx, text);  // ✨ 立即启动后续预测
-  }));
-  LOG(INFO) << "Copilot plugin Loaded.";
+  // Read disabled plugins from config
+  std::set<string> disabled_plugins;
+  if (auto* config = engine_->schema()->config()) {
+    if (auto list = config->GetList("copilot/disabled_plugins")) {
+      for (size_t i = 0; i < list->size(); ++i) {
+        if (auto item = list->GetValueAt(i)) {
+          string name;
+          if (item->GetString(&name)) {
+            disabled_plugins.insert(name);
+          }
+        }
+      }
+    }
+  }
+
+  // Register processors based on config
+  if (disabled_plugins.find("ime_bridge") == disabled_plugins.end()) {
+    processors_.emplace_back(std::make_shared<ImeBridge>(ticket));
+  }
+  if (disabled_plugins.find("auto_spacer") == disabled_plugins.end()) {
+    processors_.emplace_back(std::make_shared<AutoSpacer>(ticket));
+  }
+  if (disabled_plugins.find("select_character") == disabled_plugins.end()) {
+    processors_.emplace_back(std::make_shared<SelectCharacter>(ticket, [this](const string& text) {
+      auto* ctx = engine_->context();
+      CopilotAndUpdate(ctx, text);  // ✨ 立即启动后续预测
+    }));
+  }
+  LOG(INFO) << "Copilot plugin Loaded. Disabled plugins: " << disabled_plugins.size();
 }
 
 Copilot::~Copilot() {

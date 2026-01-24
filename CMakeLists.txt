@@ -12,11 +12,17 @@ FetchContent_Declare(
   llama
   GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
   GIT_TAG b7820)
-FetchContent_MakeAvailable(llama)
+
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG v3.11.3)
+
+FetchContent_MakeAvailable(llama nlohmann_json)
 
 aux_source_directory(src copilot_src)
 
-set(LINK_LIBS llama)
+set(LINK_LIBS llama nlohmann_json::nlohmann_json)
 if (APPLE)
   find_library(IOKIT_LIBRARY IOKit REQUIRED)
   find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)

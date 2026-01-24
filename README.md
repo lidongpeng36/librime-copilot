@@ -2,9 +2,16 @@
 
 > from [librime-predict](https://github.com/rime/librime-predict.git)
 
-librime plugin. copilot next word.
+librime plugin. Copilot next word prediction with LLM support.
+
+## Features
+
+- **Next Word Prediction** - DB-based n-gram prediction and LLM-based prediction
+- **Auto Spacer** - Automatically add spaces between Chinese and English/numbers
+- **IME Bridge** - Control `ascii_mode` via IPC from external editors (Neovim, Obsidian, VS Code)
 
 ## Usage
+
 * Put the db file (by default `copilot.db`) in rime user directory.
 * In `*.schema.yaml`, add `copilot` to the list of `engine/processors` before `key_binder`,
 add `copilot_translator` to the list of `engine/translators`;
@@ -22,22 +29,60 @@ switches:
     states: [ 關閉預測, 開啓預測 ]
     reset: 1
 ```
-* Config items for your copilot:
+
+## Configuration
+
 ```yaml
 copilot:
   # copilot db file in user directory/shared directory
   # default to 'copilot.db'
   db: copilot.db
-  # max copilotion candidates every time
+  # max prediction candidates every time
   # default to 0, which means showing all candidates
   # you may set it the same with page_size so that period doesn't trigger next page
   max_candidates: 5
-  # max continuous copilotion times
+  # max continuous prediction times
   # default to 0, which means no limitation
   max_iterations: 1
   # llm model file in user directory/shared directory
   model: Qwen-3-0.6B-q4_K_M.gguf
   # max predict tokens
   n_predict: 8
+
+  # Disable specific sub-plugins (optional)
+  disabled_plugins:
+    # - ime_bridge
+    # - auto_spacer
+    # - select_character
+
+  # IME Bridge configuration (for Vim mode support)
+  ime_bridge:
+    enable: true
+    socket_path: /tmp/rime_copilot_ime.sock
+    debug: false
 ```
+
+## IME Bridge
+
+IME Bridge allows external editors to control Rime's `ascii_mode` via Unix Domain Socket.
+
+### Protocol
+
+JSON Lines format:
+```json
+{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim"},"data":{"action":"set","ascii":true}}
+{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim"},"data":{"action":"restore"}}
+{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim"},"data":{"action":"reset","restore":true}}
+```
+
+### Actions
+
+| Action | Description |
+|--------|-------------|
+| `set` | Set `ascii_mode` to specified value, saves previous state |
+| `restore` | Restore to previous state (supports nested calls) |
+| `reset` | Clear all state for this client |
+| `ping` | Health check |
+
 * Deploy and enjoy.
+
