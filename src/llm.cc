@@ -119,7 +119,7 @@ class Backend {
   void pop_back(const HistoryEntry&);
   void pop_front(const HistoryEntry&);
 
-  int pos_max(int seq_id) const { return llama_kv_self_seq_pos_max(ctx_, seq_id); }
+  int pos_max(int seq_id) const { return llama_memory_seq_pos_max(llama_get_memory(ctx_), seq_id); }
   std::string detokenize(llama_token id) const {
     char buf[128];
     int n = llama_token_to_piece(vocab_, id, buf, sizeof(buf), 0, true);
@@ -370,7 +370,6 @@ inline bool Backend::init(const BackendConfig& cfg) {
   ctx_params.n_ctx = cfg.n_ctx;
   ctx_params.n_batch = cfg.n_batch;
   ctx_params.no_perf = cfg.no_perf;
-  ctx_params.flash_attn = cfg.flash_attn;
   ctx_params.n_threads = std::thread::hardware_concurrency();
 
   ctx_ = llama_init_from_model(model_, ctx_params);
@@ -474,7 +473,7 @@ inline void Backend::resize_kv_cache() {
     int seq_id = entry.first;
     int p0 = entry.second;
     // std::cerr << "[pop_back: [" << p0 << ", " << "-1] ]";
-    llama_kv_self_seq_rm(ctx_, seq_id, p0, -1);
+    llama_memory_seq_rm(llama_get_memory(ctx_), seq_id, p0, -1);
   }
   std::unordered_map<uint32_t, int> pop_front_map;
   for (const auto& entry : front) {
@@ -488,7 +487,7 @@ inline void Backend::resize_kv_cache() {
   for (const auto& entry : pop_front_map) {
     int seq_id = entry.first;
     int p1 = entry.second;
-    llama_kv_self_seq_rm(ctx_, seq_id, -1, p1 - 1);
+    llama_memory_seq_rm(llama_get_memory(ctx_), seq_id, -1, p1 - 1);
   }
 }
 
@@ -553,7 +552,7 @@ inline void Backend::process(int n_tokens, std::list<std::unique_ptr<Ticket>>* t
         t->result.append(buf, n);
         bool ret = t->callback(std::string_view(buf, n));
         if (!ret) {
-          llama_kv_self_seq_rm(ctx_, t->seq_id, t->p1, -1);
+          llama_memory_seq_rm(llama_get_memory(ctx_), t->seq_id, t->p1, -1);
           logits_[t->i_batch] = 0;  // stop sampling
           t->promise.set_value(false);
           auto current = it++;
@@ -599,7 +598,7 @@ inline void Backend::run() {
     for (auto& t : tickets) {
       const auto& tokens = t->tokens;
       if (t->p0 < 0) {
-        t->p0 = llama_kv_self_seq_pos_max(ctx_, t->seq_id);
+        t->p0 = llama_memory_seq_pos_max(llama_get_memory(ctx_), t->seq_id);
       }
       int n = tokens.size();
       for (int i = 0; i < n; ++i) {
@@ -737,7 +736,6 @@ ClientSimple::ClientSimple(ClientConfig config, const std::string& model,
   ctx_params.n_ctx = 0;
   ctx_params.n_batch = 512;
   ctx_params.no_perf = false;
-  ctx_params.flash_attn = true;
   ctx_params.n_threads = std::thread::hardware_concurrency();
 
   ctx_ = llama_init_from_model(model_, ctx_params);
@@ -808,7 +806,7 @@ bool ClientSimple::run(const std::string& prompt) {
   }
   batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
 
-  llama_kv_self_seq_rm(ctx_, 0, -1, -1);
+  llama_memory_seq_rm(llama_get_memory(ctx_), 0, -1, -1);
   int n_pos = 0;
   char buf[128];
   std::string response;
