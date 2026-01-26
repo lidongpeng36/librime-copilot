@@ -47,9 +47,31 @@ inline bool IsLetterKey(int keycode) {
 
 inline bool IsAlphabetKey(int keycode) { return (IsNumKey(keycode) || IsLetterKey(keycode)); }
 
+// { [ ( < `
+inline bool IsLeftPunctKey(int keycode) {
+  return keycode == XK_bracketleft || keycode == XK_parenleft || keycode == XK_braceleft ||
+         keycode == XK_less || keycode == XK_quoteleft;
+}
+
+// } ] ) > `
+inline bool IsRightPunctKey(int keycode) {
+  return keycode == XK_bracketright || keycode == XK_parenright || keycode == XK_braceright ||
+         keycode == XK_greater || keycode == XK_quoteright;
+}
+
+inline bool IsPairPunctKey(int keycode) {
+  return IsLeftPunctKey(keycode) || IsRightPunctKey(keycode);
+}
+
+// ! ? :
+inline bool IsModifierPunctKey(int keycode) {
+  return keycode == XK_exclam || keycode == XK_question || keycode == XK_colon ||
+         IsPairPunctKey(keycode);
+}
+
 inline bool IsPunctKey(int keycode) {
-  return keycode == XK_period || keycode == XK_comma || keycode == XK_colon ||
-         keycode == XK_exclam || keycode == XK_question || keycode == XK_semicolon;
+  return keycode == XK_period || keycode == XK_comma || keycode == XK_exclam ||
+         keycode == XK_question || keycode == XK_semicolon || IsRightPunctKey(keycode);
 }
 
 inline bool IsSpaceKey(int keycode) {
@@ -185,23 +207,24 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
 
   const auto& input = ctx->input();
   const bool ascii_mode = ctx->get_option("ascii_mode");
+  DLOG(INFO) << "[AutoSpacer] " << std::showbase << std::hex << " keycode=" << keycode << "("
+             << string(1, keycode) << ")" << ", input='" << input << "'"
+             << ", prev_ascii_mode=" << ascii_mode_ << ", ascii_mode=" << ascii_mode
+             << ", latest_text='" << latest_text << "'[" << ctx->commit_history().back().type
+             << "], modifier=" << key_event.modifier();
   /*
-  LOG(INFO) << "[AutoSpacer] " << std::showbase << std::hex << " keycode=" << keycode << "("
-            << string(1, keycode) << ")" << ", input='" << input << "'"
-            << ", prev_ascii_mode=" << ascii_mode_ << ", ascii_mode=" << ascii_mode
-            << ", latest_text='" << latest_text << "', modifier=" << key_event.modifier();
   LOG(INFO) << "prev_input=" << input_ << ", input=" << input;
   LOG(INFO) << "[AutoSpacer] caret_pos=" << ctx->caret_pos()
             << ", composition=" << ctx->composition().GetDebugText();
   */
 
   if (IsDelete(key_event)) {
-    DLOG(INFO) << "按键是 BackSpace 键，清除输入: " << keycode;
+    DLOG(INFO) << "[SKIP] 按键是 BackSpace 键，清除输入: " << keycode;
     ctx->commit_history().clear();
     return kNoop;
   }
   if (IsNavigating(key_event)) {
-    DLOG(INFO) << "按键是导航键，跳过处理: " << keycode;
+    DLOG(INFO) << "[SKIP] 按键是导航键，跳过处理: " << keycode;
     if (!ctx->HasMenu()) {
       ctx->commit_history().clear();
     }
@@ -211,7 +234,7 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   // TODO:(@dongpeng) .[中文]
   if (IsLetterKey(keycode)) {
     if ((!input.empty() && input[0] == ' ') || (!ascii_mode && latest_text == "。")) {
-      DLOG(INFO) << "强制刷新";
+      DLOG(INFO) << "[ADD] 强制刷新";
       ctx->set_input(input + std::string(1, keycode));
       return kAccepted;
     }
@@ -222,18 +245,20 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   }
 
   if (latest_text.empty()) {
+    DLOG(INFO) << "[SKIP] 历史为空";
     return kNoop;
   }
 
   if (IsChinesePunctuation(latest_text)) {
+    DLOG(INFO) << "[SKIP] 上次输入为中文标点: '" << latest_text << "'";
     return kNoop;
   }
 
   if (IsSpaceKey(keycode)) {
-    DLOG(INFO) << "按键是空格键，跳过处理: " << keycode;
+    DLOG(INFO) << "[SKIP] 按键是空格键，跳过处理: " << keycode;
     if (keycode == XK_Return || keycode == XK_KP_Enter) {
       if (NeedAddSpace(ctx, key_event)) {
-        DLOG(INFO) << "[AutoSpacer] Add space for Enter";
+        DLOG(INFO) << "[ADD] Add space for Enter";
         ctx->set_input(" " + input);
       }
       ctx->commit_history().push_back({"thru", std::string(1, keycode)});
@@ -241,19 +266,27 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
     return kNoop;
   }
 
+  if (IsModifierPunctKey(keycode)) {
+    // XK_comma 和 XK_period 自动加入了, 不知道为什么
+    ctx->commit_history().push_back({"thru", std::string(1, keycode)});
+    return kNoop;
+  }
+
   if (key_event.modifier()) {
+    DLOG(INFO) << "[SKIP] 修饰键，跳过处理: " << keycode;
     return kNoop;
   }
 
   const bool is_alphabet = IsAlphabetKey(keycode);
   if (!is_alphabet) {
+    DLOG(INFO) << "[SKIP] 非 Alphabet";
     return kNoop;
   }
 
   const bool has_input = !ctx->input().empty();
   if (!has_input && latest_text != " ") {
     const auto last_ascii_char = LastAsciiCharCode(latest_text);
-    
+
     // 检查是否是回车直接上屏的英文（type = "thru")
     // 如果是，不应该添加空格，因为这是连续的英文输入
     const auto& history = ctx->commit_history();
@@ -262,23 +295,24 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
       const auto& last_record = history.back();
       // "thru" 类型表示按键直接上屏（如回车键让拼音直接上屏）
       if (last_record.type == "thru" || last_record.type == "raw") {
+        DLOG(INFO) << "[SKIP] 最后输入为 thru, 跳过";
         is_thru_commit = true;
       }
     }
-    
+
     if ((IsAlphabetKey(last_ascii_char) || IsPunctKey(last_ascii_char)) && !ascii_mode) {
       // 如果是回车直接上屏的英文，不添加空格
       if (is_thru_commit && IsAlphabetKey(last_ascii_char)) {
-        DLOG(INFO) << "[AutoSpacer] Skip space: previous was thru/raw commit";
+        DLOG(INFO) << "[SKIP] previous was thru/raw commit";
         return kNoop;
       }
-      DLOG(INFO) << "为**中文**添加空格: " << string(1, keycode);
+      DLOG(INFO) << "[ADD] 为**中文**添加空格: " << string(1, keycode);
       ctx->set_input(AddSpace(keycode));
       return kAccepted;
     }
 
     if (last_ascii_char < 0 && ascii_mode) {
-      // LOG(INFO) << "为 ascii mode 添加空格";
+      DLOG(INFO) << "[ADD] 为 ascii mode 添加空格";
       engine_->CommitText(AddSpace(keycode));
       return kAccepted;
     }
