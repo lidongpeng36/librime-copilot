@@ -4,10 +4,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#include <nlohmann/json.hpp>
 #include <rime/context.h>
 #include <rime/engine.h>
 #include <rime/schema.h>
+#include <nlohmann/json.hpp>
 
 namespace rime {
 
@@ -31,13 +31,9 @@ ImeBridgeServer& ImeBridgeServer::Instance() {
   return instance;
 }
 
-ImeBridgeServer::~ImeBridgeServer() {
-  Stop();
-}
+ImeBridgeServer::~ImeBridgeServer() { Stop(); }
 
-void ImeBridgeServer::AddRef() {
-  ref_count_.fetch_add(1);
-}
+void ImeBridgeServer::AddRef() { ref_count_.fetch_add(1); }
 
 void ImeBridgeServer::Release() {
   if (ref_count_.fetch_sub(1) == 1) {
@@ -47,7 +43,7 @@ void ImeBridgeServer::Release() {
 
 void ImeBridgeServer::Start(const Config& config) {
   std::lock_guard<std::mutex> lock(mutex_);
-  
+
   if (running_.load()) {
     return;  // 已经在运行
   }
@@ -308,7 +304,7 @@ std::queue<ImeBridgePendingAction> ImeBridgeServer::TakePendingActions() {
 
 void ImeBridgeServer::CleanupStaleClients() {
   auto now = std::chrono::steady_clock::now();
-  
+
   // Check if enough time has passed since last cleanup
   if (now - last_cleanup_ < std::chrono::seconds(kCleanupIntervalSeconds)) {
     return;
@@ -336,17 +332,17 @@ void ImeBridgeServer::CleanupStaleClients() {
   }
 }
 
-ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(
-    const ImeBridgePendingAction& action, bool current_ascii) {
+ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(const ImeBridgePendingAction& action,
+                                                          bool current_ascii) {
   ApplyResult result;
   result.should_set = false;
-  
+
   std::lock_guard<std::mutex> lock(mutex_);
-  
+
   switch (action.type) {
     case ImeBridgePendingAction::kSet: {
       auto& state = client_states_[action.client_key];
-      
+
       // 在第一次 set 时保存初始状态（整个会话只保存一次）
       if (!state.has_initial) {
         state.initial_state = current_ascii;
@@ -355,7 +351,7 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(
           LOG(INFO) << "[ImeBridge] ApplyAction kSet: saved initial_state=" << state.initial_state;
         }
       }
-      
+
       // 如果是当前 cycle 的第一次 set，记录为 base
       if (state.depth == 0) {
         state.base = current_ascii;
@@ -365,27 +361,27 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(
         }
       }
       state.depth++;
-      
+
       result.should_set = true;
       result.ascii_mode = action.ascii;
-      
+
       if (config_.debug) {
         LOG(INFO) << "[ImeBridge] ApplyAction kSet: ascii=" << action.ascii
                   << ", base=" << state.base << ", depth=" << state.depth;
       }
       break;
     }
-    
+
     case ImeBridgePendingAction::kRestore: {
       auto it = client_states_.find(action.client_key);
       if (it != client_states_.end() && it->second.depth > 0) {
         it->second.depth--;
-        
+
         if (it->second.depth == 0 && it->second.has_base) {
           result.should_set = true;
           result.ascii_mode = it->second.base;
           it->second.has_base = false;
-          
+
           if (config_.debug) {
             LOG(INFO) << "[ImeBridge] ApplyAction kRestore: restored to base=" << it->second.base;
           }
@@ -397,7 +393,7 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(
       }
       break;
     }
-    
+
     case ImeBridgePendingAction::kReset: {
       auto it = client_states_.find(action.client_key);
       if (it != client_states_.end()) {
@@ -405,9 +401,9 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(
         if (action.restore && it->second.has_initial) {
           result.should_set = true;
           result.ascii_mode = it->second.initial_state;
-          
+
           if (config_.debug) {
-            LOG(INFO) << "[ImeBridge] ApplyAction kReset: restored to initial_state=" 
+            LOG(INFO) << "[ImeBridge] ApplyAction kReset: restored to initial_state="
                       << it->second.initial_state;
           }
         }
@@ -415,7 +411,7 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(
       }
       break;
     }
-    
+
     case ImeBridgePendingAction::kUnregister: {
       auto it = client_states_.find(action.client_key);
       if (it != client_states_.end()) {
@@ -426,11 +422,11 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(
       }
       break;
     }
-    
+
     default:
       break;
   }
-  
+
   return result;
 }
 
@@ -494,7 +490,7 @@ void ImeBridge::ApplyPendingActions(Context* ctx) {
 
     bool current_ascii = ctx->get_option("ascii_mode");
     auto result = server.ApplyAction(action, current_ascii);
-    
+
     if (result.should_set) {
       ctx->set_option("ascii_mode", result.ascii_mode);
       if (server.IsDebug()) {
@@ -505,4 +501,3 @@ void ImeBridge::ApplyPendingActions(Context* ctx) {
 }
 
 }  // namespace rime
-

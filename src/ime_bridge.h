@@ -17,12 +17,12 @@ class Context;
 
 // Per-client 状态结构
 struct ImeBridgeClientState {
-  bool has_initial = false;    // 是否已记录初始状态
-  bool initial_state = true;   // 第一次 set 时的 ascii_mode（整个会话保持不变）
+  bool has_initial = false;   // 是否已记录初始状态
+  bool initial_state = true;  // 第一次 set 时的 ascii_mode（整个会话保持不变）
   bool has_base = false;
-  bool base = false;           // 每次 set cycle 的 base
-  int depth = 0;               // set 嵌套层数
-  bool current_target = true;  // 最近一次 set 的目标值
+  bool base = false;                                  // 每次 set cycle 的 base
+  int depth = 0;                                      // set 嵌套层数
+  bool current_target = true;                         // 最近一次 set 的目标值
   std::chrono::steady_clock::time_point last_active;  // 最后活动时间
 };
 
@@ -31,8 +31,8 @@ struct ImeBridgePendingAction {
   enum Type { kNone, kSet, kRestore, kReset, kUnregister };
   Type type = kNone;
   std::string client_key;
-  bool ascii = true;      // for kSet
-  bool restore = true;    // for kReset
+  bool ascii = true;    // for kSet
+  bool restore = true;  // for kReset
 };
 
 // 共享的 ImeBridge 服务器状态（跨所有 session 共享）
@@ -57,16 +57,16 @@ class ImeBridgeServer {
   void Stop();
   void AddRef();
   void Release();
-  
+
   bool IsRunning() const { return running_.load(); }
   bool IsDebug() const { return config_.debug; }
-  
+
   // 获取待处理的 actions（线程安全）
   std::queue<ImeBridgePendingAction> TakePendingActions();
-  
+
   // 应用单个 action，返回需要设置的 ascii_mode（带状态跟踪）
   ApplyResult ApplyAction(const ImeBridgePendingAction& action, bool current_ascii);
-  
+
   // 清理超时客户端
   void CleanupStaleClients();
 
@@ -115,5 +115,3 @@ class ImeBridge : public CopilotPlugin<ImeBridge> {
 };
 
 }  // namespace rime
-
-
