@@ -144,22 +144,32 @@ inline bool NeedAddSpace(Context* ctx, const KeyEvent& key_event) {
   const auto& input = ctx->input();
   DLOG(INFO) << "[AutoSpacer] NeedAddSpace: latest_text='" << latest_text << "', input='" << input
              << "'";
-  if (key_event.modifier() == 0 && !input.empty()) {
-    if (input[0] != ' ' && !IsPunctString(latest_text)) {
-      // 检查是否是连续的 raw/thru 英文上屏，如果是则不加空格
-      if (!history.empty()) {
-        const auto& last_record = history.back();
-        if (last_record.type == "raw" || last_record.type == "thru") {
-          // 如果上一次是直接上屏的 ASCII 内容，不加空格
-          int last_char = LastAsciiCharCode(latest_text);
-          if (IsAlphabetKey(last_char)) {
-            DLOG(INFO) << "[AutoSpacer] NeedAddSpace: skip for consecutive raw ASCII";
-            return false;
-          }
+  if (latest_text.empty() || input.empty()) {
+    return false;
+  }
+  if (key_event.modifier() != 0) {
+    return false;
+  }
+  if (input[0] == ' ' && IsPunctString(latest_text)) {
+    auto strip = input.substr(1);
+    ctx->set_input(strip);
+    DLOG(INFO) << "strip space";
+    return false;
+  }
+  if (input[0] != ' ' && !IsPunctString(latest_text)) {
+    // 检查是否是连续的 raw/thru 英文上屏，如果是则不加空格
+    if (!history.empty()) {
+      const auto& last_record = history.back();
+      if (last_record.type == "raw" || last_record.type == "thru") {
+        // 如果上一次是直接上屏的 ASCII 内容，不加空格
+        int last_char = LastAsciiCharCode(latest_text);
+        if (IsAlphabetKey(last_char)) {
+          DLOG(INFO) << "[AutoSpacer] NeedAddSpace: skip for consecutive raw ASCII";
+          return false;
         }
       }
-      return true;
     }
+    return true;
   }
   return false;
 }
