@@ -32,6 +32,7 @@ struct ImeBridgePendingAction {
   Type type = kNone;
   std::string client_key;
   bool ascii = true;    // for kSet
+  bool stack = true;    // for kSet: if true, increment depth and save base
   bool restore = true;  // for kReset
 };
 
@@ -61,6 +62,7 @@ class ImeBridgeServer {
   bool IsRunning() const { return running_.load(); }
   bool IsDebug() const { return config_.debug; }
 
+
   // 获取待处理的 actions（线程安全）
   std::queue<ImeBridgePendingAction> TakePendingActions();
 
@@ -78,7 +80,7 @@ class ImeBridgeServer {
   void HandleConnection(int client_fd);
   void ProcessMessage(const std::string& message);
 
-  void HandleSet(const std::string& client_key, bool ascii);
+  void HandleSet(const std::string& client_key, bool ascii, bool stack = true);
   void HandleRestore(const std::string& client_key);
   void HandleReset(const std::string& client_key, bool restore);
   void HandleUnregister(const std::string& client_key);

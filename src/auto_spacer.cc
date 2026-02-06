@@ -229,8 +229,10 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   */
 
   if (IsDelete(key_event)) {
-    DLOG(INFO) << "[SKIP] 按键是 BackSpace 键，清除输入: " << keycode;
-    ctx->commit_history().clear();
+    if (input.empty()) {
+      DLOG(INFO) << "[SKIP] 按键是 BackSpace 键，输入为空, 清除输入";
+      ctx->commit_history().clear();
+    }
     return kNoop;
   }
   if (IsNavigating(key_event)) {

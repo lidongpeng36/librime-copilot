@@ -13,12 +13,12 @@ local enabled = false
 
 local config = {
   socket_path = "/tmp/rime_copilot_ime.sock",
-  app_name = nil,      -- auto-detect if nil
-  instance = nil,      -- auto-generate if nil
+  app_name = nil,         -- auto-detect if nil
+  instance = nil,         -- auto-generate if nil
   debug = false,
-  reconnect_delay = 1000,  -- ms
-  max_pending = 10,        -- max queued messages
-  rime_user_dir = nil,     -- auto-detect if nil
+  reconnect_delay = 1000, -- ms
+  max_pending = 10,       -- max queued messages
+  rime_user_dir = nil,    -- auto-detect if nil
 }
 
 -- Detect platform and return rime user directory
@@ -34,7 +34,7 @@ local function detect_rime_user_dir()
     local xdg_config = vim.env.XDG_CONFIG_HOME or vim.fn.expand("~/.config")
     local ibus_path = xdg_config .. "/ibus/rime"
     local fcitx5_path = vim.fn.expand("~/.local/share/fcitx5/rime")
-    
+
     -- Check ibus first, then fcitx5
     local stat = uv.fs_stat(ibus_path)
     if stat and stat.type == "directory" then
@@ -59,7 +59,7 @@ end
 
 -- Auto-detect app name
 local function detect_app_name()
-  if vim.env.VSCODE_PID then
+  if vim.g.vscode then
     return "vscode-neovim"
   elseif vim.env.NVIM_APPNAME then
     return vim.env.NVIM_APPNAME
@@ -71,17 +71,17 @@ end
 -- Generate unique instance ID
 local function generate_instance_id()
   local parts = {}
-  
+
   -- PID is always unique per process
   table.insert(parts, tostring(vim.fn.getpid()))
-  
+
   -- Add terminal/GUI info if available
   if vim.env.TERM_SESSION_ID then
     table.insert(parts, vim.env.TERM_SESSION_ID:sub(1, 8))
   elseif vim.env.WINDOWID then
     table.insert(parts, vim.env.WINDOWID)
   end
-  
+
   return table.concat(parts, "-")
 end
 
@@ -94,13 +94,20 @@ end
 
 -- Build JSON message
 local function build_message(action, data)
+  -- 使用 Buffer ID 作为 instance 的一部分，实现 per-buffer 状态隔离
+  local current_instance = config.instance
+  if vim.api.nvim_get_current_buf then
+    local buf = vim.api.nvim_get_current_buf()
+    current_instance = current_instance .. ":" .. tostring(buf)
+  end
+
   local msg = {
     v = 1,
     ns = "rime.ime",
     type = "ascii",
     src = {
       app = config.app_name,
-      instance = config.instance,
+      instance = current_instance,
     },
     data = vim.tbl_extend("force", { action = action }, data or {}),
   }
@@ -112,10 +119,10 @@ local function flush_pending()
   if not connected or #pending_messages == 0 then
     return
   end
-  
+
   local messages = pending_messages
   pending_messages = {}
-  
+
   for _, msg in ipairs(messages) do
     local ok = pcall(function()
       socket:write(msg)
@@ -142,26 +149,26 @@ local function connect()
   if connected or connecting then
     return
   end
-  
+
   connecting = true
   socket = uv.new_pipe(false)
-  
+
   socket:connect(config.socket_path, function(err)
     connecting = false
-    
+
     if err then
       log("Connect failed: " .. tostring(err))
       pcall(function() socket:close() end)
       socket = nil
-      
+
       -- Schedule reconnect
       vim.defer_fn(connect, config.reconnect_delay)
       return
     end
-    
+
     connected = true
     log("Connected to " .. config.socket_path)
-    
+
     -- Flush pending messages
     vim.schedule(flush_pending)
   end)
@@ -171,7 +178,7 @@ end
 local function send(action, data)
   local msg = build_message(action, data)
   log("Queueing: " .. action)
-  
+
   if connected and socket then
     local ok = pcall(function()
       socket:write(msg)
@@ -205,9 +212,16 @@ end
 
 --- Set ascii_mode
 ---@param ascii boolean
-function M.set(ascii)
+---@param opts table|nil
+function M.set(ascii, opts)
   if not enabled then return end
-  send("set", { ascii = ascii })
+
+  local data = { ascii = ascii }
+  if opts and opts.stack ~= nil then
+    data.stack = opts.stack
+  end
+
+  send("set", data)
 end
 
 --- Restore previous ascii_mode
@@ -244,24 +258,25 @@ end
 ---@param opts table|nil
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
-  
+
   -- Auto-detect rime_user_dir if not provided
   config.rime_user_dir = config.rime_user_dir or detect_rime_user_dir()
-  
+
   -- Check if Rime directory exists
   if not rime_exists() then
     if config.debug then
-      vim.notify("[rime-ime] Disabled: Rime directory not found at " .. (config.rime_user_dir or "nil"), vim.log.levels.INFO)
+      vim.notify("[rime-ime] Disabled: Rime directory not found at " .. (config.rime_user_dir or "nil"),
+        vim.log.levels.INFO)
     end
     return
   end
-  
+
   enabled = true
-  
+
   -- Auto-detect app_name and instance if not provided
   config.app_name = config.app_name or detect_app_name()
   config.instance = config.instance or generate_instance_id()
-  
+
   log("app_name=" .. config.app_name .. ", instance=" .. config.instance)
 
   local group = vim.api.nvim_create_augroup("RimeIme", { clear = true })
@@ -298,6 +313,19 @@ function M.setup(opts)
     end,
   })
 
+  -- FocusGained/WinEnter: ensure ascii if in normal mode (without stacking)
+  vim.api.nvim_create_autocmd({ "FocusGained", "WinEnter" }, {
+    group = group,
+    callback = function()
+      -- 延迟执行以确保在 OS/IDE 焦点切换和状态恢复完成后强制覆盖
+      local mode = vim.fn.mode()
+      if mode ~= "i" and mode ~= "R" and mode ~= "c" then
+        -- 使用 stack=false 避免影响 restore 栈
+        M.set(true, { stack = false })
+      end
+    end,
+  })
+
   -- Visual mode: set ascii
   vim.api.nvim_create_autocmd("ModeChanged", {
     group = group,
@@ -328,7 +356,7 @@ function M.setup(opts)
 
   -- Initial connect (async)
   connect()
-  
+
   -- 在连接建立后立即保存初始状态并设置为英文
   -- 这样 reset(true) 可以恢复到 Neovim 启动时的状态
   vim.defer_fn(function()

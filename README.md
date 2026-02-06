@@ -85,12 +85,11 @@ JSON Lines format:
 
 | Action | Description |
 |--------|-------------|
-| `set` | Set `ascii_mode` to specified value, saves previous state |
+| `set` | Set `ascii_mode`. Params: `ascii` (bool), `stack` (bool, default true). `stack=false` sets mode without affecting restore stack. |
 | `restore` | Restore to previous state (supports nested calls) |
 | `reset` | Clear state and optionally restore original mode |
 | `unregister` | Remove client registration (on exit) |
 | `ping` | Health check |
 
 * Deploy and enjoy.
-
 

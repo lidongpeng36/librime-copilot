@@ -194,7 +194,8 @@ void ImeBridgeServer::ProcessMessage(const std::string& message) {
 
     if (action == "set") {
       bool ascii = data.value("ascii", true);
-      HandleSet(client_key, ascii);
+      bool stack = data.value("stack", true);
+      HandleSet(client_key, ascii, stack);
     } else if (action == "restore") {
       HandleRestore(client_key);
     } else if (action == "reset") {
@@ -227,7 +228,7 @@ void ImeBridgeServer::TouchClient(const std::string& client_key) {
   }
 }
 
-void ImeBridgeServer::HandleSet(const std::string& client_key, bool ascii) {
+void ImeBridgeServer::HandleSet(const std::string& client_key, bool ascii, bool stack) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   auto& state = client_states_[client_key];
@@ -238,11 +239,13 @@ void ImeBridgeServer::HandleSet(const std::string& client_key, bool ascii) {
   action.type = ImeBridgePendingAction::kSet;
   action.client_key = client_key;
   action.ascii = ascii;
+  action.stack = stack;
   pending_actions_.push(action);
 
   if (config_.debug) {
     LOG(INFO) << "[ImeBridge] HandleSet: client=" << client_key << ", ascii=" << ascii
-              << ", depth=" << state.depth << ", queue_size=" << pending_actions_.size();
+              << ", stack=" << stack << ", depth=" << state.depth 
+              << ", queue_size=" << pending_actions_.size();
   }
 }
 
@@ -352,15 +355,22 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(const ImeBridgePending
         }
       }
 
-      // 如果是当前 cycle 的第一次 set，记录为 base
-      if (state.depth == 0) {
-        state.base = current_ascii;
-        state.has_base = true;
+      // 如果是 stack=true (默认行为)，则更新 depth 和 base
+      if (action.stack) {
+        // 如果是当前 cycle 的第一次 set，记录为 base
+        if (state.depth == 0) {
+          state.base = current_ascii;
+          state.has_base = true;
+          if (config_.debug) {
+            LOG(INFO) << "[ImeBridge] ApplyAction kSet: saved base=" << state.base;
+          }
+        }
+        state.depth++;
+      } else {
         if (config_.debug) {
-          LOG(INFO) << "[ImeBridge] ApplyAction kSet: saved base=" << state.base;
+           LOG(INFO) << "[ImeBridge] ApplyAction kSet: non-stack set, skipping flow control";
         }
       }
-      state.depth++;
 
       result.should_set = true;
       result.ascii_mode = action.ascii;
@@ -448,6 +458,9 @@ ImeBridge::ImeBridge(const Ticket& ticket) : CopilotPlugin<ImeBridge>(ticket) {
     auto& server = ImeBridgeServer::Instance();
     server.AddRef();
     server.Start(config_);
+    if (engine_) {
+      // server.RegisterContext(engine_->context()); // Removed
+    }
   }
 
   LOG(INFO) << "[ImeBridge] Initialized. enable=" << config_.enable
@@ -456,6 +469,10 @@ ImeBridge::ImeBridge(const Ticket& ticket) : CopilotPlugin<ImeBridge>(ticket) {
 
 ImeBridge::~ImeBridge() {
   if (enabled_) {
+    // auto& server = ImeBridgeServer::Instance();
+    // if (engine_) {
+    //   server.UnregisterContext(engine_->context()); // Removed
+    // }
     ImeBridgeServer::Instance().Release();
   }
   LOG(INFO) << "[ImeBridge] Destroyed.";
