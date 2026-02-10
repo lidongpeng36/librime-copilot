@@ -48,9 +48,9 @@ struct ImeBridgePendingAction {
   };
   Type type = kNone;
   std::string client_key;
-  bool ascii = true;    // for kSet
-  bool stack = true;    // for kSet: if true, increment depth and save base
-  bool restore = true;  // for kReset
+  bool ascii = true;        // for kSet
+  bool stack = true;        // for kSet: if true, increment depth and save base
+  bool restore = true;      // for kReset
   std::string char_before;  // for kContext
   std::string char_after;   // for kContext
 };
@@ -105,7 +105,8 @@ class ImeBridgeServer {
   void HandleRestore(const std::string& client_key);
   void HandleReset(const std::string& client_key, bool restore);
   void HandleUnregister(const std::string& client_key);
-  void HandleContext(const std::string& client_key, const std::string& before, const std::string& after);
+  void HandleContext(const std::string& client_key, const std::string& before,
+                     const std::string& after);
   void HandleClearContext(const std::string& client_key);
   void HandleActivate(const std::string& client_key);
   void HandleDeactivate(const std::string& client_key);

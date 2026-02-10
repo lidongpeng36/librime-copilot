@@ -20,10 +20,9 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
   ProcessResult Process(Context* ctx, const KeyEvent& key_event);
 
   // Path 1: Process with real surrounding context (completely independent)
-  ProcessResult ProcessWithSurroundingContext(Context* ctx,
-                                               const KeyEvent& key_event,
-                                               const SurroundingText& surrounding,
-                                               const std::string& client_key);
+  ProcessResult ProcessWithSurroundingContext(Context* ctx, const KeyEvent& key_event,
+                                              const SurroundingText& surrounding,
+                                              const std::string& client_key);
 
   // Path 2: Process with commit_history (original logic)
   ProcessResult ProcessWithCommitHistory(Context* ctx, const KeyEvent& key_event);

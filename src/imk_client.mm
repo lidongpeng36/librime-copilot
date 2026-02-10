@@ -61,7 +61,7 @@ void CacheSurroundingText(id controller, id sender) {
     return;
   }
 
-  typedef NSAttributedString *(*AttrSubFn)(id, SEL, NSRange);
+  typedef NSAttributedString* (*AttrSubFn)(id, SEL, NSRange);
   AttrSubFn attrSub = (AttrSubFn)objc_msgSend;
 
   std::string charBefore;
@@ -69,29 +69,29 @@ void CacheSurroundingText(id controller, id sender) {
   std::string clientKey = "imk:unknown";
   {
     if (sender) {
-      const char *senderClass = object_getClassName(sender);
-      NSString *senderAddr = [NSString stringWithFormat:@"%p", sender];
-      NSString *key = [NSString stringWithFormat:@"imk_sender:%s:%@", senderClass ?: "unknown",
-                                                    senderAddr];
+      const char* senderClass = object_getClassName(sender);
+      NSString* senderAddr = [NSString stringWithFormat:@"%p", sender];
+      NSString* key =
+          [NSString stringWithFormat:@"imk_sender:%s:%@",
+                                     senderClass ?: "unknown", senderAddr];
       clientKey = [key UTF8String] ?: "imk:unknown";
     } else {
-      NSString *clientAddr = [NSString stringWithFormat:@"%p", client];
+      NSString* clientAddr = [NSString stringWithFormat:@"%p", client];
       clientKey = [clientAddr UTF8String] ?: "imk:unknown";
     }
   }
 
   if (selRange.location > 0) {
     NSRange beforeRange = NSMakeRange(selRange.location - 1, 1);
-    NSAttributedString *before = attrSub(client, attrSubSel, beforeRange);
+    NSAttributedString* before = attrSub(client, attrSubSel, beforeRange);
     if (before) {
       charBefore = [[before string] UTF8String] ?: "";
     }
   }
 
   {
-    NSRange afterRange =
-        NSMakeRange(selRange.location + selRange.length, 1);
-    NSAttributedString *after = attrSub(client, attrSubSel, afterRange);
+    NSRange afterRange = NSMakeRange(selRange.location + selRange.length, 1);
+    NSAttributedString* after = attrSub(client, attrSubSel, afterRange);
     if (after) {
       charAfter = [[after string] UTF8String] ?: "";
     }
@@ -103,15 +103,14 @@ void CacheSurroundingText(id controller, id sender) {
 }
 
 // Swizzled handleEvent:client:
-static BOOL swizzled_handleEvent(id self, SEL _cmd, void *event,
-                                 id sender) {
+static BOOL swizzled_handleEvent(id self, SEL _cmd, void* event, id sender) {
   @autoreleasepool {
     CacheSurroundingText(self, sender);
   }
 
   // Call original implementation
-  return ((BOOL(*)(id, SEL, void *, id))s_originalHandleEvent)(
-      self, _cmd, event, sender);
+  return ((BOOL(*)(id, SEL, void*, id))s_originalHandleEvent)(self, _cmd, event,
+                                                              sender);
 }
 
 // Initialize the hook at load time
@@ -124,7 +123,7 @@ __attribute__((constructor)) static void InitIMKClientHook() {
     Class targetClass = nil;
     if (imkBase) {
       unsigned int classCount = 0;
-      Class *classes = objc_copyClassList(&classCount);
+      Class* classes = objc_copyClassList(&classCount);
       for (unsigned int i = 0; i < classCount; i++) {
         Class superclass = class_getSuperclass(classes[i]);
         while (superclass) {

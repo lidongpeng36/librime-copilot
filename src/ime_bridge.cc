@@ -253,7 +253,7 @@ void ImeBridgeServer::HandleSet(const std::string& client_key, bool ascii, bool 
 
   if (config_.debug) {
     LOG(INFO) << "[ImeBridge] HandleSet: client=" << client_key << ", ascii=" << ascii
-              << ", stack=" << stack << ", depth=" << state.depth 
+              << ", stack=" << stack << ", depth=" << state.depth
               << ", queue_size=" << pending_actions_.size();
   }
 }
@@ -307,9 +307,8 @@ void ImeBridgeServer::HandleUnregister(const std::string& client_key) {
   }
 }
 
-void ImeBridgeServer::HandleContext(const std::string& client_key,
-                                     const std::string& before,
-                                     const std::string& after) {
+void ImeBridgeServer::HandleContext(const std::string& client_key, const std::string& before,
+                                    const std::string& after) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto& state = client_states_[client_key];
   state.char_before = before;
@@ -318,8 +317,8 @@ void ImeBridgeServer::HandleContext(const std::string& client_key,
   state.last_active = std::chrono::steady_clock::now();
 
   if (config_.debug) {
-    LOG(INFO) << "[ImeBridge] HandleContext: client=" << client_key
-              << ", before='" << before << "', after='" << after << "'";
+    LOG(INFO) << "[ImeBridge] HandleContext: client=" << client_key << ", before='" << before
+              << "', after='" << after << "'";
   }
 }
 
@@ -452,7 +451,7 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(const ImeBridgePending
         state.depth++;
       } else {
         if (config_.debug) {
-           LOG(INFO) << "[ImeBridge] ApplyAction kSet: non-stack set, skipping flow control";
+          LOG(INFO) << "[ImeBridge] ApplyAction kSet: non-stack set, skipping flow control";
         }
       }
 
