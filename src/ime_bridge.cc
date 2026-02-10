@@ -118,9 +118,12 @@ void ImeBridgeServer::RunServer() {
       }
       continue;
     }
-
-    HandleConnection(client_fd);
-    close(client_fd);
+    // Handle each client on its own thread so multiple Neovim instances can
+    // keep long-lived connections concurrently.
+    std::thread([this, client_fd]() {
+      HandleConnection(client_fd);
+      close(client_fd);
+    }).detach();
   }
 }
 
@@ -186,10 +189,6 @@ void ImeBridgeServer::ProcessMessage(const std::string& message) {
       LOG(INFO) << "[ImeBridge] Received: client=" << client_key << ", action=" << action;
     }
 
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      active_client_ = client_key;
-    }
     TouchClient(client_key);
 
     if (action == "set") {
@@ -203,6 +202,16 @@ void ImeBridgeServer::ProcessMessage(const std::string& message) {
       HandleReset(client_key, restore);
     } else if (action == "unregister") {
       HandleUnregister(client_key);
+    } else if (action == "context") {
+      std::string before = data.value("before", "");
+      std::string after = data.value("after", "");
+      HandleContext(client_key, before, after);
+    } else if (action == "clear_context") {
+      HandleClearContext(client_key);
+    } else if (action == "activate") {
+      HandleActivate(client_key);
+    } else if (action == "deactivate") {
+      HandleDeactivate(client_key);
     } else if (action == "ping") {
       if (config_.debug) {
         LOG(INFO) << "[ImeBridge] Ping received from " << client_key;
@@ -298,11 +307,86 @@ void ImeBridgeServer::HandleUnregister(const std::string& client_key) {
   }
 }
 
+void ImeBridgeServer::HandleContext(const std::string& client_key,
+                                     const std::string& before,
+                                     const std::string& after) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto& state = client_states_[client_key];
+  state.char_before = before;
+  state.char_after = after;
+  state.context_valid = true;
+  state.last_active = std::chrono::steady_clock::now();
+
+  if (config_.debug) {
+    LOG(INFO) << "[ImeBridge] HandleContext: client=" << client_key
+              << ", before='" << before << "', after='" << after << "'";
+  }
+}
+
+void ImeBridgeServer::HandleClearContext(const std::string& client_key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = client_states_.find(client_key);
+  if (it != client_states_.end()) {
+    it->second.context_valid = false;
+    it->second.char_before.clear();
+    it->second.char_after.clear();
+    it->second.last_active = std::chrono::steady_clock::now();
+    if (active_client_ == client_key) {
+      active_client_.clear();
+    }
+  }
+
+  if (config_.debug) {
+    LOG(INFO) << "[ImeBridge] HandleClearContext: client=" << client_key;
+  }
+}
+
+void ImeBridgeServer::HandleActivate(const std::string& client_key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto& state = client_states_[client_key];
+  state.last_active = std::chrono::steady_clock::now();
+  active_client_ = client_key;
+  if (config_.debug) {
+    LOG(INFO) << "[ImeBridge] HandleActivate: client=" << client_key;
+  }
+}
+
+void ImeBridgeServer::HandleDeactivate(const std::string& client_key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = client_states_.find(client_key);
+  if (it != client_states_.end()) {
+    it->second.last_active = std::chrono::steady_clock::now();
+  }
+  if (active_client_ == client_key) {
+    active_client_.clear();
+  }
+  if (config_.debug) {
+    LOG(INFO) << "[ImeBridge] HandleDeactivate: client=" << client_key;
+  }
+}
+
 std::queue<ImeBridgePendingAction> ImeBridgeServer::TakePendingActions() {
   std::lock_guard<std::mutex> lock(mutex_);
   std::queue<ImeBridgePendingAction> result;
   std::swap(result, pending_actions_);
   return result;
+}
+
+std::optional<SurroundingText> ImeBridgeServer::GetActiveContext() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  if (active_client_.empty()) {
+    return std::nullopt;
+  }
+
+  auto it = client_states_.find(active_client_);
+  if (it == client_states_.end()) {
+    return std::nullopt;
+  }
+  if (!it->second.context_valid) {
+    return std::nullopt;
+  }
+  return SurroundingText{it->second.char_before, it->second.char_after, active_client_};
 }
 
 void ImeBridgeServer::CleanupStaleClients() {
@@ -433,6 +517,34 @@ ImeBridgeServer::ApplyResult ImeBridgeServer::ApplyAction(const ImeBridgePending
       break;
     }
 
+    case ImeBridgePendingAction::kContext: {
+      auto& state = client_states_[action.client_key];
+      state.char_before = action.char_before;
+      state.char_after = action.char_after;
+      state.context_valid = true;
+      state.last_active = std::chrono::steady_clock::now();
+
+      if (config_.debug) {
+        LOG(INFO) << "[ImeBridge] ApplyAction kContext: client=" << action.client_key
+                  << ", before='" << action.char_before << "', after='" << action.char_after << "'";
+      }
+      break;
+    }
+
+    case ImeBridgePendingAction::kClearContext: {
+      auto it = client_states_.find(action.client_key);
+      if (it != client_states_.end()) {
+        it->second.context_valid = false;
+        it->second.char_before.clear();
+        it->second.char_after.clear();
+
+        if (config_.debug) {
+          LOG(INFO) << "[ImeBridge] ApplyAction kClearContext: client=" << action.client_key;
+        }
+      }
+      break;
+    }
+
     default:
       break;
   }
@@ -497,7 +609,6 @@ void ImeBridge::ApplyPendingActions(Context* ctx) {
   }
 
   auto& server = ImeBridgeServer::Instance();
-  server.CleanupStaleClients();
 
   auto actions = server.TakePendingActions();
 

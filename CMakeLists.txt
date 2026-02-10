@@ -27,6 +27,8 @@ if (APPLE)
   find_library(IOKIT_LIBRARY IOKit REQUIRED)
   find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
   list(APPEND LINK_LIBS ${IOKIT_LIBRARY} ${COREFOUNDATION_LIBRARY})
+  # ObjC++ source for IMK client access (not picked up by aux_source_directory)
+  list(APPEND copilot_src src/imk_client.mm)
 endif()
 
 add_library(rime-copilot-objs OBJECT ${copilot_src})

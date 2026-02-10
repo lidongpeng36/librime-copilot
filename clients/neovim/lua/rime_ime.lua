@@ -10,6 +10,7 @@ local connected = false
 local connecting = false
 local pending_messages = {}
 local enabled = false
+local pending_insert_leave_timer = nil
 
 local config = {
   socket_path = "/tmp/rime_copilot_ime.sock",
@@ -92,22 +93,52 @@ local function log(msg)
   end
 end
 
+-- Get surrounding text (up to 2 chars before and 1 char after cursor)
+local function get_surrounding()
+  local ok, before, after = pcall(function()
+    local _, col = unpack(vim.api.nvim_win_get_cursor(0))
+    local line = vim.api.nvim_get_current_line()
+
+    if line == "" then
+      return "", ""
+    end
+
+    -- Convert cursor byte offset to UTF-8 character index, then slice by characters.
+    -- This is robust for CJK content and avoids byte-boundary drift.
+    local char_index = vim.str_utfindex(line, col)
+    local char_count = vim.fn.strchars(line)
+
+    local before_len = math.min(2, math.max(0, char_index))
+    local before_start = math.max(0, char_index - before_len)
+    local b = ""
+    if before_len > 0 then
+      b = vim.fn.strcharpart(line, before_start, before_len)
+    end
+
+    local a = ""
+    if char_index < char_count then
+      a = vim.fn.strcharpart(line, char_index, 1)
+    end
+
+    return b, a
+  end)
+
+  if ok then
+    return before or "", after or ""
+  else
+    return "", ""
+  end
+end
+
 -- Build JSON message
 local function build_message(action, data)
-  -- 使用 Buffer ID 作为 instance 的一部分，实现 per-buffer 状态隔离
-  local current_instance = config.instance
-  if vim.api.nvim_get_current_buf then
-    local buf = vim.api.nvim_get_current_buf()
-    current_instance = current_instance .. ":" .. tostring(buf)
-  end
-
   local msg = {
     v = 1,
     ns = "rime.ime",
     type = "ascii",
     src = {
       app = config.app_name,
-      instance = current_instance,
+      instance = config.instance,
     },
     data = vim.tbl_extend("force", { action = action }, data or {}),
   }
@@ -249,6 +280,38 @@ function M.ping()
   send("ping")
 end
 
+--- Mark current client as active context owner
+function M.activate()
+  if not enabled then return end
+  send("activate")
+end
+
+--- Mark current client as inactive context owner
+function M.deactivate()
+  if not enabled then return end
+  send("deactivate")
+end
+
+--- Push surrounding text context
+function M.context()
+  if not enabled then return end
+
+  -- Only push context in insert/replace mode
+  local mode = vim.fn.mode()
+  if mode ~= 'i' and mode ~= 'R' then
+    return
+  end
+
+  local before, after = get_surrounding()
+  send("context", { before = before, after = after })
+end
+
+--- Clear surrounding text context
+function M.clear_context()
+  if not enabled then return end
+  send("clear_context")
+end
+
 --- Get current config
 function M.get_config()
   return vim.deepcopy(config)
@@ -281,27 +344,83 @@ function M.setup(opts)
 
   local group = vim.api.nvim_create_augroup("RimeIme", { clear = true })
 
-  -- Insert mode: restore previous mode
+  -- Insert mode: restore previous mode and push context
   vim.api.nvim_create_autocmd("InsertEnter", {
     group = group,
     callback = function()
+      if pending_insert_leave_timer then
+        pcall(function() pending_insert_leave_timer:stop() end)
+        pcall(function() pending_insert_leave_timer:close() end)
+        pending_insert_leave_timer = nil
+      end
+      M.activate()
       M.restore()
+      M.context()
+      vim.defer_fn(function()
+        M.context()
+      end, 10)
     end,
   })
 
-  -- Leave Insert mode: set ascii
+  -- Push context on cursor movement in insert mode
+  vim.api.nvim_create_autocmd("CursorMovedI", {
+    group = group,
+    callback = function()
+      M.context()
+    end,
+  })
+
+  -- Push context on text change in insert mode
+  vim.api.nvim_create_autocmd("TextChangedI", {
+    group = group,
+    callback = function()
+      M.context()
+    end,
+  })
+
+  -- Push context before each inserted character.
+  -- This improves first-key boundary accuracy for auto spacing.
+  vim.api.nvim_create_autocmd("InsertCharPre", {
+    group = group,
+    callback = function()
+      M.context()
+    end,
+  })
+
+  -- Leave Insert mode: set ascii and clear context
   vim.api.nvim_create_autocmd("InsertLeave", {
     group = group,
     callback = function()
-      M.set(true)
+      if pending_insert_leave_timer then
+        pcall(function() pending_insert_leave_timer:stop() end)
+        pcall(function() pending_insert_leave_timer:close() end)
+      end
+      pending_insert_leave_timer = uv.new_timer()
+      pending_insert_leave_timer:start(60, 0, vim.schedule_wrap(function()
+        if not enabled then
+          return
+        end
+        local mode = vim.fn.mode()
+        if mode ~= "i" and mode ~= "R" then
+          M.set(true)
+          M.deactivate()
+          M.clear_context()
+        end
+        if pending_insert_leave_timer then
+          pcall(function() pending_insert_leave_timer:close() end)
+          pending_insert_leave_timer = nil
+        end
+      end))
     end,
   })
 
-  -- Command mode: set ascii
+  -- Command mode: set ascii and clear context
   vim.api.nvim_create_autocmd("CmdlineEnter", {
     group = group,
     callback = function()
       M.set(true)
+      M.deactivate()
+      M.clear_context()
     end,
   })
 
@@ -313,16 +432,29 @@ function M.setup(opts)
     end,
   })
 
-  -- FocusGained/WinEnter: ensure ascii if in normal mode (without stacking)
-  vim.api.nvim_create_autocmd({ "FocusGained", "WinEnter" }, {
+  -- FocusGained: ensure ascii if in normal mode (without stacking)
+  vim.api.nvim_create_autocmd({ "FocusGained" }, {
     group = group,
     callback = function()
       -- 延迟执行以确保在 OS/IDE 焦点切换和状态恢复完成后强制覆盖
       local mode = vim.fn.mode()
-      if mode ~= "i" and mode ~= "R" and mode ~= "c" then
+      if mode == "i" or mode == "R" then
+        M.activate()
+        M.context()
+      elseif mode ~= "c" then
         -- 使用 stack=false 避免影响 restore 栈
         M.set(true, { stack = false })
+        M.deactivate()
+        M.clear_context()
       end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "FocusLost" }, {
+    group = group,
+    callback = function()
+      M.deactivate()
+      M.clear_context()
     end,
   })
 
@@ -349,6 +481,8 @@ function M.setup(opts)
     group = group,
     callback = function()
       M.reset(true)  -- 恢复到 Neovim 启动时的状态
+      M.deactivate()
+      M.clear_context()
       M.unregister() -- 清除注册
       disconnect()
     end,

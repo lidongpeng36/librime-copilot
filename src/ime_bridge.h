@@ -4,12 +4,14 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
 
 #include "copilot_plugin.h"
+#include "imk_client.h"
 
 namespace rime {
 
@@ -24,16 +26,33 @@ struct ImeBridgeClientState {
   int depth = 0;                                      // set 嵌套层数
   bool current_target = true;                         // 最近一次 set 的目标值
   std::chrono::steady_clock::time_point last_active;  // 最后活动时间
+
+  // Surrounding text context
+  std::string char_before;
+  std::string char_after;
+  bool context_valid = false;
 };
 
 // 待处理的 action
 struct ImeBridgePendingAction {
-  enum Type { kNone, kSet, kRestore, kReset, kUnregister };
+  enum Type {
+    kNone,
+    kSet,
+    kRestore,
+    kReset,
+    kUnregister,
+    kContext,
+    kClearContext,
+    kActivate,
+    kDeactivate
+  };
   Type type = kNone;
   std::string client_key;
   bool ascii = true;    // for kSet
   bool stack = true;    // for kSet: if true, increment depth and save base
   bool restore = true;  // for kReset
+  std::string char_before;  // for kContext
+  std::string char_after;   // for kContext
 };
 
 // 共享的 ImeBridge 服务器状态（跨所有 session 共享）
@@ -62,6 +81,8 @@ class ImeBridgeServer {
   bool IsRunning() const { return running_.load(); }
   bool IsDebug() const { return config_.debug; }
 
+  // 获取活跃客户端的上下文信息（线程安全）
+  std::optional<SurroundingText> GetActiveContext();
 
   // 获取待处理的 actions（线程安全）
   std::queue<ImeBridgePendingAction> TakePendingActions();
@@ -84,6 +105,10 @@ class ImeBridgeServer {
   void HandleRestore(const std::string& client_key);
   void HandleReset(const std::string& client_key, bool restore);
   void HandleUnregister(const std::string& client_key);
+  void HandleContext(const std::string& client_key, const std::string& before, const std::string& after);
+  void HandleClearContext(const std::string& client_key);
+  void HandleActivate(const std::string& client_key);
+  void HandleDeactivate(const std::string& client_key);
   void TouchClient(const std::string& client_key);
 
   static std::string MakeClientKey(const std::string& app, const std::string& instance);

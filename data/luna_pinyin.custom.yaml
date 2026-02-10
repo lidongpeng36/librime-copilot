@@ -8,3 +8,5 @@ patch:
     db: copilot.db
     max_iterations: 3
     max_candidates: 10
+    auto_spacer:
+      enable_right_space: true
