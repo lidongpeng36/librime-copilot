@@ -595,10 +595,8 @@ ProcessResult AutoSpacer::ProcessWithCommitHistory(Context* ctx, const KeyEvent&
       }
     }
 
-    const bool is_space_punct =
-        IsAsciiPunctuationCode(last_ascii_char) && last_ascii_char != '`';
-    if ((IsAlphabetKey(last_ascii_char) || is_space_punct) &&
-        !ascii_mode) {
+    const bool is_space_punct = IsAsciiPunctuationCode(last_ascii_char) && last_ascii_char != '`';
+    if ((IsAlphabetKey(last_ascii_char) || is_space_punct) && !ascii_mode) {
       // 如果是回车直接上屏的英文，不添加空格
       if (is_thru_commit && IsAlphabetKey(last_ascii_char)) {
         DLOG(INFO) << "[SKIP] previous was thru/raw commit";
