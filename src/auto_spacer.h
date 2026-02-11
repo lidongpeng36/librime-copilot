@@ -35,8 +35,8 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
   struct ClientState {
     // Stores boundary when composition starts, used at commit time.
     // During composition, IMK context may reflect marked text position.
-    std::string context_before_composition;
-    std::string context_after_composition;
+    std::string before;
+    std::string after;
   };
   std::unordered_map<std::string, ClientState> client_states_;
   bool enable_right_space_ = true;

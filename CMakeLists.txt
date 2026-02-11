@@ -20,6 +20,15 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(llama nlohmann_json)
 
+# GCC 13 may emit false-positive -Wmaybe-uninitialized warnings in
+# upstream llama.cpp regex code (treated as errors in some CI setups).
+# Limit suppression to the third-party llama target only.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(llama PRIVATE
+    -Wno-maybe-uninitialized
+    -Wno-error=maybe-uninitialized)
+endif()
+
 aux_source_directory(src copilot_src)
 
 set(LINK_LIBS llama nlohmann_json::nlohmann_json)

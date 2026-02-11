@@ -362,13 +362,6 @@ static std::string DecorateCommitText(const std::string& text, const std::string
   return result;
 }
 
-static std::string ResolveBoundaryBefore(Context* ctx, const std::string& surrounding_before) {
-  (void)ctx;
-  // In surrounding-context path, trust client-provided boundary directly.
-  // Empty before means true line/file start; do not fall back to history.
-  return surrounding_before;
-}
-
 // Path 1: Process with real surrounding context (completely independent)
 ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyEvent& key_event,
                                                         const SurroundingText& surrounding,
@@ -377,16 +370,18 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   const auto& input = ctx->input();
   const bool ascii_mode = ctx->get_option("ascii_mode");
   const std::string effective_client_key = client_key.empty() ? "__default__" : client_key;
-  const std::string boundary_before_now = ResolveBoundaryBefore(ctx, surrounding.before);
-  auto& client_state = client_states_[effective_client_key];
-  const std::string boundary_after_now = surrounding.after;
+  const std::string& raw_before = surrounding.before;
+  const std::string& raw_after = surrounding.after;
 
+  auto& client_state = client_states_[effective_client_key];
   const auto& latest_text = ctx->commit_history().latest_text();
-  DLOG(INFO) << "[SurroundingText] " << std::showbase << std::hex << " keycode=" << keycode << "("
+  DLOG(INFO) << "[SurroundingText]" << std::showbase << std::hex << " keycode=" << keycode << "("
              << string(1, keycode) << ")" << ", input='" << input << "'"
              << ", ascii_mode=" << ascii_mode << ", latest_text='" << latest_text << "'["
              << ctx->commit_history().back().type << "], modifier=" << key_event.modifier()
-             << ", before='" << surrounding.before << "', after='" << surrounding.after << "'";
+             << ", raw_before='" << raw_before << "', raw_after='" << raw_after
+             << "', client_before='" << client_state.before << "', client_after='"
+             << client_state.after << "'";
 
   if (key_event.modifier() != 0 || keycode >= XK_Shift_L) {
     return kNoop;
@@ -400,7 +395,7 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     if (!IsAlphabetKey(keycode)) {
       return kNoop;
     }
-    if (NeedSpaceBefore(boundary_before_now, true)) {
+    if (NeedSpaceBefore(raw_before, true)) {
       engine_->CommitText(AddSpace(keycode));
       return kAccepted;
     }
@@ -409,23 +404,20 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
 
   // Non-ASCII mode: cache boundary whenever not composing.
   if (input.empty()) {
-    client_state.context_before_composition = boundary_before_now;
-    client_state.context_after_composition = boundary_after_now;
+    client_state.before = raw_before;
+    client_state.after = raw_after;
     return kNoop;
   }
 
-  const std::string before = client_state.context_before_composition.empty()
-                                 ? boundary_before_now
-                                 : client_state.context_before_composition;
-  const std::string after = client_state.context_after_composition.empty()
-                                ? boundary_after_now
-                                : client_state.context_after_composition;
+  const std::string before = client_state.before;
+  const std::string after = client_state.after.empty() ? raw_after : client_state.after;
+  DLOG(INFO) << "[SurroundingText] " << "Before='" << before << "', After='" << after << "'";
 
   // Keep behavior consistent with ProcessWithCommitHistory:
   // after Chinese full stop, force-refresh preedit on first letter key.
   if (IsLetterKey(keycode)) {
     const bool after_period = !ascii_mode && (latest_text == "。" || latest_text == ".");
-    if ((!input.empty()) || after_period) {
+    if (!input.empty() || after_period) {
       ctx->set_input(input + std::string(1, static_cast<char>(keycode)));
       return kAccepted;
     }
@@ -435,8 +427,8 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   if (keycode == XK_Return || keycode == XK_KP_Enter) {
     engine_->CommitText(DecorateCommitText(input, before, after, true, enable_right_space_));
     ctx->Clear();
-    client_state.context_before_composition.clear();
-    client_state.context_after_composition.clear();
+    client_state.before.clear();
+    client_state.after.clear();
     return kAccepted;
   }
 
@@ -454,8 +446,8 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     engine_->CommitText(
         DecorateCommitText(text, before, after, content_is_ascii, enable_right_space_));
     ctx->Clear();
-    client_state.context_before_composition.clear();
-    client_state.context_after_composition.clear();
+    client_state.before.clear();
+    client_state.after.clear();
     return kAccepted;
   }
 
@@ -471,8 +463,8 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     std::string raw = input + std::string(1, static_cast<char>(keycode));
     engine_->CommitText(DecorateCommitText(raw, before, after, true, enable_right_space_));
     ctx->Clear();
-    client_state.context_before_composition.clear();
-    client_state.context_after_composition.clear();
+    client_state.before.clear();
+    client_state.after.clear();
     return kAccepted;
   };
 
@@ -492,8 +484,8 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   engine_->CommitText(
       DecorateCommitText(cand->text(), before, after, cand_is_ascii, enable_right_space_));
   ctx->Clear();
-  client_state.context_before_composition.clear();
-  client_state.context_after_composition.clear();
+  client_state.before.clear();
+  client_state.after.clear();
   return kAccepted;
 }
 
