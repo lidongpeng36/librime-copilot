@@ -31,6 +31,11 @@ endif()
 
 aux_source_directory(src copilot_src)
 
+# `aux_source_directory` may collect Objective-C++ source on non-Apple hosts.
+# Keep IMK integration strictly macOS-only to avoid Linux CI trying to compile
+# `imk_client.mm` without Objective-C++ toolchain (cc1objplus).
+list(REMOVE_ITEM copilot_src ${CMAKE_CURRENT_SOURCE_DIR}/src/imk_client.mm)
+
 set(LINK_LIBS llama nlohmann_json::nlohmann_json)
 if (APPLE)
   find_library(IOKIT_LIBRARY IOKit REQUIRED)
