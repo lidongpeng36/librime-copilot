@@ -193,7 +193,9 @@ ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_even
   if (num == 0 || num > page_size) {
     // ctx->set_input(input + std::string(1, keycode));
     auto str = input + std::string(1, keycode);
-    engine_->CommitText(NeedAddSpace(ctx, key_event) ? " " + str : str);
+    auto commit_str = NeedAddSpace(ctx, key_event) ? " " + str : str;
+    engine_->CommitText(commit_str);
+    if (!commit_str.empty()) ctx->commit_history().push_back({"raw", commit_str});
     ctx->Clear();
     return kAccepted;
   }
@@ -209,7 +211,9 @@ ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_even
   DLOG(INFO) << "Input Num=" << num << ", n_cand=" << n_cand;
   if (num > n_cand && !input.empty()) {
     auto str = input + std::string(1, keycode);
-    engine_->CommitText(NeedAddSpace(ctx, key_event) ? " " + str : str);
+    auto commit_str = NeedAddSpace(ctx, key_event) ? " " + str : str;
+    engine_->CommitText(commit_str);
+    if (!commit_str.empty()) ctx->commit_history().push_back({"raw", commit_str});
     ctx->Clear();
     return kAccepted;
   }
@@ -396,7 +400,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
       return kNoop;
     }
     if (NeedSpaceBefore(raw_before, true)) {
-      engine_->CommitText(AddSpace(keycode));
+      auto commit_str = AddSpace(keycode);
+      engine_->CommitText(commit_str);
+      if (!commit_str.empty()) ctx->commit_history().push_back({"raw", commit_str});
       return kAccepted;
     }
     return kNoop;
@@ -406,6 +412,13 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   if (input.empty()) {
     client_state.before = raw_before;
     client_state.after = raw_after;
+    if (IsLetterKey(keycode)) {
+      const bool after_period = !ascii_mode && (latest_text == "。" || latest_text == ".");
+      if (after_period) {
+        ctx->set_input(std::string(1, static_cast<char>(keycode)));
+        return kAccepted;
+      }
+    }
     return kNoop;
   }
 
@@ -425,7 +438,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
 
   // Enter: raw commit as ASCII.
   if (keycode == XK_Return || keycode == XK_KP_Enter) {
-    engine_->CommitText(DecorateCommitText(input, before, after, true, enable_right_space_));
+    auto decorated_text = DecorateCommitText(input, before, after, true, enable_right_space_);
+    engine_->CommitText(decorated_text);
+    if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -443,8 +458,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
         content_is_ascii = false;
       }
     }
-    engine_->CommitText(
-        DecorateCommitText(text, before, after, content_is_ascii, enable_right_space_));
+    auto decorated_text = DecorateCommitText(text, before, after, content_is_ascii, enable_right_space_);
+    engine_->CommitText(decorated_text);
+    if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -461,7 +477,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   // Number key fallback to raw ASCII commit.
   auto commit_raw = [&]() {
     std::string raw = input + std::string(1, static_cast<char>(keycode));
-    engine_->CommitText(DecorateCommitText(raw, before, after, true, enable_right_space_));
+    auto decorated_text = DecorateCommitText(raw, before, after, true, enable_right_space_);
+    engine_->CommitText(decorated_text);
+    if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -481,8 +499,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   }
 
   const bool cand_is_ascii = IsPureAsciiText(cand->text());
-  engine_->CommitText(
-      DecorateCommitText(cand->text(), before, after, cand_is_ascii, enable_right_space_));
+  auto decorated_text = DecorateCommitText(cand->text(), before, after, cand_is_ascii, enable_right_space_);
+  engine_->CommitText(decorated_text);
+  if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
   ctx->Clear();
   client_state.before.clear();
   client_state.after.clear();
@@ -601,7 +620,9 @@ ProcessResult AutoSpacer::ProcessWithCommitHistory(Context* ctx, const KeyEvent&
 
     if (last_ascii_char < 0 && ascii_mode) {
       DLOG(INFO) << "[ADD] 为 ascii mode 添加空格 (from history)";
-      engine_->CommitText(AddSpace(keycode));
+      auto commit_str = AddSpace(keycode);
+      engine_->CommitText(commit_str);
+      if (!commit_str.empty()) ctx->commit_history().push_back({"raw", commit_str});
       return kAccepted;
     }
   }
