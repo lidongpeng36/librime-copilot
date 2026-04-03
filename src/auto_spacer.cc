@@ -498,14 +498,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     return commit_raw();
   }
 
-  const bool cand_is_ascii = IsPureAsciiText(cand->text());
-  auto decorated_text = DecorateCommitText(cand->text(), before, after, cand_is_ascii, enable_right_space_);
-  engine_->CommitText(decorated_text);
-  if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
-  ctx->Clear();
-  client_state.before.clear();
-  client_state.after.clear();
-  return kAccepted;
+  // Let Rime's Selector handle candidate selection normally.
+  // Direct commit here would prematurely flush a multi-segment composition.
+  return kNoop;
 }
 
 // Path 2: Process with commit_history (original logic)
