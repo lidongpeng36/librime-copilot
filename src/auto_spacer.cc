@@ -1,5 +1,6 @@
 #include "auto_spacer.h"
 
+#include <rime/config.h>
 #include <rime/context.h>
 #include <rime/engine.h>
 #include <rime/key_event.h>
@@ -74,6 +75,65 @@ inline bool IsModifierPunctKey(int keycode) {
 
 inline bool IsAsciiPunctuationCode(int keycode) {
   return keycode >= 0 && keycode < 0x80 && std::ispunct(static_cast<unsigned char>(keycode));
+}
+
+// 从 schema 的 punctuator/full_shape 里查找 keycode 对应的"默认" 中文标点.
+// 优先顺序: full_shape → symbols. 返回空串表示没有匹配的中文映射.
+// 对于各种 ConfigItem 类型, 选择规则与 Rime 的 Punctuator 一致:
+//   - ConfigValue: 整个值
+//   - ConfigList:  第 0 项 (AlternatingPunct 的默认)
+//   - ConfigMap.commit: commit 值 (AutoCommitPunct)
+//   - ConfigMap.pair:   pair[0] (PairedPunct 的默认)
+inline std::string ExtractPunctDefault(an<ConfigItem> item) {
+  if (!item) return {};
+  if (auto v = As<ConfigValue>(item)) {
+    return v->str();
+  }
+  if (auto list = As<ConfigList>(item)) {
+    if (list->size() > 0) {
+      if (auto v = list->GetValueAt(0)) {
+        return v->str();
+      }
+    }
+    return {};
+  }
+  if (auto map = As<ConfigMap>(item)) {
+    if (auto commit = map->Get("commit")) {
+      if (auto v = As<ConfigValue>(commit)) {
+        return v->str();
+      }
+    }
+    if (auto pair = map->Get("pair")) {
+      if (auto pair_list = As<ConfigList>(pair)) {
+        if (pair_list->size() > 0) {
+          if (auto v = pair_list->GetValueAt(0)) {
+            return v->str();
+          }
+        }
+      }
+    }
+  }
+  return {};
+}
+
+inline std::string LookupFullShapePunct(Engine* engine, int keycode) {
+  if (!engine || !engine->schema()) return {};
+  Config* config = engine->schema()->config();
+  if (!config) return {};
+  std::string key(1, static_cast<char>(keycode));
+  // full_shape 优先
+  if (auto m = config->GetMap("punctuator/full_shape")) {
+    if (auto text = ExtractPunctDefault(m->Get(key)); !text.empty()) {
+      return text;
+    }
+  }
+  // 回退到 symbols
+  if (auto m = config->GetMap("punctuator/symbols")) {
+    if (auto text = ExtractPunctDefault(m->Get(key)); !text.empty()) {
+      return text;
+    }
+  }
+  return {};
 }
 
 inline bool IsSpaceKey(int keycode) {
@@ -387,8 +447,41 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
              << "', client_before='" << client_state.before << "', client_after='"
              << client_state.after << "'";
 
-  if (key_event.modifier() != 0 || keycode >= XK_Shift_L) {
+  // 带 Ctrl/Alt/Super 的通常是快捷键, 不走标点/输入处理. Shift 要放行, 因为
+  // ASCII 标点键本身就依赖 Shift (例如 '@' = Shift+2, '#' = Shift+3).
+  if (key_event.ctrl() || key_event.alt() || key_event.super() ||
+      keycode >= XK_Shift_L) {
     return kNoop;
+  }
+
+  // 非 ASCII 模式下, 强制用"全角 / 中文" 标点直接上屏, 绕过 Rime 的
+  // Punctuator. 这样做的理由:
+  //   1. 许多 schema (如 rime_ice / double_pinyin_flypy) 默认 full_shape =
+  //      半角, 其 half_shape 映射里一些键 (如 '@' → "@", '#' → "#") 仍然
+  //      是 ASCII 原字符, 导致"中文模式下按 @ 上屏英文 @" 的尴尬.
+  //   2. 多形标点 (ConfigList, 如 full_shape '@' → ["＠", "☯"]) 的候选框,
+  //      用户在连续输入中并不希望看到.
+  // 这里直接从 schema 读取 punctuator/full_shape 下的映射, 取默认候选
+  // (ConfigValue 本身 / ConfigList 第 0 项 / ConfigMap 的 commit 或 pair[0])
+  // 通过 sink 直接上屏, 并写入 commit_history 为 "punct" 类型.
+  // 注意: 此分支在 input empty / composing / ascii_mode 等检查之前, 所以无论
+  // 当前 composing 状态如何, 只要非 ASCII 且非英文标点模式, 标点键一律走
+  // 强制上屏路径 (composition 如果存在, Rime 的 Punctuator 本来也会在
+  // PushInput 后自动提交上一段).
+  if (input.empty() && !ascii_mode && !ctx->get_option("ascii_punct") &&
+      IsAsciiPunctuationCode(keycode) && !key_event.release()) {
+    std::string punct_text = LookupFullShapePunct(engine_, keycode);
+    DLOG(INFO) << "[AutoSpacer] force-punct key='" << static_cast<char>(keycode)
+               << "' (0x" << std::hex << keycode << std::dec << ") modifier=0x"
+               << std::hex << key_event.modifier() << std::dec
+               << " -> '" << punct_text << "'";
+    if (!punct_text.empty()) {
+      engine_->sink()(punct_text);
+      ctx->commit_history().push_back({"punct", punct_text});
+      return kAccepted;
+    }
+    // 该键在 full_shape / symbols 里都没有中文映射 (如纯英文符号):
+    // 让后续默认流程处理.
   }
 
   // ASCII mode: direct typing, only check left boundary.

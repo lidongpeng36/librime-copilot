@@ -1,6 +1,7 @@
 #include "copilot.h"
 
 #include <rime/candidate.h>
+#include <rime/composition.h>
 #include <rime/context.h>
 #include <rime/dict/db_pool_impl.h>
 #include <rime/engine.h>
@@ -157,15 +158,15 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
   }
 
   last_keycode_ = keycode;
-  auto last_action = last_action_;
-  last_action_ = kUnspecified;
-  auto result = RunProcessors(key_event);
-  if (result != kNoop) {
-    // LOG(INFO) << "Processor result: " << result;
-    return result;
-  }
-  last_action_ = last_action;
 
+  // 非连续输入 (标点、回车等): 先清理 copilot 状态，再执行子处理器。
+  // 原因: Rime 的 Punctuator 通过检查 comp.back().HasTag("punct") 来决定是
+  // 否直接上屏 (ConfirmUniquePunct / AutoCommitPunct)。如果 copilot 的
+  // placeholder 片段残留在 composition 末尾 (Engine::CalculateSegmentation
+  // 会跳过对 placeholder 的 Trim), 会导致 comp.back() 不是 punct 片段,
+  // Punctuator 无法自动上屏, 用户就会看到候选框。
+  // 顺序调整后 (与 BackSpace 分支一致), 子处理器和后续 Rime 处理器都能
+  // 看到一个干净的 context。
   if (!IsContinuingInput(key_event)) {
     last_action_ = kSpecial;
     copilot_engine_->Clear();
@@ -177,26 +178,54 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
     }
     if (tag == SegmentTag::kTagCopilot) {
       ctx->Clear();
-      // return kAccepted;
-      return kNoop;
     }
-  } else {
-    last_action_ = kUnspecified;
+    auto result = RunProcessors(key_event);
+    if (result != kNoop) {
+      return result;
+    }
+    return kNoop;
   }
+
+  // 连续输入 (字母、数字、方向键、修饰键): 正常执行子处理器。
+  auto last_action = last_action_;
+  last_action_ = kUnspecified;
+  auto result = RunProcessors(key_event);
+  if (result != kNoop) {
+    // LOG(INFO) << "Processor result: " << result;
+    return result;
+  }
+  last_action_ = last_action;
+  last_action_ = kUnspecified;
   return kNoop;
 }
 
 void Copilot::OnSelect(Context* ctx) { last_action_ = kSelect; }
 
 void Copilot::OnContextUpdate(Context* ctx) {
-  if (self_updating_ || !copilot_engine_ || !ctx || !ctx->composition().empty() ||
-      !ctx->get_option("copilot")) {
-    // LOG(ERROR) << "Copilot::OnContextUpdate: "
-    //               "self_updating_="
-    //            << self_updating_ << ", copilot_engine_=" << copilot_engine_ << ", ctx=" << ctx
-    //            << ", composition=" << ctx->composition()
-    //            << ", get_option(copilot)=" << ctx->get_option("copilot")
-    //            << ", last_action_=" << last_action_;
+  if (self_updating_ || !copilot_engine_ || !ctx || !ctx->get_option("copilot")) {
+    return;
+  }
+
+  // 中文多形标点自动上屏: 例如 '@' 在 schema 里是 ["＠", "☯"] (ConfigList),
+  // Rime 的 Punctuator 不会自动确认, 会弹出候选框等待用户选择. 这里在用户
+  // 刚按下标点 (last_action_ == kSpecial) 时检测到 pending 的 punct 段,
+  // 主动确认默认候选让它直接上屏. 同时处理两个场景:
+  //   1) 中文 → '@'            : '@' 段单独 pending, 直接 commit 成 '＠'
+  //   2) '@' → '.' (多段遗留)  : 多段时, 内部非末尾的 punct 段同样强制 commit,
+  //                              防止候选框残留
+  if (last_action_ == kSpecial && !ctx->composition().empty()) {
+    Composition& comp = ctx->composition();
+    Segment& back = comp.back();
+    if (back.HasTag("punct") && back.status < Segment::kSelected && back.menu &&
+        !back.menu->empty()) {
+      self_updating_ = true;
+      ctx->ConfirmCurrentSelection();
+      self_updating_ = false;
+      return;
+    }
+  }
+
+  if (!ctx->composition().empty()) {
     return;
   }
   if (last_action_ == kSpecial) {
