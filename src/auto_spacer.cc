@@ -9,39 +9,14 @@
 #include <rime/schema.h>
 #include <cctype>
 
+#include "auto_spacer_util.h"
 #include "ime_bridge.h"
 
 namespace rime {
 
+using namespace auto_spacer_detail;
+
 namespace {
-
-// 将 UTF-8 字符串转为 Unicode 码点
-inline uint32_t Utf8ToCodepoint(const std::string& s) {
-  uint32_t code = 0;
-  const unsigned char* bytes = reinterpret_cast<const unsigned char*>(s.data());
-  size_t len = s.size();
-
-  if (len == 1) {
-    code = bytes[0];
-  } else if (len == 2) {
-    code = ((bytes[0] & 0x1F) << 6) | (bytes[1] & 0x3F);
-  } else if (len == 3) {
-    code = ((bytes[0] & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
-  } else if (len == 4) {
-    code = ((bytes[0] & 0x07) << 18) | ((bytes[1] & 0x3F) << 12) | ((bytes[2] & 0x3F) << 6) |
-           (bytes[3] & 0x3F);
-  }
-  return code;
-}
-
-// 判断是否是中文标点符号
-inline bool IsChinesePunctuation(const std::string& s) {
-  if (s.empty() || s.size() > 4) return false;
-
-  uint32_t cp = Utf8ToCodepoint(s);
-  return (cp >= 0x3000 && cp <= 0x303F) ||  // CJK 符号和标点
-         (cp >= 0xFF00 && cp <= 0xFFEF);    // 全角标点等
-}
 
 inline bool IsNumKey(int keycode) { return (keycode >= XK_0 && keycode <= XK_9); }
 
@@ -143,24 +118,6 @@ inline bool IsSpaceKey(int keycode) {
 
 inline std::string AddSpace(int keycode) {
   return " " + std::string(1, static_cast<char>(keycode));
-}
-
-inline int LastAsciiCharCode(const std::string& str) {
-  if (str.empty()) return -1;
-
-  int i = static_cast<int>(str.size()) - 1;
-  // 回溯查找 UTF-8 字符的起始字节
-  while (i >= 0 && (static_cast<uint8_t>(str[i]) & 0xC0) == 0x80) {
-    --i;
-  }
-  if (i < 0) return -1;  // 非法 UTF-8 序列
-
-  uint8_t c = static_cast<uint8_t>(str[i]);
-  if (c < 0x80) {
-    return c;  // 是 ASCII 字符，直接返回其数值
-  }
-
-  return -1;  // 非 ASCII 字符
 }
 
 inline bool IsDelete(const KeyEvent& key_event) {
@@ -301,129 +258,24 @@ std::optional<SurroundingText> AutoSpacer::GetSurroundingText() const {
   return std::nullopt;
 }
 
-// Helper: Get last UTF-8 character from string
-static std::string GetLastUtf8Char(const std::string& str) {
-  if (str.empty()) return "";
-
-  size_t len = str.size();
-  size_t start = len - 1;
-
-  // Find start of last UTF-8 character
-  while (start > 0 && (static_cast<uint8_t>(str[start]) & 0xC0) == 0x80) {
-    start--;
+std::string ComputeSpaceCommitText(Context* ctx, const std::string& before,
+                                   const std::string& after, bool enable_right_space) {
+  // Default: commit the raw input (composing English, no candidate).
+  std::string text = ctx->input();
+  // When there is a selected candidate, commit the FULL composition text: all
+  // selected segments concatenated (Context::GetCommitText), not just the last
+  // segment's candidate. Committing only composition().back() would drop the
+  // earlier selections of a long, multi-segment input so only the last
+  // candidate reaches the screen.
+  if (!ctx->composition().empty() && ctx->composition().back().GetSelectedCandidate()) {
+    text = ctx->GetCommitText();
   }
-
-  return str.substr(start);
-}
-
-static std::string GetFirstUtf8Char(const std::string& str) {
-  if (str.empty()) return "";
-  size_t len = str.size();
-  size_t end = 1;
-  unsigned char c = static_cast<unsigned char>(str[0]);
-  if ((c & 0x80) == 0x00) {
-    end = 1;
-  } else if ((c & 0xE0) == 0xC0) {
-    end = 2;
-  } else if ((c & 0xF0) == 0xE0) {
-    end = 3;
-  } else if ((c & 0xF8) == 0xF0) {
-    end = 4;
-  }
-  if (end > len) {
-    end = len;
-  }
-  return str.substr(0, end);
-}
-
-static bool IsAsciiRightPunctCode(int c) {
-  return c == '.' || c == ',' || c == '>' || c == ']' || c == ')' || c == '}' || c == '!' ||
-         c == '?';
-}
-
-static bool IsAsciiRightPunctCodeForAsciiInput(int c) {
-  // Keep punctuation-triggered spacing, but exclude '.' per latest behavior.
-  return c == ',' || c == '>' || c == ']' || c == ')' || c == '}' || c == '!' || c == '?';
-}
-
-static bool IsAsciiAlphaNumCode(int c) {
-  return c >= 0 && c < 0x80 && std::isalnum(static_cast<unsigned char>(c));
-}
-
-static bool IsChinesePunctuationChar(const std::string& s) {
-  return !s.empty() && IsChinesePunctuation(s);
-}
-
-static bool IsCjkNonPunctuationChar(const std::string& s) {
-  if (s.empty() || IsChinesePunctuationChar(s)) {
-    return false;
-  }
-  return LastAsciiCharCode(s) < 0;
-}
-
-static bool IsPureAsciiText(const std::string& s) {
-  if (s.empty()) {
-    return false;
-  }
-  for (unsigned char c : s) {
-    if (c >= 0x80) {
-      return false;
-    }
-  }
-  return true;
-}
-
-static bool NeedSpaceBefore(const std::string& before, bool content_is_ascii) {
-  std::string ch = GetLastUtf8Char(before);
-  if (ch.empty() || IsChinesePunctuationChar(ch) || ch == " ") {
-    return false;
-  }
-  int ascii = LastAsciiCharCode(ch);
-  if (content_is_ascii) {
-    return IsCjkNonPunctuationChar(ch) || IsAsciiRightPunctCodeForAsciiInput(ascii);
-  }
-  return IsAsciiAlphaNumCode(ascii) || IsAsciiRightPunctCode(ascii);
-}
-
-static bool NeedSpaceAfter(const std::string& after, bool content_is_ascii) {
-  std::string ch = GetFirstUtf8Char(after);
-  if (ch.empty() || IsChinesePunctuationChar(ch)) {
-    return false;
-  }
-  int ascii = LastAsciiCharCode(ch);
-  if (content_is_ascii) {
-    return IsCjkNonPunctuationChar(ch);
-  }
-  return IsAsciiAlphaNumCode(ascii);
-}
-
-static std::string DecorateCommitText(const std::string& text, const std::string& before,
-                                      const std::string& after, bool content_is_ascii,
-                                      bool enable_space_after) {
-  if (text.empty()) {
-    return text;
-  }
-  size_t begin = 0;
-  size_t end = text.size();
-  while (begin < end && std::isspace(static_cast<unsigned char>(text[begin]))) {
-    ++begin;
-  }
-  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
-    --end;
-  }
-  std::string result = text.substr(begin, end - begin);
-  if (result.empty() || IsChinesePunctuationChar(result)) {
-    return result;
-  }
-
-  if (NeedSpaceBefore(before, content_is_ascii) && (result.empty() || result.front() != ' ')) {
-    result = " " + result;
-  }
-  if (enable_space_after && NeedSpaceAfter(after, content_is_ascii) &&
-      (result.empty() || result.back() != ' ')) {
-    result += " ";
-  }
-  return result;
+  // Pick the spacing rules from the actual committed text, not from "is a
+  // candidate selected": an ASCII candidate (e.g. an English word chosen in the
+  // middle of CJK) must be spaced on both sides like raw English, whereas a CJK
+  // candidate must not.
+  bool content_is_ascii = IsPureAsciiText(text);
+  return DecorateCommitText(text, before, after, content_is_ascii, enable_right_space);
 }
 
 // Path 1: Process with real surrounding context (completely independent)
@@ -540,18 +392,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     return kAccepted;
   }
 
-  // Space: commit current selected candidate (usually CJK).
+  // Space: commit the whole composition (usually CJK).
   if (keycode == XK_space) {
-    std::string text = input;
-    bool content_is_ascii = true;
-    if (!ctx->composition().empty()) {
-      auto cand = ctx->composition().back().GetSelectedCandidate();
-      if (cand) {
-        text = cand->text();
-        content_is_ascii = false;
-      }
-    }
-    auto decorated_text = DecorateCommitText(text, before, after, content_is_ascii, enable_right_space_);
+    auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
     engine_->CommitText(decorated_text);
     if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
     ctx->Clear();
@@ -591,9 +434,21 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     return commit_raw();
   }
 
-  // Let Rime's Selector handle candidate selection normally.
-  // Direct commit here would prematurely flush a multi-segment composition.
-  return kNoop;
+  // Make the number-chosen candidate the current selection, then commit the
+  // whole composition through the SAME path as the Space key (which is correct).
+  // Deferring to Rime here committed the candidate with no auto-spacing, so an
+  // English word chosen in the middle of CJK via a number key lost its trailing
+  // space (`你 test好`). Selecting + committing here mirrors Space, so both
+  // behave identically. ComputeSpaceCommitText concatenates all selected
+  // segments (Context::GetCommitText), so multi-segment input is preserved.
+  seg.selected_index = idx;
+  auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
+  engine_->CommitText(decorated_text);
+  if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
+  ctx->Clear();
+  client_state.before.clear();
+  client_state.after.clear();
+  return kAccepted;
 }
 
 // Path 2: Process with commit_history (original logic)

@@ -61,3 +61,9 @@ set(plugin_modules "copilot" PARENT_SCOPE)
 if(BUILD_TOOLS)
   add_subdirectory(tools)
 endif()
+
+# Unit tests. BUILD_TEST is a librime root option (default ON); GTest is found
+# there before plugins are configured.
+if(BUILD_TEST AND GTEST_FOUND)
+  add_subdirectory(test)
+endif()

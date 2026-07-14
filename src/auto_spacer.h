@@ -10,6 +10,19 @@
 namespace rime {
 
 class Context;
+
+// Compute the text to commit when Space finalizes the current composition,
+// including CJK/Latin auto-spacing against the surrounding `before`/`after`.
+//
+// The whole composition is committed (all selected segments concatenated via
+// Context::GetCommitText), NOT just the last segment — committing only the
+// last segment drops earlier selections of a long, multi-segment input.
+//
+// Declared here (rather than kept file-local) so it can be unit-tested with a
+// hand-built Context, without standing up a full Rime engine.
+std::string ComputeSpaceCommitText(Context* ctx, const std::string& before,
+                                   const std::string& after, bool enable_right_space);
+
 class AutoSpacer : public CopilotPlugin<AutoSpacer> {
  public:
   explicit AutoSpacer(const Ticket& ticket);
