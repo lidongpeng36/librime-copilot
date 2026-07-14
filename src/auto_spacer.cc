@@ -301,8 +301,7 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
 
   // 带 Ctrl/Alt/Super 的通常是快捷键, 不走标点/输入处理. Shift 要放行, 因为
   // ASCII 标点键本身就依赖 Shift (例如 '@' = Shift+2, '#' = Shift+3).
-  if (key_event.ctrl() || key_event.alt() || key_event.super() ||
-      keycode >= XK_Shift_L) {
+  if (key_event.ctrl() || key_event.alt() || key_event.super() || keycode >= XK_Shift_L) {
     return kNoop;
   }
 
@@ -323,10 +322,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   if (input.empty() && !ascii_mode && !ctx->get_option("ascii_punct") &&
       IsAsciiPunctuationCode(keycode) && !key_event.release()) {
     std::string punct_text = LookupFullShapePunct(engine_, keycode);
-    DLOG(INFO) << "[AutoSpacer] force-punct key='" << static_cast<char>(keycode)
-               << "' (0x" << std::hex << keycode << std::dec << ") modifier=0x"
-               << std::hex << key_event.modifier() << std::dec
-               << " -> '" << punct_text << "'";
+    DLOG(INFO) << "[AutoSpacer] force-punct key='" << static_cast<char>(keycode) << "' (0x"
+               << std::hex << keycode << std::dec << ") modifier=0x" << std::hex
+               << key_event.modifier() << std::dec << " -> '" << punct_text << "'";
     if (!punct_text.empty()) {
       engine_->sink()(punct_text);
       ctx->commit_history().push_back({"punct", punct_text});
