@@ -40,10 +40,4 @@ jobs:
           cmake --build build
 
       - name: Run plugin unit tests
-        # detect_odr_violation=0: llama.cpp's static lib is linked into both
-        # librime.so and copilot_test (via the plugin objects), so ASan sees its
-        # file-scope `SUPPORTED` global registered twice. This is the known-benign
-        # duplicate-in-shared-and-executable case, not a real ODR bug.
-        env:
-          ASAN_OPTIONS: detect_odr_violation=0
         run: ctest --test-dir build -R copilot_test --output-on-failure
