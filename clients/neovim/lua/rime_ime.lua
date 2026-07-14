@@ -11,6 +11,7 @@ local connecting = false
 local pending_messages = {}
 local enabled = false
 local pending_insert_leave_timer = nil
+local last_before, last_after = nil, nil
 
 local config = {
   socket_path = "/tmp/rime_copilot_ime.sock",
@@ -303,12 +304,23 @@ function M.context()
   end
 
   local before, after = get_surrounding()
+  -- Dedup: skip the redundant send when the boundary is unchanged. The cache is
+  -- reset in clear_context(), which is called on every ownership handoff
+  -- (InsertLeave/FocusLost/deactivate), so a handoff always forces a re-send.
+  -- Caveat: switching between two nvim instances that both stay in insert mode
+  -- with no focus event won't re-push until the first differing keystroke — a
+  -- known limitation of not having reliable terminal focus events.
+  if before == last_before and after == last_after then
+    return
+  end
+  last_before, last_after = before, after
   send("context", { before = before, after = after })
 end
 
 --- Clear surrounding text context
 function M.clear_context()
   if not enabled then return end
+  last_before, last_after = nil, nil
   send("clear_context")
 end
 
@@ -372,15 +384,6 @@ function M.setup(opts)
 
   -- Push context on text change in insert mode
   vim.api.nvim_create_autocmd("TextChangedI", {
-    group = group,
-    callback = function()
-      M.context()
-    end,
-  })
-
-  -- Push context before each inserted character.
-  -- This improves first-key boundary accuracy for auto spacing.
-  vim.api.nvim_create_autocmd("InsertCharPre", {
     group = group,
     callback = function()
       M.context()

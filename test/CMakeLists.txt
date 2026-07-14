@@ -8,6 +8,8 @@ add_executable(copilot_test
   auto_spacer_util_test.cc
   commit_text_test.cc
   history_test.cc
+  ime_bridge_socket_test.cc
+  ime_bridge_state_test.cc
   spacing_matrix_test.cc
   $<TARGET_OBJECTS:rime-copilot-objs>)
 target_link_libraries(copilot_test

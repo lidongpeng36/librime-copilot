@@ -78,7 +78,8 @@ This plugin manages Rime's `ascii_mode` intelligently to provide a seamless Vim 
    - `restore` previous mode,
    - push `context` immediately and once more after a short delay.
 3. **Insert mode typing**:
-   - push `context` on `CursorMovedI`, `TextChangedI`, and `InsertCharPre`.
+   - push `context` on `CursorMovedI` and `TextChangedI` (deduped: only when the
+     surrounding text actually changed).
 4. **InsertLeave/CmdlineEnter/FocusLost**:
    - set English mode as needed,
    - `deactivate`,

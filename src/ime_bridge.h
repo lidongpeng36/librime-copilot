@@ -35,28 +35,18 @@ struct ImeBridgeClientState {
 
 // 待处理的 action
 struct ImeBridgePendingAction {
-  enum Type {
-    kNone,
-    kSet,
-    kRestore,
-    kReset,
-    kUnregister,
-    kContext,
-    kClearContext,
-    kActivate,
-    kDeactivate
-  };
+  enum Type { kNone, kSet, kRestore, kReset, kUnregister, kActivate, kDeactivate };
   Type type = kNone;
   std::string client_key;
-  bool ascii = true;        // for kSet
-  bool stack = true;        // for kSet: if true, increment depth and save base
-  bool restore = true;      // for kReset
-  std::string char_before;  // for kContext
-  std::string char_after;   // for kContext
+  bool ascii = true;    // for kSet
+  bool stack = true;    // for kSet: if true, increment depth and save base
+  bool restore = true;  // for kReset
 };
 
-// 共享的 ImeBridge 服务器状态（跨所有 session 共享）
-class ImeBridgeServer {
+// Socket-independent ImeBridge state machine: client registry, active-owner
+// tracking, pending ascii-mode actions. Default-constructible and free of any
+// socket/thread, so it can be unit-tested directly.
+class ImeBridgeState {
  public:
   struct Config {
     bool enable = true;
@@ -64,41 +54,14 @@ class ImeBridgeServer {
     bool debug = false;
     int client_timeout_minutes = 30;
   };
-
-  // ApplyAction 返回值
   struct ApplyResult {
     bool should_set = false;
     bool ascii_mode = true;
   };
 
-  static ImeBridgeServer& Instance();
+  ImeBridgeState() = default;
 
-  void Start(const Config& config);
-  void Stop();
-  void AddRef();
-  void Release();
-
-  bool IsRunning() const { return running_.load(); }
-  bool IsDebug() const { return config_.debug; }
-
-  // 获取活跃客户端的上下文信息（线程安全）
-  std::optional<SurroundingText> GetActiveContext();
-
-  // 获取待处理的 actions（线程安全）
-  std::queue<ImeBridgePendingAction> TakePendingActions();
-
-  // 应用单个 action，返回需要设置的 ascii_mode（带状态跟踪）
-  ApplyResult ApplyAction(const ImeBridgePendingAction& action, bool current_ascii);
-
-  // 清理超时客户端
-  void CleanupStaleClients();
-
- private:
-  ImeBridgeServer() = default;
-  ~ImeBridgeServer();
-
-  void RunServer();
-  void HandleConnection(int client_fd);
+  // Parse one JSON-Lines message and dispatch to the handlers below.
   void ProcessMessage(const std::string& message);
 
   void HandleSet(const std::string& client_key, bool ascii, bool stack = true);
@@ -112,19 +75,68 @@ class ImeBridgeServer {
   void HandleDeactivate(const std::string& client_key);
   void TouchClient(const std::string& client_key);
 
+  std::optional<SurroundingText> GetActiveContext();
+  std::queue<ImeBridgePendingAction> TakePendingActions();
+  ApplyResult ApplyAction(const ImeBridgePendingAction& action, bool current_ascii);
+  void CleanupStaleClients();
+
   static std::string MakeClientKey(const std::string& app, const std::string& instance);
 
   Config config_;
-  int server_fd_ = -1;
-  std::atomic<bool> running_{false};
-  std::unique_ptr<std::thread> server_thread_;
-  std::atomic<int> ref_count_{0};
 
+ private:
   mutable std::mutex mutex_;
   std::unordered_map<std::string, ImeBridgeClientState> client_states_;
   std::string active_client_;
   std::queue<ImeBridgePendingAction> pending_actions_;
   std::chrono::steady_clock::time_point last_cleanup_;
+};
+
+// 共享的 ImeBridge 服务器状态（跨所有 session 共享）
+class ImeBridgeServer {
+ public:
+  using Config = ImeBridgeState::Config;
+  using ApplyResult = ImeBridgeState::ApplyResult;
+
+  static ImeBridgeServer& Instance();
+
+  // Public so tests can construct a non-singleton server on a temp socket.
+  ImeBridgeServer() = default;
+  ~ImeBridgeServer();
+
+  void Start(const Config& config);
+  void Stop();
+  void AddRef();
+  void Release();
+
+  bool IsRunning() const { return running_.load(); }
+  bool IsDebug() const { return state_.config_.debug; }
+
+  // 获取活跃客户端的上下文信息（线程安全）
+  std::optional<SurroundingText> GetActiveContext() { return state_.GetActiveContext(); }
+
+  // 获取待处理的 actions（线程安全）
+  std::queue<ImeBridgePendingAction> TakePendingActions() { return state_.TakePendingActions(); }
+
+  // 应用单个 action，返回需要设置的 ascii_mode（带状态跟踪）
+  ImeBridgeState::ApplyResult ApplyAction(const ImeBridgePendingAction& action,
+                                          bool current_ascii) {
+    return state_.ApplyAction(action, current_ascii);
+  }
+
+  // 清理超时客户端
+  void CleanupStaleClients() { state_.CleanupStaleClients(); }
+
+ private:
+  void RunServer();
+  void HandleConnection(int client_fd);
+
+  ImeBridgeState state_;
+  mutable std::mutex mutex_;  // guards the socket lifecycle (Start/Stop) only
+  int server_fd_ = -1;
+  std::atomic<bool> running_{false};
+  std::unique_ptr<std::thread> server_thread_;
+  std::atomic<int> ref_count_{0};
 };
 
 // IME Bridge Processor（每个 session 一个实例，共享服务器）
