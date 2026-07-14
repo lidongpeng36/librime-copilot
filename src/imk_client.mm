@@ -9,6 +9,7 @@
 #ifdef __APPLE__
 
 #include "imk_client.h"
+#include "imk_client_internal.h"
 
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
@@ -24,82 +25,51 @@ static IMP s_originalHandleEvent = nullptr;
 static std::mutex s_cacheMutex;
 static std::optional<SurroundingText> s_cachedContext;
 
-// Query surrounding text from the IMK client and cache it
+// Derive a stable per-client key for per-app state isolation.
+std::string ClientKeyFromSender(id sender, id client) {
+  if (sender) {
+    const char* senderClass = object_getClassName(sender);
+    NSString* senderAddr = [NSString stringWithFormat:@"%p", sender];
+    NSString* key = [NSString stringWithFormat:@"imk_sender:%s:%@",
+                                               senderClass ?: "unknown", senderAddr];
+    return [key UTF8String] ?: "imk:unknown";
+  }
+  NSString* clientAddr = [NSString stringWithFormat:@"%p", client];
+  return [clientAddr UTF8String] ?: "imk:unknown";
+}
+
+// Query surrounding text from the IMK client and cache it.
 void CacheSurroundingText(id controller, id sender) {
-  // Clear cache first - will only be re-set on success
+  SEL clientSel = @selector(client);
+  id client = [controller respondsToSelector:clientSel]
+                  ? ((id (*)(id, SEL))objc_msgSend)(controller, clientSel)
+                  : nil;
+
+  // Skip the query while composing: the AutoSpacer only uses the boundary
+  // snapshot taken at composition start, so mid-composition queries are wasted.
+  // markedRange reflects the app's live composition state at hook time, so this
+  // stays correct across commits — after a commit there is no marked text, so
+  // the next word's first key refreshes the boundary.
+  if (client && ClientIsComposing(client)) {
+    return;  // keep the composition-start snapshot
+  }
+
   {
     std::lock_guard<std::mutex> lock(s_cacheMutex);
     s_cachedContext.reset();
   }
-
-  // Get the client: [controller client]
-  SEL clientSel = @selector(client);
-  if (![controller respondsToSelector:clientSel]) {
-    return;
-  }
-  id client = ((id(*)(id, SEL))objc_msgSend)(controller, clientSel);
   if (!client) {
     return;
   }
 
-  // Get selectedRange
-  SEL selRangeSel = @selector(selectedRange);
-  if (![client respondsToSelector:selRangeSel]) {
+  auto surrounding = QuerySurroundingFromClient(client);
+  if (!surrounding) {
     return;
   }
+  surrounding->client_key = ClientKeyFromSender(sender, client);
 
-  typedef NSRange (*SelRangeFn)(id, SEL);
-  NSRange selRange = ((SelRangeFn)objc_msgSend)(client, selRangeSel);
-
-  if (selRange.location == NSNotFound) {
-    return;
-  }
-
-  // Get attributedSubstringFromRange:
-  SEL attrSubSel = @selector(attributedSubstringFromRange:);
-  if (![client respondsToSelector:attrSubSel]) {
-    return;
-  }
-
-  typedef NSAttributedString* (*AttrSubFn)(id, SEL, NSRange);
-  AttrSubFn attrSub = (AttrSubFn)objc_msgSend;
-
-  std::string charBefore;
-  std::string charAfter;
-  std::string clientKey = "imk:unknown";
-  {
-    if (sender) {
-      const char* senderClass = object_getClassName(sender);
-      NSString* senderAddr = [NSString stringWithFormat:@"%p", sender];
-      NSString* key =
-          [NSString stringWithFormat:@"imk_sender:%s:%@",
-                                     senderClass ?: "unknown", senderAddr];
-      clientKey = [key UTF8String] ?: "imk:unknown";
-    } else {
-      NSString* clientAddr = [NSString stringWithFormat:@"%p", client];
-      clientKey = [clientAddr UTF8String] ?: "imk:unknown";
-    }
-  }
-
-  if (selRange.location > 0) {
-    NSRange beforeRange = NSMakeRange(selRange.location - 1, 1);
-    NSAttributedString* before = attrSub(client, attrSubSel, beforeRange);
-    if (before) {
-      charBefore = [[before string] UTF8String] ?: "";
-    }
-  }
-
-  {
-    NSRange afterRange = NSMakeRange(selRange.location + selRange.length, 1);
-    NSAttributedString* after = attrSub(client, attrSubSel, afterRange);
-    if (after) {
-      charAfter = [[after string] UTF8String] ?: "";
-    }
-  }
-
-  // Cache the result
   std::lock_guard<std::mutex> lock(s_cacheMutex);
-  s_cachedContext = SurroundingText{charBefore, charAfter, clientKey};
+  s_cachedContext = surrounding;
 }
 
 // Swizzled handleEvent:client:
@@ -156,6 +126,58 @@ __attribute__((constructor)) static void InitIMKClientHook() {
 }
 
 }  // anonymous namespace
+
+bool ClientIsComposing(id client) {
+  if (!client) {
+    return false;
+  }
+  SEL markedSel = @selector(markedRange);
+  if (![client respondsToSelector:markedSel]) {
+    return false;
+  }
+  typedef NSRange (*MarkedRangeFn)(id, SEL);
+  NSRange marked = ((MarkedRangeFn)objc_msgSend)(client, markedSel);
+  return marked.location != NSNotFound && marked.length > 0;
+}
+
+std::optional<SurroundingText> QuerySurroundingFromClient(id client) {
+  if (!client) {
+    return std::nullopt;
+  }
+  SEL selRangeSel = @selector(selectedRange);
+  if (![client respondsToSelector:selRangeSel]) {
+    return std::nullopt;
+  }
+  typedef NSRange (*SelRangeFn)(id, SEL);
+  NSRange selRange = ((SelRangeFn)objc_msgSend)(client, selRangeSel);
+  if (selRange.location == NSNotFound) {
+    return std::nullopt;
+  }
+
+  SEL attrSubSel = @selector(attributedSubstringFromRange:);
+  if (![client respondsToSelector:attrSubSel]) {
+    return std::nullopt;
+  }
+  typedef NSAttributedString* (*AttrSubFn)(id, SEL, NSRange);
+  AttrSubFn attrSub = (AttrSubFn)objc_msgSend;
+
+  std::string charBefore;
+  std::string charAfter;
+  if (selRange.location > 0) {
+    NSAttributedString* before = attrSub(client, attrSubSel, NSMakeRange(selRange.location - 1, 1));
+    if (before) {
+      charBefore = [[before string] UTF8String] ?: "";
+    }
+  }
+  {
+    NSAttributedString* after =
+        attrSub(client, attrSubSel, NSMakeRange(selRange.location + selRange.length, 1));
+    if (after) {
+      charAfter = [[after string] UTF8String] ?: "";
+    }
+  }
+  return SurroundingText{charBefore, charAfter, "imk:query"};
+}
 
 // Public API to get cached surrounding text
 std::optional<SurroundingText> GetIMKSurroundingText() {

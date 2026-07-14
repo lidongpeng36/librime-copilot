@@ -16,4 +16,12 @@ target_link_libraries(copilot_test
   ${rime_dict_library}
   ${GTEST_LIBRARIES})
 
+# macOS-only ObjC++ test driving the IMK query/compose-detection logic against
+# a mock NSTextInputClient.
+if(APPLE)
+  target_sources(copilot_test PRIVATE imk_client_test.mm)
+  find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
+  target_link_libraries(copilot_test ${FOUNDATION_LIBRARY})
+endif()
+
 add_test(NAME copilot_test COMMAND copilot_test)
