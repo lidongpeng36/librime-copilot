@@ -11,6 +11,9 @@
 
 #include "ime_bridge.h"
 
+#include <chrono>
+#include <thread>
+
 using rime::ImeBridgePendingAction;
 using rime::ImeBridgeState;
 
@@ -109,4 +112,28 @@ TEST(ImeBridgeState, ApplyActionSetThenRestoreReturnsToBase) {
   auto r2 = s.ApplyAction(restore, /*current_ascii=*/true);
   EXPECT_TRUE(r2.should_set);
   EXPECT_FALSE(r2.ascii_mode);  // restored to base (false)
+}
+
+TEST(ImeBridgeState, CleanupRemovesTimedOutClients) {
+  // The cleanup pass had no call site at all, so client_timeout_minutes was a
+  // dead config knob and per-client state lived forever.
+  ImeBridgeState s;
+  s.config_.client_timeout_minutes = 0;  // everything is instantly stale
+  s.HandleContext("nvim:1", "中", "文");
+  ASSERT_TRUE(s.GetActiveContext().has_value());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  s.CleanupStaleClients();
+
+  EXPECT_FALSE(s.GetActiveContext().has_value());
+}
+
+TEST(ImeBridgeState, CleanupKeepsFreshClients) {
+  ImeBridgeState s;  // default timeout: 30 minutes
+  s.HandleContext("nvim:1", "中", "文");
+  s.CleanupStaleClients();
+
+  auto ctx = s.GetActiveContext();
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ("中", ctx->before);
 }

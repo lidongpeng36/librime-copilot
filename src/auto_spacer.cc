@@ -222,7 +222,9 @@ ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_even
   }
   int n_cand = -1;
   const auto& composition = ctx->composition();
-  if (!composition.empty()) {
+  // A segment can carry no menu (e.g. the copilot placeholder before the
+  // translators run), and Rime's own Segment accessors all null-check it.
+  if (!composition.empty() && composition.back().menu) {
     int cand_count = composition.back().menu->candidate_count();
     if (cand_count) {
       int mod = cand_count % page_size;

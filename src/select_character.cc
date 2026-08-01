@@ -61,29 +61,35 @@ ProcessResult SelectCharacter::Process(const KeyEvent& key_event, std::string* o
     auto selection = it->second;
     auto c = ctx->GetSelectedCandidate();
     if (c) {
-      auto text = c->text();
+      const auto text = c->text();
       ::copilot::UTF8 utf8(text);
+      // Keep the slice in its own string: utf8 is a view over `text`, so
+      // assigning back into `text` would rewrite the buffer being viewed.
+      std::string picked;
       switch (selection) {
         case Selection::kFirst:
-          text = utf8[0];
+          picked = std::string(utf8[0]);
           break;
         case Selection::kLast:
-          text = utf8[-1];
+          picked = std::string(utf8[-1]);
           break;
         case Selection::kLeft:
-          // text = utf8(0, -2);
-          text = utf8.left();
+          picked = std::string(utf8.left());
           break;
         case Selection::kRight:
-          // text = utf8(1, -1);
-          text = utf8.right();
+          picked = std::string(utf8.right());
           break;
         default:
           return kNoop;
       }
-      *output = text;
-      DLOG(INFO) << "Select Text: " << text;
-      engine_->CommitText(text);
+      // Nothing on that side of the candidate (e.g. leading punctuation):
+      // leave the key to the rest of the chain instead of committing "".
+      if (picked.empty()) {
+        return kNoop;
+      }
+      *output = picked;
+      DLOG(INFO) << "Select Text: " << picked;
+      engine_->CommitText(picked);
       ctx->Clear();
       return kAccepted;
     }

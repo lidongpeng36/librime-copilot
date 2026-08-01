@@ -187,14 +187,14 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
   }
 
   // 连续输入 (字母、数字、方向键、修饰键): 正常执行子处理器。
-  auto last_action = last_action_;
+  // 子处理器跑完后 last_action_ 一律回到 kUnspecified — 之前这里先写回了
+  // 进入时的旧值, 又被下一行立即覆盖, 那次写回是死代码。
   last_action_ = kUnspecified;
   auto result = RunProcessors(key_event);
   if (result != kNoop) {
     // LOG(INFO) << "Processor result: " << result;
     return result;
   }
-  last_action_ = last_action;
   last_action_ = kUnspecified;
   return kNoop;
 }

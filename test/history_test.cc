@@ -45,6 +45,31 @@ TEST(Utf8View, LeftRightWithoutPunctuation) {
   EXPECT_EQ("bc", u.right());  // no punct: from the second char
 }
 
+TEST(Utf8View, LeftIsEmptyWhenPunctuationLeads) {
+  // Nothing precedes a leading punctuation mark. Returning (0, -1) here made
+  // left() hand back the WHOLE string, punctuation included.
+  std::string s = ",hao";
+  UTF8 u(s);
+  EXPECT_EQ("", u.left());
+  EXPECT_EQ("hao", u.right());
+}
+
+TEST(Utf8View, RightIsEmptyWhenPunctuationTrails) {
+  // Mirror case: nothing follows a trailing punctuation mark; the clamped
+  // (i+1, -1) slice used to return the punctuation itself.
+  std::string s = "ni,";
+  UTF8 u(s);
+  EXPECT_EQ("ni", u.left());
+  EXPECT_EQ("", u.right());
+}
+
+TEST(Utf8View, LeftRightAroundChinesePunctuation) {
+  std::string s = "你，好";
+  UTF8 u(s);
+  EXPECT_EQ("你", u.left());
+  EXPECT_EQ("好", u.right());
+}
+
 TEST(HistoryBuffer, BackReturnsLastCharacter) {
   History h(10);
   h.add("中文");

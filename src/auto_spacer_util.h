@@ -32,9 +32,31 @@ inline uint32_t Utf8ToCodepoint(const std::string& s) {
   return code;
 }
 
+// UTF-8 首字节声明的序列长度; 0 表示不是合法首字节.
+inline size_t Utf8SequenceLength(unsigned char lead) {
+  if ((lead & 0x80) == 0x00) return 1;
+  if ((lead & 0xE0) == 0xC0) return 2;
+  if ((lead & 0xF0) == 0xE0) return 3;
+  if ((lead & 0xF8) == 0xF0) return 4;
+  return 0;  // 续字节 (10xxxxxx) 或非法首字节
+}
+
+// s 是否恰好是一个结构合法的 UTF-8 字符.
+inline bool IsSingleUtf8Char(const std::string& s) {
+  if (s.empty()) return false;
+  size_t len = Utf8SequenceLength(static_cast<unsigned char>(s[0]));
+  if (len == 0 || len != s.size()) return false;
+  for (size_t i = 1; i < len; ++i) {
+    if ((static_cast<unsigned char>(s[i]) & 0xC0) != 0x80) return false;
+  }
+  return true;
+}
+
 // 判断是否是中文标点符号
 inline bool IsChinesePunctuation(const std::string& s) {
-  if (s.empty() || s.size() > 4) return false;
+  // 必须是单个合法 UTF-8 字符: 否则 "3@x" 这样的短 ASCII 串会被当成 3 字节
+  // 序列解码成 U+3020, 落进 CJK 标点区间, 导致上屏时跳过自动加空格.
+  if (!IsSingleUtf8Char(s)) return false;
 
   uint32_t cp = Utf8ToCodepoint(s);
   return (cp >= 0x3000 && cp <= 0x303F) ||  // CJK 符号和标点

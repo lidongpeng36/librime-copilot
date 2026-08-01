@@ -160,14 +160,14 @@ std::string_view UTF8::left() const {
   int n = size();
   for (int i = 0; i < n; ++i) {
     std::string_view ch = (*this)[i];
-
-    // 英文/ASCII 标点（仅单字节）
-    if (ch.size() == 1 && std::ispunct(static_cast<unsigned char>(ch[0]))) {
-      return (*this)(0, i - 1);
-    }
-
-    // 中文/全角标点
-    if (std::find(chinese_punct.begin(), chinese_punct.end(), ch) != chinese_punct.end()) {
+    // 英文/ASCII 标点（仅单字节）或 中文/全角标点
+    const bool is_punct =
+        (ch.size() == 1 && std::ispunct(static_cast<unsigned char>(ch[0]))) ||
+        std::find(chinese_punct.begin(), chinese_punct.end(), ch) != chinese_punct.end();
+    if (is_punct) {
+      // 标点在首位时前面什么都没有: (0, -1) 会被负索引解释成"整段",
+      // 反而把标点本身也带出来.
+      if (i == 0) return {};
       return (*this)(0, i - 1);
     }
   }
@@ -180,14 +180,14 @@ std::string_view UTF8::right() const {
   int n = size();
   for (int i = 0; i < n; ++i) {
     std::string_view ch = (*this)[i];
-
-    // ASCII 英文标点
-    if (ch.size() == 1 && std::ispunct(static_cast<unsigned char>(ch[0]))) {
-      return (*this)(i + 1, -1);
-    }
-
-    // 中文/全角标点
-    if (std::find(chinese_punct.begin(), chinese_punct.end(), ch) != chinese_punct.end()) {
+    // ASCII 英文标点 或 中文/全角标点
+    const bool is_punct =
+        (ch.size() == 1 && std::ispunct(static_cast<unsigned char>(ch[0]))) ||
+        std::find(chinese_punct.begin(), chinese_punct.end(), ch) != chinese_punct.end();
+    if (is_punct) {
+      // 标点在末位时后面什么都没有: (n, -1) 的 start 会被 clamp 回 n-1,
+      // 于是返回标点自己.
+      if (i + 1 >= n) return {};
       return (*this)(i + 1, -1);
     }
   }

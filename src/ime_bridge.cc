@@ -4,6 +4,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <thread>
+
 #include <rime/context.h>
 #include <rime/engine.h>
 #include <rime/schema.h>
@@ -18,7 +21,11 @@ namespace {
 constexpr int kProtocolVersion = 1;
 constexpr const char* kNamespace = "rime.ime";
 constexpr size_t kMaxMessageSize = 4096;
+// Upper bound on one accumulated JSON line; a client that never sends '\n'
+// must not be able to grow the buffer without limit.
+constexpr size_t kMaxPendingBytes = 1 << 20;  // 1 MiB
 constexpr int kCleanupIntervalSeconds = 60;
+constexpr int kAcceptRetryDelayMs = 100;
 
 }  // namespace
 
@@ -86,6 +93,10 @@ void ImeBridgeServer::Start(const Config& config) {
 }
 
 void ImeBridgeServer::Stop() {
+  // Same lock as Start(): without it a concurrent Start/Stop (schema reload
+  // racing a Release()) could interleave on server_fd_ / server_thread_.
+  std::lock_guard<std::mutex> lock(mutex_);
+
   if (!running_.load()) {
     return;
   }
@@ -112,9 +123,18 @@ void ImeBridgeServer::RunServer() {
   while (running_.load()) {
     int client_fd = accept(server_fd_, nullptr, nullptr);
     if (client_fd < 0) {
-      if (running_.load()) {
-        LOG(WARNING) << "[ImeBridge] Accept failed: " << strerror(errno);
+      const int err = errno;
+      if (err == EINTR) {
+        continue;
       }
+      if (!running_.load()) {
+        break;
+      }
+      // Back off instead of spinning: a persistent failure (EMFILE when the
+      // process is out of descriptors, or a dead listening socket) would
+      // otherwise burn a core and flood the log.
+      LOG(WARNING) << "[ImeBridge] Accept failed: " << strerror(err);
+      std::this_thread::sleep_for(std::chrono::milliseconds(kAcceptRetryDelayMs));
       continue;
     }
     // Handle each client on its own thread so multiple Neovim instances can
@@ -135,8 +155,7 @@ void ImeBridgeServer::HandleConnection(int client_fd) {
     if (n <= 0) {
       break;
     }
-    buffer[n] = '\0';
-    message += buffer;
+    message.append(buffer, static_cast<size_t>(n));
 
     size_t pos;
     while ((pos = message.find('\n')) != std::string::npos) {
@@ -146,6 +165,12 @@ void ImeBridgeServer::HandleConnection(int client_fd) {
       if (!line.empty()) {
         state_.ProcessMessage(line);
       }
+    }
+
+    if (message.size() > kMaxPendingBytes) {
+      LOG(WARNING) << "[ImeBridge] Dropping oversized message (" << message.size()
+                   << " bytes without a newline)";
+      message.clear();
     }
   }
 
@@ -390,30 +415,31 @@ std::optional<SurroundingText> ImeBridgeState::GetActiveContext() {
 
 void ImeBridgeState::CleanupStaleClients() {
   auto now = std::chrono::steady_clock::now();
+  auto timeout = std::chrono::minutes(config_.client_timeout_minutes);
 
-  // Check if enough time has passed since last cleanup
+  std::vector<std::string> stale_clients;
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Throttle under the same lock that guards last_cleanup_: this runs from the
+  // input thread on every key event.
   if (now - last_cleanup_ < std::chrono::seconds(kCleanupIntervalSeconds)) {
     return;
   }
   last_cleanup_ = now;
 
-  auto timeout = std::chrono::minutes(config_.client_timeout_minutes);
-
-  std::vector<std::string> stale_clients;
-
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& [key, state] : client_states_) {
-      if (now - state.last_active > timeout) {
-        stale_clients.push_back(key);
-      }
+  for (const auto& [key, state] : client_states_) {
+    if (now - state.last_active > timeout) {
+      stale_clients.push_back(key);
     }
+  }
 
-    for (const auto& key : stale_clients) {
-      if (config_.debug) {
-        LOG(INFO) << "[ImeBridge] Removing stale client: " << key;
-      }
-      client_states_.erase(key);
+  for (const auto& key : stale_clients) {
+    if (config_.debug) {
+      LOG(INFO) << "[ImeBridge] Removing stale client: " << key;
+    }
+    client_states_.erase(key);
+    if (active_client_ == key) {
+      active_client_.clear();
     }
   }
 }
@@ -570,6 +596,9 @@ ProcessResult ImeBridge::Process(const KeyEvent& key_event) {
   if (ctx) {
     ApplyPendingActions(ctx);
   }
+  // Self-throttled to once per kCleanupIntervalSeconds; this is the only call
+  // site, so without it client_timeout_minutes did nothing at all.
+  ImeBridgeServer::Instance().CleanupStaleClients();
 
   return kNoop;
 }

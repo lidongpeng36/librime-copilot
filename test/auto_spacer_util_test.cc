@@ -27,6 +27,22 @@ TEST(IsChinesePunctuation, RecognizesCjkAndFullWidth) {
   EXPECT_FALSE(IsChinesePunctuation(""));
 }
 
+TEST(IsChinesePunctuation, RejectsMultiCharacterStrings) {
+  // The predicate decoded any string of <= 4 bytes as if it were a single
+  // UTF-8 character, so short ASCII runs could land inside the CJK punctuation
+  // range: "3@x" decoded to U+3020. A commit like that then skipped auto
+  // spacing (DecorateCommitText / ProcessWithCommitHistory both gate on this).
+  EXPECT_FALSE(IsChinesePunctuation("3@x"));
+  EXPECT_FALSE(IsChinesePunctuation("c@ "));
+  EXPECT_FALSE(IsChinesePunctuation("s@a"));
+  EXPECT_FALSE(IsChinesePunctuation("ab"));
+  EXPECT_FALSE(IsChinesePunctuation("。。"));  // two real puncts are not one
+  EXPECT_FALSE(IsChinesePunctuation("。a"));
+  // Truncated / malformed sequences are not punctuation either.
+  EXPECT_FALSE(IsChinesePunctuation(std::string("\xE3\x80")));  // 2 of 3 bytes
+  EXPECT_FALSE(IsChinesePunctuation(std::string("\x80")));      // lone continuation
+}
+
 TEST(LastAsciiCharCode, ReturnsTrailingAsciiOrNegative) {
   EXPECT_EQ('c', LastAsciiCharCode("abc"));
   EXPECT_EQ('a', LastAsciiCharCode("中a"));  // 中a -> 'a'

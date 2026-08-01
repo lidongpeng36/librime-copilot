@@ -112,16 +112,23 @@ bool CopilotDb::Build(const copilot::RawData& data) {
   }
 
   // copy from entry vector to entry array
+  if (entries.empty() || keys.empty()) {
+    LOG(ERROR) << "no copilot entries to write.";
+    return false;
+  }
   const table::Entry* available_entries = &entries[0];
   vector<int> values;
-  values.reserve(data_size);
+  values.reserve(keys.size());
   for (const auto& kv : data) {
     if (kv.second.empty()) continue;
     values.push_back(WriteCandidates(kv.second, available_entries));
     available_entries += kv.second.size();
   }
   // build real key trie
-  if (0 != key_trie_->build(data_size, keys.data(), NULL, values.data())) {
+  // Size from `keys`, not from data.size(): keys/values only get an element
+  // for entries with a non-empty candidate list, so a key mapped to an empty
+  // list would make the trie builder read past both arrays.
+  if (0 != key_trie_->build(keys.size(), keys.data(), NULL, values.data())) {
     LOG(ERROR) << "Error building double-array trie.";
     return false;
   }
