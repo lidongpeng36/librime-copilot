@@ -10,6 +10,14 @@ target_link_libraries(build_copilot
   ${rime_library}
   ${rime_dict_library})
 
+add_executable(dump_copilot
+  dump_copilot.cc
+  $<TARGET_OBJECTS:rime-copilot-objs>)
+target_link_libraries(dump_copilot
+  ${LINK_LIBS}
+  ${rime_library}
+  ${rime_dict_library})
+
 if(APPLE)
   find_library(APPSERVICES_LIBRARY ApplicationServices REQUIRED)
   find_library(APPKIT_LIBRARY AppKit REQUIRED)

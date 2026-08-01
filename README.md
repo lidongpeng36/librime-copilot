@@ -10,6 +10,36 @@ librime plugin. Copilot next word prediction with LLM support.
 - **Auto Spacer** - Automatically add spaces between Chinese and English/numbers
 - **IME Bridge** - Control `ascii_mode` via IPC from external editors (Neovim, Obsidian, VS Code)
 
+## Building the db
+
+`tools/make_copilot_db.py` turns Rime dictionaries into `copilot.db`. Point it at
+a JSON config listing the dictionaries to merge (start from
+`tools/dict.example.json`):
+
+```sh
+tools/make_copilot_db.py -c dict.json -o copilot.db
+```
+
+Each word is split at every boundary into `prefix → suffix`, which is exactly
+how the plugin queries it: the last 1..N characters before the caret are the
+key, and the highest-weighted continuations are the answer.
+
+**Weights mean "larger = more likely"** — the same convention the plugin sorts
+by. A dictionary whose third column is a rank (1 = best) or a line number will
+silently invert every ordering; `tools/dump_copilot` prints a key's
+continuations with weights and ranks so you can check:
+
+```sh
+dump_copilot copilot.db --find 议 -- 建
+```
+
+Dictionaries differ in what they carry. Only some ship real frequencies; others
+use a constant filler, which is a membership signal ("this word exists"), not a
+ranking signal. Don't rescale the frequency-bearing ones into a narrow band —
+word frequency is long-tailed, and a linear min-max squeeze collapses almost
+everything onto the same value. Mark a personal dictionary with `"top": true`
+to lift all of its entries above the others while keeping their relative order.
+
 ## Usage
 
 * Put the db file (by default `copilot.db`) in rime user directory.

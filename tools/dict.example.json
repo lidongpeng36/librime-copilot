@@ -1,0 +1,8 @@
+[
+  { "dict": "~/Library/Rime/private/custom.dict.yaml", "top": true },
+  { "dict": "~/Library/Rime/private/sogou.dict.yaml" },
+  { "dict": "~/Library/Rime/cn_dicts/base.dict.yaml" },
+  { "dict": "~/Library/Rime/cn_dicts/ext.dict.yaml" },
+  { "dict": "~/Library/Rime/cn_dicts/tencent.dict.yaml" },
+  { "dict": "~/Library/Rime/cn_dicts/others.dict.yaml" }
+]

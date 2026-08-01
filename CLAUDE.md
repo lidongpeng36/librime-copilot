@@ -98,8 +98,15 @@ All three can be turned off via `copilot/disabled_plugins` in the schema config.
 ## Tools (`tools/`, built when `BUILD_TOOLS=ON`, default)
 - `build_copilot` — builds the `copilot.db` prediction DB. Reads stdin lines of
   `key text weight`, writes the DB file (arg 1, default `copilot.db`).
-- `make_copilot_data/` — a **Rust** (Cargo) preprocessor that dedups/filters raw corpora
-  into the `key text weight` format `build_copilot` consumes (`--filter-weight`, `--max-candidates`).
+- `dump_copilot` — read-only probe: prints a key's continuations with weights,
+  ranks and duplicate counts. First stop when candidates come out in a
+  surprising order (`dump_copilot <db> --find 议 -- 建`).
+- `make_copilot_db.py` — the pipeline that feeds `build_copilot`: reads Rime
+  `*.dict.yaml` files listed in a JSON config (see `dict.example.json`), merges
+  and weights them, splits every word into `prefix → suffix` pairs.
+  **The weight convention lives here and in `src/db_provider.h` / `src/rerank.h`
+  and must match: larger = more likely.** Writing a rank instead of a real
+  weight silently inverts every ordering in the plugin.
 - `ax_poc.mm` — macOS Accessibility API proof-of-concept (Apple-only).
 
 ## Clients
