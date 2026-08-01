@@ -32,12 +32,13 @@ CopilotEngine::CopilotEngine(std::vector<std::shared_ptr<Provider>> providers,
 
 CopilotEngine::~CopilotEngine() {}
 
-bool CopilotEngine::Copilot(Context* ctx, const string& context_query) {
+bool CopilotEngine::Copilot(Context* ctx, const string& context_query,
+                            const string& surrounding_context) {
   // LOG(INFO) << "CopilotEngine::Copilot [" << context_query << "]";
   // history_->add(context_query);
   bool ret = false;
   for (auto& provider : providers_) {
-    ret |= provider->Predict(context_query);
+    ret |= provider->Predict(context_query, surrounding_context);
   }
   if (ret) {
     query_ = context_query;

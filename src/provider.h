@@ -43,7 +43,12 @@ class Provider {
   virtual void OnBackspace() {}
   virtual void Clear() {}
   virtual int Rank() const { return -1; }
-  virtual bool Predict(const std::string& input) = 0;
+
+  // `input` is the text that triggered this round (the last commit).
+  // `context` is the real text before the caret when the frontend can supply
+  // it (IMK / IME Bridge), otherwise empty — a provider that gets an empty
+  // context falls back to its own commit history.
+  virtual bool Predict(const std::string& input, const std::string& context) = 0;
 
   virtual std::vector<::copilot::Entry> Retrive(int timeout_us) const = 0;
 

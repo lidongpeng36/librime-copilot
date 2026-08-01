@@ -23,10 +23,13 @@ namespace rime {
 // composing. Returns false for nil / non-responding clients.
 bool ClientIsComposing(id client);
 
-// Query the character immediately before and after the cursor from `client`
-// via selectedRange + attributedSubstringFromRange:. Returns nullopt if the
-// client is nil, does not respond, or has no valid selection.
-std::optional<SurroundingText> QuerySurroundingFromClient(id client);
+// Query the text around the cursor from `client` via selectedRange +
+// attributedSubstringFromRange:. Fetches up to `prefix_chars` UTF-16 units
+// before the caret (clamped at the document start) and one character after.
+// If the client refuses the longer range, retries with a single character so
+// the caller still gets the boundary character. Returns nullopt if the client
+// is nil, does not respond, or has no valid selection.
+std::optional<SurroundingText> QuerySurroundingFromClient(id client, int prefix_chars);
 
 }  // namespace rime
 

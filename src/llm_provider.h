@@ -46,7 +46,9 @@ class LLMProvider : public Provider {
   // whatever context came next.
   void Clear() override;
   int Rank() const override { return config_.rank; }
-  bool Predict(const std::string& input) override;
+  // Prediction context is not wired into the LLM prompt yet; it keeps using
+  // the plugin's own commit history.
+  bool Predict(const std::string& input, const std::string& context) override;
   std::vector<::copilot::Entry> Retrive(int timeout_us) const override;
 
  private:

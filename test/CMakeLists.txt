@@ -10,6 +10,7 @@ set(copilot_test_src
   history_test.cc
   ime_bridge_socket_test.cc
   ime_bridge_state_test.cc
+  prediction_context_test.cc
   spacing_matrix_test.cc)
 
 # GTest include dirs are added globally by the librime root CMakeLists.

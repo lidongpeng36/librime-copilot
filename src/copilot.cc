@@ -12,12 +12,15 @@
 #include <rime/service.h>
 #include <rime/translation.h>
 
+#include <algorithm>
 #include <set>
 
 #include "auto_spacer.h"
 #include "copilot_engine.h"
 #include "ime_bridge.h"
+#include "prediction_context.h"
 #include "select_character.h"
+#include "surrounding_source.h"
 
 namespace rime {
 
@@ -63,6 +66,15 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
   // Read disabled plugins from config
   std::set<string> disabled_plugins;
   if (auto* config = engine_->schema()->config()) {
+    config->GetBool("copilot/use_surrounding_context", &use_surrounding_context_);
+    config->GetInt("copilot/surrounding_context_chars", &surrounding_context_chars_);
+    surrounding_context_chars_ = std::clamp(surrounding_context_chars_, 1, 64);
+#ifdef __APPLE__
+    // Ask the IMK hook for as much text as the prediction needs; left at 1 (the
+    // boundary character AutoSpacer uses) when the feature is off, so the
+    // per-key query stays exactly as cheap as before.
+    SetIMKSurroundingPrefixChars(use_surrounding_context_ ? surrounding_context_chars_ : 1);
+#endif
     if (auto list = config->GetList("copilot/disabled_plugins")) {
       for (size_t i = 0; i < list->size(); ++i) {
         if (auto item = list->GetValueAt(i)) {
@@ -267,11 +279,26 @@ void Copilot::OnContextUpdate(Context* ctx) {
   CopilotAndUpdate(ctx, last_commit.text);
 }
 
+string Copilot::GetPredictionContext(const string& committed) const {
+  if (!use_surrounding_context_) {
+    return {};
+  }
+  auto surrounding = GetSurroundingContext();
+  if (!surrounding) {
+    return {};  // no real context; the providers fall back to commit history
+  }
+  // The snapshot was taken before this key event was handled (and is frozen
+  // while composing), so it does not contain the text this commit just added.
+  return BuildPredictionContext(surrounding->before, committed);
+}
+
 void Copilot::CopilotAndUpdate(Context* ctx, const string& context_query) {
   // auto history = copilot_engine_->history();
   // LOG(INFO) << "CopilotAndUpdate: " << history->get_chars(10)
   //           << " context_query: " << context_query;
-  if (copilot_engine_->Copilot(ctx, context_query)) {
+  const string prediction_context = GetPredictionContext(context_query);
+  DLOG(INFO) << "[Copilot] prediction context: '" << prediction_context << "'";
+  if (copilot_engine_->Copilot(ctx, context_query, prediction_context)) {
     copilot_engine_->CreateCopilotSegment(ctx);
     self_updating_ = true;
     ctx->update_notifier()(ctx);

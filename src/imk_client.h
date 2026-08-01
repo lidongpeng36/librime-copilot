@@ -14,8 +14,11 @@ namespace rime {
 
 // Text surrounding the cursor position
 struct SurroundingText {
-  std::string before;  // UTF-8 character immediately before cursor
-  std::string after;   // UTF-8 character immediately after cursor
+  // UTF-8 text immediately before the cursor. At least the boundary character
+  // (all AutoSpacer looks at); up to SetIMKSurroundingPrefixChars() characters
+  // when the prediction path asks for more and the client can answer.
+  std::string before;
+  std::string after;  // UTF-8 character immediately after cursor
   // Client/app identity for per-app state isolation.
   // For ImeBridge, this is "app:instance". For IMK, this is a client pointer key.
   std::string client_key;
@@ -26,6 +29,11 @@ struct SurroundingText {
 // This function should be called during key event processing.
 #ifdef __APPLE__
 std::optional<SurroundingText> GetIMKSurroundingText();
+
+// How many characters before the caret the hook should fetch (default 1, which
+// is all AutoSpacer needs). The prediction path raises it when
+// copilot/use_surrounding_context is on. Clamped to [1, 64].
+void SetIMKSurroundingPrefixChars(int n);
 #endif
 
 }  // namespace rime

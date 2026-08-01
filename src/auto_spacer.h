@@ -53,9 +53,6 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
 
   ProcessResult HandleNumberKey(Context* ctx, const KeyEvent& key_event) const;
 
-  // Get surrounding text with priority: ImeBridge > IMK Client > commit_history
-  std::optional<SurroundingText> GetSurroundingText() const;
-
   struct ClientState {
     // Stores boundary when composition starts, used at commit time.
     // During composition, IMK context may reflect marked text position.

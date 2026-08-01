@@ -6,6 +6,7 @@
 
 #include "copilot_db.h"
 #include "history.h"
+#include "prediction_context.h"
 #include "provider.h"
 
 namespace rime {
@@ -29,7 +30,7 @@ class DBProvider : public Provider {
   virtual ~DBProvider() = default;
 
   void Clear() override { candidates_.clear(); }
-  bool Predict(const std::string& input) override;
+  bool Predict(const std::string& input, const std::string& context) override;
 
   std::vector<::copilot::Entry> Retrive(int timeout_us) const override { return candidates_; }
 
@@ -54,21 +55,30 @@ class DBProvider : public Provider {
   std::shared_ptr<::copilot::History> history_;
 };
 
-inline bool DBProvider::Predict(const std::string& input) {
+inline bool DBProvider::Predict(const std::string& input, const std::string& context) {
   candidates_.clear();
-  auto hist = history_->back();
-  auto candidates = Lookup(hist);
-  for (uint32_t i = 2; i < config_.max_hints; ++i) {
-    auto curr = history_->get_chars(i);
-    // LOG(INFO) << "DBProvider::Predict: " << i << ", curr: " << curr << ", hist: " << hist
-    //           << " max_hints: " << config_.max_hints;
-    if (curr == hist) {
-      // LOG(INFO) << "DBProvider::Predict: " << i << ", curr == hist";
-      break;
+  std::list<::copilot::Entry> candidates;
+  if (!context.empty()) {
+    // Real text before the caret: derive the keys from it so the prediction
+    // follows the caret instead of the (possibly unrelated) session history.
+    for (const auto& key : BuildLookupKeys(context, config_.max_hints)) {
+      candidates.splice(candidates.end(), Lookup(key));
     }
-    auto hint_candidates = Lookup(curr);
-    hist.swap(curr);
-    candidates.splice(candidates.end(), hint_candidates);
+  } else {
+    auto hist = history_->back();
+    candidates = Lookup(hist);
+    for (uint32_t i = 2; i < config_.max_hints; ++i) {
+      auto curr = history_->get_chars(i);
+      // LOG(INFO) << "DBProvider::Predict: " << i << ", curr: " << curr << ", hist: " << hist
+      //           << " max_hints: " << config_.max_hints;
+      if (curr == hist) {
+        // LOG(INFO) << "DBProvider::Predict: " << i << ", curr == hist";
+        break;
+      }
+      auto hint_candidates = Lookup(curr);
+      hist.swap(curr);
+      candidates.splice(candidates.end(), hint_candidates);
+    }
   }
   if (candidates.empty()) {
     return false;

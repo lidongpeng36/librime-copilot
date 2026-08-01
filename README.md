@@ -49,6 +49,13 @@ copilot:
   # max predict tokens
   n_predict: 8
 
+  # Predict from the real text before the caret (IMK / IME Bridge) instead of
+  # this session's commit history. default: true
+  use_surrounding_context: true
+  # How many characters before the caret to use as the lookup context.
+  # default: 8, clamped to 1..64
+  surrounding_context_chars: 8
+
   # Disable specific sub-plugins (optional)
   disabled_plugins:
     # - ime_bridge
@@ -69,6 +76,26 @@ copilot:
     # default: true
     enable_right_space: true
 ```
+
+### Prediction Context
+
+The db n-gram lookup keys are the last few characters before the caret:
+
+- **Surrounding path** (`use_surrounding_context: true`, default): the text is
+  read from the frontend — IMK on macOS, otherwise an IME Bridge client — and
+  the word just committed is appended to it (the snapshot is taken before the
+  key is handled). Because it follows the caret, moving to another paragraph or
+  app immediately predicts from *there*, instead of from whatever was typed
+  earlier in the session.
+- **History fallback**: when the frontend cannot answer (Chrome/Electron and
+  terminals often return nothing, and there is no IMK on Linux), the plugin
+  falls back to its own commit history — exactly the previous behavior. Setting
+  `use_surrounding_context: false` forces this path.
+
+`surrounding_context_chars` bounds how much is read; keys longer than ~6
+characters essentially never hit the db, so the default of 8 is ample. The text
+is only ever used in-process. The LLM provider still prompts from commit
+history and is unaffected by these settings.
 
 ### Auto Spacer Notes
 
@@ -122,7 +149,7 @@ JSON Lines format:
 | `unregister` | Remove client registration (on exit) |
 | `activate` | Mark this client as active context owner |
 | `deactivate` | Clear active ownership for this client |
-| `context` | Push surrounding text (`before`, `after`) |
+| `context` | Push surrounding text. `before` may hold several characters (its last one is the spacing boundary, the whole run is the prediction context); `after` is a single character |
 | `clear_context` | Clear stored surrounding text for this client |
 | `ping` | Health check |
 

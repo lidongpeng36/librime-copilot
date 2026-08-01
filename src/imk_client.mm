@@ -15,6 +15,8 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -24,6 +26,8 @@ namespace {
 static IMP s_originalHandleEvent = nullptr;
 static std::mutex s_cacheMutex;
 static std::optional<SurroundingText> s_cachedContext;
+// 1 = today's behavior (just the boundary character AutoSpacer needs).
+static std::atomic<int> s_prefixChars{1};
 
 // Derive a stable per-client key for per-app state isolation.
 std::string ClientKeyFromSender(id sender, id client) {
@@ -62,7 +66,7 @@ void CacheSurroundingText(id controller, id sender) {
     return;
   }
 
-  auto surrounding = QuerySurroundingFromClient(client);
+  auto surrounding = QuerySurroundingFromClient(client, s_prefixChars.load());
   if (!surrounding) {
     return;
   }
@@ -140,7 +144,7 @@ bool ClientIsComposing(id client) {
   return marked.location != NSNotFound && marked.length > 0;
 }
 
-std::optional<SurroundingText> QuerySurroundingFromClient(id client) {
+std::optional<SurroundingText> QuerySurroundingFromClient(id client, int prefix_chars) {
   if (!client) {
     return std::nullopt;
   }
@@ -164,9 +168,27 @@ std::optional<SurroundingText> QuerySurroundingFromClient(id client) {
   std::string charBefore;
   std::string charAfter;
   if (selRange.location > 0) {
-    NSAttributedString* before = attrSub(client, attrSubSel, NSMakeRange(selRange.location - 1, 1));
+    const NSUInteger wanted =
+        std::min(static_cast<NSUInteger>(std::max(prefix_chars, 1)), selRange.location);
+    NSAttributedString* before =
+        attrSub(client, attrSubSel, NSMakeRange(selRange.location - wanted, wanted));
+    // Some clients answer a single character but refuse a longer range. Falling
+    // through with "no context" would also cost AutoSpacer its boundary
+    // character, so retry with one character before giving up.
+    if (!before && wanted > 1) {
+      before = attrSub(client, attrSubSel, NSMakeRange(selRange.location - 1, 1));
+    }
     if (before) {
-      charBefore = [[before string] UTF8String] ?: "";
+      NSString* text = [before string];
+      // The range is in UTF-16 units, so its first unit may be the trailing
+      // half of a surrogate pair; drop it rather than emit a broken character.
+      if (text.length > 0) {
+        unichar first = [text characterAtIndex:0];
+        if (first >= 0xDC00 && first <= 0xDFFF) {
+          text = [text substringFromIndex:1];
+        }
+      }
+      charBefore = [text UTF8String] ?: "";
     }
   }
   {
@@ -178,6 +200,8 @@ std::optional<SurroundingText> QuerySurroundingFromClient(id client) {
   }
   return SurroundingText{charBefore, charAfter, "imk:query"};
 }
+
+void SetIMKSurroundingPrefixChars(int n) { s_prefixChars.store(std::clamp(n, 1, 64)); }
 
 // Public API to get cached surrounding text
 std::optional<SurroundingText> GetIMKSurroundingText() {

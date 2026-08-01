@@ -22,6 +22,11 @@ class Copilot : public Processor {
 
  private:
   ProcessResult RunProcessors(const KeyEvent& key_event);
+  // Text before the caret to predict from: the frontend's surrounding-text
+  // snapshot plus `committed`, or empty when no real context is available (the
+  // engine then falls back to the plugin's own commit history).
+  string GetPredictionContext(const string& committed) const;
+
   enum Action { kUnspecified, kSelect, kDelete, kSpecial };
   Action last_action_ = kUnspecified;
   bool self_updating_ = false;
@@ -33,6 +38,8 @@ class Copilot : public Processor {
   connection delete_connection_;
 
   int last_keycode_ = 0;
+  bool use_surrounding_context_ = true;
+  int surrounding_context_chars_ = 8;
   std::vector<std::shared_ptr<Processor>> processors_;
 };
 

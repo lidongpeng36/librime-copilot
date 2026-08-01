@@ -57,7 +57,7 @@ LLMProvider::LLMProvider(const Config& c, const std::shared_ptr<::copilot::Histo
   client_->clear();
 #else
   session_ = CreateSession("copilot");
-  Predict("WarmUp");
+  Predict("WarmUp", "");
   Clear(session_);
 #endif
   if (!config_.battery_active) {
@@ -167,7 +167,7 @@ std::shared_ptr<LLMProvider::Session> LLMProvider::GetOrCreateSession(const std:
 
 void LLMProvider::Clear(const std::shared_ptr<Session>& session) { session->client->clear(); }
 
-bool LLMProvider::Predict(const std::string& input) {
+bool LLMProvider::Predict(const std::string& input, const std::string& context) {
   if (!is_on_ac_) {
     return false;
   }

@@ -11,7 +11,7 @@
 #include <cctype>
 
 #include "auto_spacer_util.h"
-#include "ime_bridge.h"
+#include "surrounding_source.h"
 
 namespace rime {
 
@@ -241,27 +241,6 @@ ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_even
     return kAccepted;
   }
   return kNoop;
-}
-
-std::optional<SurroundingText> AutoSpacer::GetSurroundingText() const {
-#ifdef __APPLE__
-  // Priority 1: IMK Client (macOS system query)
-  if (auto context = GetIMKSurroundingText()) {
-    DLOG(INFO) << "[AutoSpacer] Using IMK context: before='" << context->before << "', after='"
-               << context->after << "'";
-    return context;
-  }
-#endif
-
-  // Priority 2: ImeBridge (clients like Neovim), used only when IMK has no context.
-  if (auto context = ImeBridgeServer::Instance().GetActiveContext()) {
-    DLOG(INFO) << "[AutoSpacer] Using ImeBridge context: before='" << context->before
-               << "', after='" << context->after << "'";
-    return context;
-  }
-
-  // Priority 3: fallback to commit_history
-  return std::nullopt;
 }
 
 bool SelectionLeavesUnconvertedInput(Context* ctx, const an<Candidate>& cand) {
@@ -605,7 +584,7 @@ ProcessResult AutoSpacer::ProcessWithCommitHistory(Context* ctx, const KeyEvent&
 
 ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
   // Try to get real surrounding context first
-  auto surrounding = GetSurroundingText();
+  auto surrounding = GetSurroundingContext();
 
   // Path 1: Use real surrounding context (completely independent)
   if (surrounding.has_value()) {

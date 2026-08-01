@@ -36,8 +36,13 @@ require("rime_ime").setup({
   reconnect_delay = 1000,
   max_pending = 10,
   rime_user_dir = nil,  -- auto-detect based on platform
+  context_chars = 8,    -- characters before the cursor sent as context
 })
 ```
+
+`context_chars` feeds two things on the Rime side: the last character is the
+boundary the auto-spacer needs, and the whole run is the n-gram prediction
+context (keep it in step with `copilot/surrounding_context_chars`, default 8).
 
 **Auto-detected Rime directories:**
 - **macOS**: `~/Library/Rime`

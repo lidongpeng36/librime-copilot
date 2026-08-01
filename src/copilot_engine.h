@@ -42,7 +42,10 @@ class CopilotEngine : public Class<CopilotEngine, const Ticket&> {
                 std::shared_ptr<::copilot::History>& history, int max_iterations);
   virtual ~CopilotEngine();
 
-  bool Copilot(Context* ctx, const string& context_query);
+  // `context_query` is what gates the prediction (query() must stay non-empty
+  // for CopilotTranslator to translate). `surrounding_context` is the real text
+  // before the caret when available, empty otherwise — see Provider::Predict.
+  bool Copilot(Context* ctx, const string& context_query, const string& surrounding_context = {});
   void Clear();
   void CreateCopilotSegment(Context* ctx) const;
 

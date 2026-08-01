@@ -21,6 +21,10 @@ local config = {
   reconnect_delay = 1000, -- ms
   max_pending = 10,       -- max queued messages
   rime_user_dir = nil,    -- auto-detect if nil
+  -- How many characters before the cursor to send. The plugin needs only the
+  -- boundary character for auto-spacing, but uses the rest as the n-gram
+  -- prediction context (copilot/surrounding_context_chars, default 8).
+  context_chars = 8,
 }
 
 -- Detect platform and return rime user directory
@@ -94,7 +98,7 @@ local function log(msg)
   end
 end
 
--- Get surrounding text (up to 2 chars before and 1 char after cursor)
+-- Get surrounding text (up to config.context_chars before, 1 char after)
 local function get_surrounding()
   local ok, before, after = pcall(function()
     local _, col = unpack(vim.api.nvim_win_get_cursor(0))
@@ -109,7 +113,8 @@ local function get_surrounding()
     local char_index = vim.str_utfindex(line, col)
     local char_count = vim.fn.strchars(line)
 
-    local before_len = math.min(2, math.max(0, char_index))
+    local want = math.max(1, config.context_chars or 8)
+    local before_len = math.min(want, math.max(0, char_index))
     local before_start = math.max(0, char_index - before_len)
     local b = ""
     if before_len > 0 then
