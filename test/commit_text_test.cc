@@ -38,6 +38,19 @@ Segment MakeSelectedSegment(size_t start, size_t end, const std::string& text) {
   return seg;
 }
 
+// Build a segment spanning [start, seg_end) whose highlighted candidate only
+// converts [start, cand_end) — Rime's "typed yyuu, highlighted 云 (just yy)".
+Segment MakePartialSegment(size_t start, size_t seg_end, size_t cand_end, const std::string& text) {
+  Segment seg(static_cast<int>(start), static_cast<int>(seg_end));
+  auto menu = New<Menu>();
+  auto translation = New<FifoTranslation>();
+  translation->Append(New<SimpleCandidate>("test", start, cand_end, text));
+  menu->AddTranslation(translation);
+  seg.menu = menu;
+  seg.selected_index = 0;
+  return seg;
+}
+
 // Populate ctx with a composition of the given selected candidate texts, as if
 // the user had picked a candidate for each segment of a long input.
 void SetupSelectedComposition(Context* ctx, const std::vector<std::string>& texts) {
@@ -109,6 +122,62 @@ TEST(SpaceCommit, EnglishCandidateInMiddleGetsBothSpaces) {
   SetupSelectedComposition(&ctx, {"test"});
 
   EXPECT_EQ(" test ", ComputeSpaceCommitText(&ctx, "你", "好", true));
+}
+
+TEST(PartialSelection, CandidateConvertingPrefixDefersToRime) {
+  // Typing 云枢 as "yyuu" and picking 云 (which spans only "yy"): Rime confirms
+  // that segment and keeps composing "uu" so 枢 can still be chosen.
+  Context ctx;
+  ctx.set_input("yyuu");
+  ctx.composition().Reset("yyuu");
+  ctx.composition().push_back(MakePartialSegment(0, 4, 2, "云"));
+
+  auto cand = ctx.composition().back().GetSelectedCandidate();
+  ASSERT_TRUE(cand);
+
+  // Why the AutoSpacer must not commit here: GetCommitText appends the
+  // unconverted tail verbatim, i.e. the reported "云uu" bug.
+  ASSERT_EQ("云uu", ComputeSpaceCommitText(&ctx, "", "", true));
+
+  EXPECT_TRUE(SelectionLeavesUnconvertedInput(&ctx, cand));
+}
+
+TEST(PartialSelection, CandidateConvertingWholeInputCommits) {
+  Context ctx;
+  ctx.set_input("yyuu");
+  ctx.composition().Reset("yyuu");
+  ctx.composition().push_back(MakePartialSegment(0, 4, 4, "云枢"));
+
+  auto cand = ctx.composition().back().GetSelectedCandidate();
+  ASSERT_TRUE(cand);
+
+  EXPECT_FALSE(SelectionLeavesUnconvertedInput(&ctx, cand));
+  EXPECT_EQ("云枢", ComputeSpaceCommitText(&ctx, "", "", true));
+}
+
+TEST(PartialSelection, LastSegmentOfMultiSegmentInputCommits) {
+  // 云 already confirmed, 枢 highlighted for the tail: the selection now reaches
+  // the end of the input, so committing the whole composition is correct.
+  Context ctx;
+  ctx.set_input("yyuu");
+  ctx.composition().Reset("yyuu");
+  ctx.composition().push_back(MakeSelectedSegment(0, 2, "云"));
+  ctx.composition().push_back(MakePartialSegment(2, 4, 4, "枢"));
+
+  auto cand = ctx.composition().back().GetSelectedCandidate();
+  ASSERT_TRUE(cand);
+
+  EXPECT_FALSE(SelectionLeavesUnconvertedInput(&ctx, cand));
+  EXPECT_EQ("云枢", ComputeSpaceCommitText(&ctx, "", "", true));
+}
+
+TEST(PartialSelection, NoCandidateIsNotDeferred) {
+  // Composing raw ASCII with no candidate: nothing to defer to, Space still
+  // commits the raw input.
+  Context ctx;
+  ctx.set_input("hello");
+
+  EXPECT_FALSE(SelectionLeavesUnconvertedInput(&ctx, nullptr));
 }
 
 TEST(SpaceCommit, CjkCandidateInMiddleNotSpaced) {

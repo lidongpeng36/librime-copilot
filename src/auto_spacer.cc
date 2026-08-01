@@ -1,5 +1,6 @@
 #include "auto_spacer.h"
 
+#include <rime/candidate.h>
 #include <rime/config.h>
 #include <rime/context.h>
 #include <rime/engine.h>
@@ -258,6 +259,15 @@ std::optional<SurroundingText> AutoSpacer::GetSurroundingText() const {
   return std::nullopt;
 }
 
+bool SelectionLeavesUnconvertedInput(Context* ctx, const an<Candidate>& cand) {
+  if (!ctx || !cand) {
+    return false;
+  }
+  // Compare against the composition's own input: that is the string
+  // Composition::GetCommitText() slices the unconverted tail from.
+  return cand->end() < ctx->composition().input().length();
+}
+
 std::string ComputeSpaceCommitText(Context* ctx, const std::string& before,
                                    const std::string& after, bool enable_right_space) {
   // Default: commit the raw input (composing English, no candidate).
@@ -392,6 +402,13 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
 
   // Space: commit the whole composition (usually CJK).
   if (keycode == XK_space) {
+    // ...unless the highlighted candidate converts only part of the input, in
+    // which case Space means "confirm this segment, keep composing the rest".
+    // Let Rime's Selector do that; committing here would flush the tail raw.
+    if (!ctx->composition().empty() &&
+        SelectionLeavesUnconvertedInput(ctx, ctx->composition().back().GetSelectedCandidate())) {
+      return kNoop;
+    }
     auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
     engine_->CommitText(decorated_text);
     if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
@@ -430,6 +447,13 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   auto cand = seg.GetCandidateAt(idx);
   if (!cand) {
     return commit_raw();
+  }
+
+  // Same as Space: a candidate covering only a prefix of the input means the
+  // composition continues, so defer the selection to Rime instead of
+  // committing the unconverted tail along with it.
+  if (SelectionLeavesUnconvertedInput(ctx, cand)) {
+    return kNoop;
   }
 
   // Make the number-chosen candidate the current selection, then commit the

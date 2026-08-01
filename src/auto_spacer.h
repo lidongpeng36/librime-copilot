@@ -9,7 +9,18 @@
 
 namespace rime {
 
+class Candidate;
 class Context;
+
+// True when `cand` — the candidate the user just picked — converts only a
+// PREFIX of the current input, so Rime would confirm that segment and keep
+// composing the rest (typing 云枢 as "yyuu" and picking 云, which spans "yy").
+//
+// The AutoSpacer must defer to Rime's Selector in that state instead of
+// committing: Composition::GetCommitText() appends the unconverted tail
+// verbatim, so committing would put "云uu" on screen and steal the user's
+// chance to pick 枢.
+bool SelectionLeavesUnconvertedInput(Context* ctx, const an<Candidate>& cand);
 
 // Compute the text to commit when Space finalizes the current composition,
 // including CJK/Latin auto-spacing against the surrounding `before`/`after`.
