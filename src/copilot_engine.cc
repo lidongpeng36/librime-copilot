@@ -77,32 +77,51 @@ void CopilotEngine::BackSpace() {
   }
 }
 
-const std::vector<::copilot::Entry>& CopilotEngine::candidates() {
-  cands_.clear();
+namespace {
 
-  std::multimap<size_t, std::vector<::copilot::Entry>> ranks;
-  for (auto& provider : providers_) {
-    auto cands = provider->Retrive(200'000);
-    if (cands.empty()) {
+inline void SortByWeightDesc(std::vector<::copilot::Entry>& entries) {
+  std::stable_sort(
+      entries.begin(), entries.end(),
+      [](const ::copilot::Entry& a, const ::copilot::Entry& b) { return a.weight > b.weight; });
+}
+
+}  // namespace
+
+std::vector<::copilot::Entry> MergeProviderCandidates(std::vector<RankedCandidates> per_provider) {
+  std::vector<::copilot::Entry> merged;
+  std::vector<RankedCandidates*> ranked;
+  for (auto& contribution : per_provider) {
+    if (contribution.entries.empty()) {
       continue;
     }
-    if (provider->Rank() > 0) {
-      ranks.emplace(provider->Rank(), std::move(cands));
+    if (contribution.rank < 0) {
+      merged.insert(merged.end(), contribution.entries.begin(), contribution.entries.end());
     } else {
-      cands_.insert(cands_.end(), cands.begin(), cands.end());
+      ranked.push_back(&contribution);
     }
   }
-  std::sort(cands_.begin(), cands_.end(), [](const ::copilot::Entry& a, const ::copilot::Entry& b) {
-    return a.weight < b.weight;
-  });
-  for (auto& rank : ranks) {
-    auto& entries = rank.second;
-    std::sort(
-        entries.begin(), entries.end(),
-        [](const ::copilot::Entry& a, const ::copilot::Entry& b) { return a.weight < b.weight; });
-    size_t pos = std::min(rank.first, cands_.size());
-    cands_.insert(cands_.begin() + pos, entries.begin(), entries.end());
+  SortByWeightDesc(merged);
+
+  // Insert the pinned providers low-rank-first so each index refers to the
+  // list as it looked before the later (further down) insertions.
+  std::stable_sort(
+      ranked.begin(), ranked.end(),
+      [](const RankedCandidates* a, const RankedCandidates* b) { return a->rank < b->rank; });
+  for (auto* contribution : ranked) {
+    SortByWeightDesc(contribution->entries);
+    size_t pos = std::min(static_cast<size_t>(contribution->rank), merged.size());
+    merged.insert(merged.begin() + pos, contribution->entries.begin(), contribution->entries.end());
   }
+  return merged;
+}
+
+const std::vector<::copilot::Entry>& CopilotEngine::candidates() {
+  std::vector<RankedCandidates> per_provider;
+  per_provider.reserve(providers_.size());
+  for (auto& provider : providers_) {
+    per_provider.push_back({provider->Rank(), provider->Retrive(200'000)});
+  }
+  cands_ = MergeProviderCandidates(std::move(per_provider));
 
   /*
   for (size_t i = 0; i < cands_.size(); ++i) {

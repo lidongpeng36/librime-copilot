@@ -15,6 +15,27 @@ struct Segment;
 struct Ticket;
 class Translation;
 
+// One provider's contribution to the candidate list.
+struct RankedCandidates {
+  // 0-based display position to pin the entries at; < 0 means "unranked",
+  // i.e. merged into the weight-sorted pool (Provider::Rank()'s default).
+  int rank = -1;
+  std::vector<::copilot::Entry> entries;
+};
+
+// Merge the providers' candidates into the order the user sees (the result
+// feeds a FifoTranslation verbatim).
+//
+// Unranked entries come first-by-likelihood: the whole data pipeline treats a
+// HIGHER weight as more likely (make_copilot_data filters *below*
+// --filter-weight and sorts descending; DBProvider keeps the top-N by weight),
+// so they are sorted descending. Ranked providers are then inserted at their
+// index, clamped to the end of the list.
+//
+// Declared here so the ordering can be unit-tested without providers, a db or
+// a Rime engine.
+std::vector<::copilot::Entry> MergeProviderCandidates(std::vector<RankedCandidates> per_provider);
+
 class CopilotEngine : public Class<CopilotEngine, const Ticket&> {
  public:
   CopilotEngine(std::vector<std::shared_ptr<Provider>> providers,

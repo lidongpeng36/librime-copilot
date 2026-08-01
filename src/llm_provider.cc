@@ -62,7 +62,7 @@ LLMProvider::LLMProvider(const Config& c, const std::shared_ptr<::copilot::Histo
 #endif
   if (!config_.battery_active) {
     is_on_ac_ = copilot::IsACPowerConnected();
-    copilot::RegisterPowerChange([this](bool is_ac_power) {
+    power_token_ = copilot::RegisterPowerChange([this](bool is_ac_power) {
       if (is_ac_power != is_on_ac_) {
         is_on_ac_ = is_ac_power;
         DLOG(INFO) << "[LLM]: AC Power Connected:" << is_on_ac_;
@@ -71,7 +71,34 @@ LLMProvider::LLMProvider(const Config& c, const std::shared_ptr<::copilot::Histo
   }
 }
 
-LLMProvider::~LLMProvider() {}
+LLMProvider::~LLMProvider() {
+  // The monitor is a process-wide singleton: leaving the `this`-capturing
+  // callback registered means the next plug/unplug writes into freed memory
+  // (this provider dies on every schema redeploy).
+  copilot::UnregisterPowerChange(power_token_);
+  power_token_ = 0;
+}
+
+void LLMProvider::Clear() {
+#ifdef USE_SIMPLE_CLIENT
+  if (client_) {
+    // Stop (and wait for) an in-flight run before dropping promise_: the
+    // finish callback reads promise_ on the llama worker thread, so resetting
+    // it while a run is live would be a data race. This is the same handshake
+    // Predict() already performs.
+    client_->clear();
+  }
+  promise_.reset();
+  future_ = std::shared_future<std::string>();
+#else
+  if (session_) {
+    Clear(session_);
+    session_->promise.reset();
+    session_->future = std::shared_future<std::string>();
+    session_->response.clear();
+  }
+#endif
+}
 
 void LLMProvider::Backspace(const std::shared_ptr<Session>& session) {}
 

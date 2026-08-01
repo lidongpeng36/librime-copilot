@@ -5,6 +5,7 @@ include_directories(../src)
 set(copilot_test_src
   test_main.cc
   auto_spacer_util_test.cc
+  candidate_order_test.cc
   commit_text_test.cc
   history_test.cc
   ime_bridge_socket_test.cc

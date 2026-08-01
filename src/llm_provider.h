@@ -7,6 +7,7 @@
 
 #include "history.h"
 #include "provider.h"
+#include "utils.h"
 
 namespace llama {
 class Client;
@@ -40,6 +41,10 @@ class LLMProvider : public Provider {
 
   // Provider interface
   void OnBackspace() override {}
+  // Drops the pending/completed inference. Without this override the base
+  // no-op ran instead, so a finished future kept handing the same sentence to
+  // whatever context came next.
+  void Clear() override;
   int Rank() const override { return config_.rank; }
   bool Predict(const std::string& input) override;
   std::vector<::copilot::Entry> Retrive(int timeout_us) const override;
@@ -69,6 +74,7 @@ class LLMProvider : public Provider {
 
   Config config_;
   std::atomic<bool> is_on_ac_{true};
+  ::copilot::PowerChangeToken power_token_ = 0;
 
   std::unique_ptr<llama::ClientSimple> client_;
   std::shared_ptr<std::promise<std::string>> promise_;

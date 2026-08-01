@@ -230,8 +230,11 @@ History::History(size_t n) : size_(n), capacity_(n * 2) {}
 void History::cleanup() {
   DLOG(INFO) << "History::cleanup: " << debug_string();
   size_t n = 0;
-  for (size_t i = 0; i < size_; ++i) {
-    n += pos_[i].total;
+  // Read the front entry each round: indexing with a running counter while
+  // popping from the front skips every other entry, so `n` no longer matched
+  // the chunks actually evicted and input_ drifted out of sync with pos_.
+  for (size_t i = 0; i < size_ && !pos_.empty(); ++i) {
+    n += pos_.front().total;
     pos_.pop_front();
   }
   input_.erase(0, n);

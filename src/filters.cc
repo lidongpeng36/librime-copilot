@@ -158,7 +158,12 @@ bool RawInputFilterTranslation::Replenish() {
     }
   }
   cache_.push_back(raw);
-  cache_.push_back(next);
+  // `next` is null when the upstream translation ran out inside the loop —
+  // pushing it would put a null candidate in the cache, which Peek() then
+  // hands to every downstream filter.
+  if (next) {
+    cache_.push_back(next);
+  }
   return true;
 }
 

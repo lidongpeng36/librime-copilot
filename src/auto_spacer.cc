@@ -202,7 +202,10 @@ AutoSpacer::AutoSpacer(const Ticket& ticket) : CopilotPlugin<AutoSpacer>(ticket)
 
 ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_event) const {
   const auto& keycode = key_event.keycode();
-  static const auto page_size = engine_->schema()->page_size();
+  // Not static: a function-local static would pin the first schema's page
+  // size for the whole process, so switching to a schema with a different
+  // page_size would mis-handle the number keys.
+  const auto page_size = engine_->schema()->page_size();
   int num = keycode - XK_0;
   const auto& input = ctx->input();
   if (input.empty()) {
@@ -422,7 +425,10 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     return kNoop;
   }
 
-  static const auto page_size = engine_->schema()->page_size();
+  // Not static: a function-local static would pin the first schema's page
+  // size for the whole process, so switching to a schema with a different
+  // page_size would mis-handle the number keys.
+  const auto page_size = engine_->schema()->page_size();
   const int num = keycode - XK_0;
 
   // Number key fallback to raw ASCII commit.

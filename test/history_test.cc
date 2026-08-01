@@ -99,3 +99,35 @@ TEST(HistoryBuffer, CleanupHonorsCapacity) {
   EXPECT_EQ(1u, h.size());
   EXPECT_EQ("b", h.last());
 }
+
+TEST(HistoryBuffer, CleanupDropsExactlyTheEvictedBytes) {
+  // Regression: cleanup() summed the totals of the WRONG entries (it indexed a
+  // deque it was popping from, so it read every other entry). With chunks of
+  // mixed byte width it erased too many bytes from input_, leaving the text
+  // shorter than what pos_ still accounted for — every later read then computed
+  // a negative (wrapped) offset and threw std::out_of_range.
+  History h(2);  // capacity_ == 4: the 4th add evicts the first two chunks
+  h.add("a");    // 1 byte  ─┬ evicted
+  h.add("b");    // 1 byte  ─┘
+  h.add("好");   // 3 bytes ─┬ must survive intact
+  h.add("世");   // 3 bytes ─┘
+
+  EXPECT_EQ(2u, h.size());
+  EXPECT_EQ("好世", h.gets(10));
+  EXPECT_EQ("好世", h.get_chars(2));
+  EXPECT_EQ("世", h.back());
+  EXPECT_EQ("世", h.last());
+}
+
+TEST(HistoryBuffer, CleanupKeepsSurvivorsWhenEvictedChunksAreLonger) {
+  // The mirror case: evicting long chunks must not leave stale bytes behind.
+  History h(2);
+  h.add("好");  // 3 bytes ─┬ evicted
+  h.add("世");  // 3 bytes ─┘
+  h.add("a");   // 1 byte
+  h.add("b");   // 1 byte
+
+  EXPECT_EQ(2u, h.size());
+  EXPECT_EQ("ab", h.gets(10));
+  EXPECT_EQ("ab", h.get_chars(2));
+}

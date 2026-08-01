@@ -747,30 +747,49 @@ ClientSimple::ClientSimple(ClientConfig config, const std::string& model,
 
   worker_ = std::make_shared<std::thread>([this]() {
     while (true) {
+      std::string prompt;
+      std::shared_ptr<std::promise<void>> task;
       {
+        // Read the task under the same lock commit() publishes it with:
+        // pending_prompt_ / has_new_task_ / running_task_ are all written from
+        // the input thread, and an unlocked publish can also lose the wakeup
+        // (predicate checked, then set+notify, then wait) — the prediction
+        // would silently never run.
         std::unique_lock<std::mutex> lock(mutex_);
         cond_.wait(lock, [this] { return has_new_task_ || shutdown_; });
+        if (shutdown_) {
+          break;
+        }
+        prompt = pending_prompt_;
+        task = running_task_;
+        has_new_task_ = false;
       }
-      if (shutdown_) {
-        break;
-      }
-      auto prompt = pending_prompt_;
-      has_new_task_ = false;
       run(prompt);
-      running_task_->set_value();
+      if (task) {
+        task->set_value();
+      }
     }
   });
 }
 
 ClientSimple::~ClientSimple() {
   stop_ = true;
-  shutdown_ = true;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    shutdown_ = true;
+  }
   cond_.notify_one();
+  // Join BEFORE releasing the llama objects: run() only observes stop_ after
+  // llama_decode / llama_sampler_sample have already used ctx_ and sampler_,
+  // so freeing them first is a use-after-free whenever a prediction is still
+  // in flight (e.g. the schema is redeployed mid-inference).
+  if (worker_ && worker_->joinable()) {
+    worker_->join();
+  }
   llama_sampler_free(sampler_);
   llama_free(ctx_);
   llama_model_free(model_);
   llama_backend_free();
-  worker_->join();
 }
 
 void ClientSimple::wait() {
@@ -781,12 +800,20 @@ void ClientSimple::wait() {
 
 void ClientSimple::commit(const std::string& prompt) {
   stop_ = true;
-  wait();
+  wait();  // let the in-flight run() bail out first
   stop_ = false;
-  pending_prompt_ = prompt;
-  has_new_task_ = true;
-  running_task_ = std::make_shared<std::promise<void>>();
-  running_future_ = running_task_->get_future().share();
+  auto task = std::make_shared<std::promise<void>>();
+  // Take the future before publishing the task: once the lock is released the
+  // worker may pick it up and call set_value(), and promise's members are not
+  // safe to call concurrently.
+  auto future = task->get_future().share();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_prompt_ = prompt;
+    running_task_ = task;
+    has_new_task_ = true;
+  }
+  running_future_ = std::move(future);
   cond_.notify_one();
 }
 
@@ -828,7 +855,9 @@ bool ClientSimple::run(const std::string& prompt) {
     response.append(buf, n);
     batch = llama_batch_get_one(&new_token_id, 1);
   }
-  on_finish_(response);
+  if (on_finish_) {
+    on_finish_(response);
+  }
   return true;
 }
 

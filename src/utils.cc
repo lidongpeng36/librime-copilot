@@ -1,7 +1,10 @@
 #include "utils.h"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 #ifndef __APPLE__
 #include <condition_variable>
@@ -29,18 +32,27 @@ bool IsACPowerConnected() {
   return false;
 
 #elif __APPLE__
+  // Every IOPS call here can return NULL (no power source, e.g. a desktop Mac,
+  // or a transient query failure); CFArrayGetCount/CFRelease(NULL) would crash.
   CFTypeRef power_info = IOPSCopyPowerSourcesInfo();
+  if (!power_info) {
+    return true;  // can't tell: assume AC rather than disabling the LLM
+  }
   CFArrayRef power_sources = IOPSCopyPowerSourcesList(power_info);
+  if (!power_sources) {
+    CFRelease(power_info);
+    return true;
+  }
 
-  bool is_ac_power = false;
+  bool is_ac_power = true;  // no battery listed == desktop == on AC
   if (CFArrayGetCount(power_sources) > 0) {
     CFDictionaryRef power_source =
         IOPSGetPowerSourceDescription(power_info, CFArrayGetValueAtIndex(power_sources, 0));
     if (power_source) {
       CFStringRef power_state =
           (CFStringRef)CFDictionaryGetValue(power_source, CFSTR(kIOPSPowerSourceStateKey));
-      is_ac_power =
-          (CFStringCompare(power_state, CFSTR(kIOPSACPowerValue), 0) == kCFCompareEqualTo);
+      is_ac_power = power_state && (CFStringCompare(power_state, CFSTR(kIOPSACPowerValue), 0) ==
+                                    kCFCompareEqualTo);
     }
   }
 
@@ -70,8 +82,9 @@ class PowerMonitor {
  public:
   static PowerMonitor& Instance();
 
-  // 注册电源变化回调
-  void RegisterCallback(std::function<void(bool /*is_ac_power*/)> callback);
+  // 注册电源变化回调, 返回可用于注销的 token
+  PowerChangeToken RegisterCallback(std::function<void(bool /*is_ac_power*/)> callback);
+  void UnregisterCallback(PowerChangeToken token);
 
  private:
   PowerMonitor();
@@ -88,7 +101,8 @@ class PowerMonitor {
   void PollingLoop();
 #endif
 
-  std::vector<std::function<void(bool)>> callbacks_;
+  std::vector<std::pair<PowerChangeToken, std::function<void(bool)>>> callbacks_;
+  PowerChangeToken next_token_ = 1;
   std::mutex callback_mutex_;
   std::atomic<bool> last_power_state_;
 #if defined(__APPLE__)
@@ -116,14 +130,35 @@ PowerMonitor::PowerMonitor() : last_power_state_(IsACPowerConnected()) {
 
 PowerMonitor::~PowerMonitor() { StopMonitoring(); }
 
-void PowerMonitor::RegisterCallback(std::function<void(bool)> callback) {
+PowerChangeToken PowerMonitor::RegisterCallback(std::function<void(bool)> callback) {
   std::lock_guard<std::mutex> lock(callback_mutex_);
-  callbacks_.emplace_back(std::move(callback));
+  PowerChangeToken token = next_token_++;
+  callbacks_.emplace_back(token, std::move(callback));
+  return token;
+}
+
+void PowerMonitor::UnregisterCallback(PowerChangeToken token) {
+  if (token == 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(callback_mutex_);
+  callbacks_.erase(std::remove_if(callbacks_.begin(), callbacks_.end(),
+                                  [token](const auto& entry) { return entry.first == token; }),
+                   callbacks_.end());
 }
 
 void PowerMonitor::NotifyCallbacks(bool is_ac_power) {
-  std::lock_guard<std::mutex> lock(callback_mutex_);
-  for (const auto& cb : callbacks_) {
+  // Copy under the lock, then invoke unlocked: a callback that unregisters
+  // itself (or registers another) would otherwise deadlock on callback_mutex_.
+  std::vector<std::function<void(bool)>> callbacks;
+  {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    callbacks.reserve(callbacks_.size());
+    for (const auto& [token, cb] : callbacks_) {
+      callbacks.push_back(cb);
+    }
+  }
+  for (const auto& cb : callbacks) {
     cb(is_ac_power);
   }
 }
@@ -180,8 +215,12 @@ void PowerMonitor::MacOSPowerChangeCallback(void*) {
 }
 #endif
 
-void RegisterPowerChange(std::function<void(bool /* is_ac_power */)> callback) {
-  PowerMonitor::Instance().RegisterCallback(std::move(callback));
+PowerChangeToken RegisterPowerChange(std::function<void(bool /* is_ac_power */)> callback) {
+  return PowerMonitor::Instance().RegisterCallback(std::move(callback));
+}
+
+void UnregisterPowerChange(PowerChangeToken token) {
+  PowerMonitor::Instance().UnregisterCallback(token);
 }
 
 }  // namespace copilot
