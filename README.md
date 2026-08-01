@@ -56,6 +56,14 @@ copilot:
   # default: 8, clamped to 1..64
   surrounding_context_chars: 8
 
+  # Contextual candidate re-ranking, as our own filter. Also add
+  # `copilot_rerank_filter` to engine/filters. See "Contextual Re-ranking".
+  rerank:
+    enable: true
+    max_context_chars: 8
+    window: 32
+    max_rank: 50
+
   # Disable specific sub-plugins (optional)
   disabled_plugins:
     # - ime_bridge
@@ -96,6 +104,59 @@ The db n-gram lookup keys are the last few characters before the caret:
 characters essentially never hit the db, so the default of 8 is ample. The text
 is only ever used in-process. The LLM provider still prompts from commit
 history and is unaffected by these settings.
+
+### Contextual Re-ranking (filter)
+
+Reorders the candidates of the composition you are typing so the one the db
+expects to follow the text before the caret comes first: typing the syllable
+for 瓴 right after 高屋建 puts 瓴 ahead of 令. Separate from the prediction
+popup, which only appears with an empty input.
+
+Add the filter to the schema, ahead of any pinning filter so pinned candidates
+keep winning:
+
+```yaml
+patch:
+  "engine/filters/@after 0": copilot_rerank_filter   # after copilot_filter
+```
+
+| key (`copilot/rerank/…`) | default | meaning |
+|-----|---------|---------|
+| `enable` | `true` | kill switch; the db is not opened when false |
+| `max_context_chars` | `8` | longest context key: Han characters before the caret |
+| `window` | `32` | only the first N candidates are considered |
+| `max_rank` | `50` | a continuation ranked below this among its key's continuations never promotes |
+
+How it decides:
+
+- **Context** is the run of Han characters *touching* the caret, taken from IMK
+  or the IME Bridge. Anything else ends it — CJK or ASCII punctuation, spaces,
+  newlines, latin, digits, emoji — so `高屋建。` and `高屋建 ` re-rank nothing
+  while `see 高屋建` still yields `高屋建`.
+- **Matching** is bidirectional: a candidate matches a continuation when it
+  equals it, starts it (`高屋 -> 建瓴` while only 建 is typed), or is started by
+  it. Exact matches outrank partial ones; ties go to the likelier continuation.
+- **The quality floor is a rank**, not a share of the key's total weight: the db
+  merges dictionaries on different scales (a personal dictionary is deliberately
+  lifted above the frequency-bearing one), which leaves the order meaningful but
+  the ratios not. A key like 建 has ~2900 continuations, so a share threshold
+  could never be met either. The db's weights must therefore be real
+  frequencies, ordered "larger = more likely".
+- **Promotion** moves the winner to the front, but only among candidates
+  covering the same input span, so how much input Space commits never changes.
+- **No surrounding text, no re-ranking.** With only commit history the plugin
+  cannot tell that the caret was moved by a mouse click, and a wrong promotion
+  is worse than none — so Chrome/Electron, terminals and Linux keep today's
+  order.
+
+This deliberately does not use librime's own `contextual_suggestions` /
+`grammar` mechanism. That path resolves its language model through a component
+registered under the name `grammar`, and librime-octagram — bundled with
+Squirrel — loads after this plugin and replaces it (`Registry::Register`
+overwrites on a name collision; look for `replacing previously registered
+component: grammar` in Rime's WARNING log). Owning the filter avoids that
+fight, and lets the context come from the real text before the caret rather
+than librime's "last commit only".
 
 ### Auto Spacer Notes
 

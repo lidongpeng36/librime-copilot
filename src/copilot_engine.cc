@@ -204,6 +204,17 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   return nullptr;
 }
 
+an<CopilotDb> CopilotEngineComponent::GetDb(const string& db_name) {
+  auto db = db_pool_.GetDb(db_name);
+  if (!db) {
+    return nullptr;
+  }
+  if (!db->IsOpen() && !db->Load()) {
+    return nullptr;
+  }
+  return db;
+}
+
 an<CopilotEngine> CopilotEngineComponent::GetInstance(const Ticket& ticket) {
   if (Schema* schema = ticket.schema) {
     auto found = copilot_engine_by_schema_id.find(schema->schema_id());

@@ -8,6 +8,7 @@
 
 #include "auto_spacer.h"
 #include "filters.h"
+#include "rerank_filter.h"
 #include "select_character.h"
 
 using namespace rime;
@@ -24,6 +25,11 @@ static void rime_copilot_initialize() {
   r.Register("auto_spacer_filter", new Component<AutoSpacerFilter>);
   r.Register("raw_input_filter", new Component<RawInputFilter>);
   r.Register("copilot_filter", new Component<CopilotFilter>);
+
+  // Contextual candidate re-ranking. Opt in by adding `copilot_rerank_filter`
+  // to engine/filters, ahead of any pinning filter so pinned candidates keep
+  // winning.
+  r.Register("copilot_rerank_filter", new CopilotRerankFilterComponent(engine_factory));
 }
 
 static void rime_copilot_finalize() {}

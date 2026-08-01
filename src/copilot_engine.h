@@ -75,6 +75,11 @@ class CopilotEngineComponent : public CopilotEngine::Component {
 
   an<CopilotEngine> GetInstance(const Ticket& ticket);
 
+  // Opened-and-loaded db from the shared pool, or null. Exposed so the
+  // re-ranking filter can score against the same file the prediction path
+  // reads, without mapping it a second time.
+  an<CopilotDb> GetDb(const string& db_name);
+
  protected:
   map<string, weak<CopilotEngine>> copilot_engine_by_schema_id;
   DbPool<CopilotDb> db_pool_;

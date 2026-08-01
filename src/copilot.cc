@@ -70,10 +70,19 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
     config->GetInt("copilot/surrounding_context_chars", &surrounding_context_chars_);
     surrounding_context_chars_ = std::clamp(surrounding_context_chars_, 1, 64);
 #ifdef __APPLE__
-    // Ask the IMK hook for as much text as the prediction needs; left at 1 (the
-    // boundary character AutoSpacer uses) when the feature is off, so the
+    // Ask the IMK hook for as much text as its consumers need — the prediction
+    // context and the re-ranking filter each have their own length. Left at 1
+    // (the boundary character AutoSpacer uses) when neither is on, so the
     // per-key query stays exactly as cheap as before.
-    SetIMKSurroundingPrefixChars(use_surrounding_context_ ? surrounding_context_chars_ : 1);
+    int prefix_chars = use_surrounding_context_ ? surrounding_context_chars_ : 1;
+    bool rerank_enable = true;
+    int rerank_chars = 8;
+    config->GetBool("copilot/rerank/enable", &rerank_enable);
+    config->GetInt("copilot/rerank/max_context_chars", &rerank_chars);
+    if (rerank_enable) {
+      prefix_chars = std::max(prefix_chars, std::clamp(rerank_chars, 1, 64));
+    }
+    SetIMKSurroundingPrefixChars(prefix_chars);
 #endif
     if (auto list = config->GetList("copilot/disabled_plugins")) {
       for (size_t i = 0; i < list->size(); ++i) {
