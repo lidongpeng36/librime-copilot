@@ -4,64 +4,40 @@
 
 local M = {}
 
+local endpoint = require("rime_ime.endpoint")
+
 local uv = vim.uv or vim.loop
 local socket = nil
 local connected = false
 local connecting = false
 local pending_messages = {}
 local enabled = false
+local shutting_down = false
+local reconnect_timer = nil
+local attempt = 0
+local active_endpoint = nil
 local pending_insert_leave_timer = nil
 local last_before, last_after = nil, nil
 
 local config = {
-  socket_path = "/tmp/rime_copilot_ime.sock",
-  app_name = nil,         -- auto-detect if nil
-  instance = nil,         -- auto-generate if nil
+  -- Explicit endpoint. nil means "discover it": $RIME_IME_SOCKET, then this
+  -- field, then the local default, then any ssh-forwarded tunnel socket.
+  -- Accepts "/path/to.sock" and "host:port".
+  socket_path = nil,
+  app_name = nil,             -- auto-detect if nil
+  instance = nil,             -- auto-generate if nil
   debug = false,
-  reconnect_delay = 1000, -- ms
-  max_pending = 10,       -- max queued messages
-  rime_user_dir = nil,    -- auto-detect if nil
+  reconnect_delay = 1000,     -- ms, first retry
+  reconnect_max_delay = 30000, -- ms, ceiling
+  max_pending = 10,           -- max queued messages
   -- How many characters before the cursor to send. The plugin needs only the
   -- boundary character for auto-spacing, but uses the rest as the n-gram
   -- prediction context (copilot/surrounding_context_chars, default 8).
   context_chars = 8,
 }
 
--- Detect platform and return rime user directory
-local function detect_rime_user_dir()
-  if vim.fn.has("mac") == 1 or vim.fn.has("macunix") == 1 then
-    return vim.fn.expand("~/Library/Rime")
-  elseif vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-    -- Windows: %APPDATA%\Rime
-    local appdata = vim.env.APPDATA or ""
-    return appdata .. "\\Rime"
-  else
-    -- Linux/BSD: ~/.config/ibus/rime or ~/.local/share/fcitx5/rime
-    local xdg_config = vim.env.XDG_CONFIG_HOME or vim.fn.expand("~/.config")
-    local ibus_path = xdg_config .. "/ibus/rime"
-    local fcitx5_path = vim.fn.expand("~/.local/share/fcitx5/rime")
-
-    -- Check ibus first, then fcitx5
-    local stat = uv.fs_stat(ibus_path)
-    if stat and stat.type == "directory" then
-      return ibus_path
-    end
-    stat = uv.fs_stat(fcitx5_path)
-    if stat and stat.type == "directory" then
-      return fcitx5_path
-    end
-    -- Default to ibus path for check
-    return ibus_path
-  end
-end
-
--- Check if Rime directory exists
-local function rime_exists()
-  local dir = config.rime_user_dir
-  if not dir then return false end
-  local stat = uv.fs_stat(dir)
-  return stat ~= nil and stat.type == "directory"
-end
+-- Forward declarations: these call each other.
+local connect, schedule_reconnect, on_close, resync, flush_pending, queue
 
 -- Auto-detect app name
 local function detect_app_name()
@@ -91,11 +67,19 @@ local function generate_instance_id()
   return table.concat(parts, "-")
 end
 
--- Log helper
+-- Log helper. Several callers are libuv callbacks, and nvim_echo (under
+-- vim.notify) raises E5560 in a fast event context, so defer when we are in one.
 local function log(msg)
-  if config.debug then
-    vim.notify("[rime-ime] " .. msg, vim.log.levels.DEBUG)
+  if not config.debug then
+    return
   end
+  if vim.in_fast_event() then
+    vim.schedule(function()
+      vim.notify("[rime-ime] " .. msg, vim.log.levels.DEBUG)
+    end)
+    return
+  end
+  vim.notify("[rime-ime] " .. msg, vim.log.levels.DEBUG)
 end
 
 -- Get surrounding text (up to config.context_chars before, 1 char after)
@@ -151,64 +135,206 @@ local function build_message(action, data)
   return vim.json.encode(msg) .. "\n"
 end
 
--- Flush pending messages
-local function flush_pending()
-  if not connected or #pending_messages == 0 then
+-- Endpoint discovery ------------------------------------------------------
+
+local function stat_endpoint(path)
+  local st = uv.fs_stat(path)
+  if not st then
+    return nil
+  end
+  return {
+    type = st.type,
+    uid = st.uid,
+    mtime = (st.mtime and st.mtime.sec) or 0,
+  }
+end
+
+local function candidates()
+  return endpoint.candidates({
+    env = vim.env.RIME_IME_SOCKET,
+    configured = config.socket_path,
+    glob = function(pattern) return vim.fn.glob(pattern, true, true) end,
+    stat = stat_endpoint,
+    uid = uv.getuid and uv.getuid() or nil,
+  })
+end
+
+-- True when there is something worth dialling right now. When nothing exists on
+-- disk there is nothing to poll for, so we go dormant instead of burning a
+-- timer forever; InsertEnter and FocusGained retry lazily.
+local function any_endpoint_present()
+  for _, ep in ipairs(candidates()) do
+    if ep.kind == "tcp" then
+      return true  -- a port cannot be stat'ed; keep trying
+    end
+    if uv.fs_stat(ep.path) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Message plumbing --------------------------------------------------------
+
+queue = function(msg)
+  if #pending_messages >= config.max_pending then
+    -- Drop the oldest: these are state messages, and the newest is the one that
+    -- describes reality.
+    table.remove(pending_messages, 1)
+  end
+  pending_messages[#pending_messages + 1] = msg
+end
+
+flush_pending = function()
+  if not connected or not socket then
     return
   end
-
   local messages = pending_messages
   pending_messages = {}
-
   for _, msg in ipairs(messages) do
-    local ok = pcall(function()
-      socket:write(msg)
-    end)
+    local ok, err = socket:write(msg)
     if not ok then
-      log("Flush failed, message dropped")
+      log("Flush failed: " .. tostring(err))
+      on_close()
+      return
     end
   end
 end
 
--- Handle connection close
-local function on_close()
+-- Connection lifecycle ----------------------------------------------------
+
+on_close = function()
+  local was_connected = connected
   connected = false
   connecting = false
   if socket then
+    pcall(function() socket:read_stop() end)
     pcall(function() socket:close() end)
     socket = nil
   end
-  log("Connection closed")
+  active_endpoint = nil
+  if was_connected then
+    log("Connection lost")
+    attempt = 0  -- a working endpoint just died; retry promptly
+  end
+  schedule_reconnect()
 end
 
--- Connect to socket (async)
-local function connect()
-  if connected or connecting then
+schedule_reconnect = function()
+  if shutting_down or reconnect_timer or connected or connecting then
+    return
+  end
+  if not any_endpoint_present() then
+    log("No endpoint present; dormant until the next InsertEnter/FocusGained")
+    return
+  end
+  attempt = attempt + 1
+  local delay = endpoint.backoff(attempt, config.reconnect_delay, config.reconnect_max_delay)
+  log("Reconnecting in " .. delay .. "ms (attempt " .. attempt .. ")")
+  reconnect_timer = vim.defer_fn(function()
+    reconnect_timer = nil
+    connect()
+  end, delay)
+end
+
+-- After a reconnect the server knows nothing about us, so re-assert whatever
+-- the current mode implies. Note we do NOT send restore here: the restore stack
+-- died with the old connection and there is nothing meaningful to pop.
+resync = function()
+  local mode = vim.fn.mode()
+  if mode == "i" or mode == "R" then
+    M.activate()
+    M.context()
+  else
+    M.set(true, { stack = false })
+    M.deactivate()
+  end
+end
+
+local function try_connect(list, idx)
+  if idx > #list then
+    connecting = false
+    schedule_reconnect()
     return
   end
 
-  connecting = true
-  socket = uv.new_pipe(false)
+  local ep = list[idx]
+  local handle = (ep.kind == "tcp") and uv.new_tcp() or uv.new_pipe(false)
 
-  socket:connect(config.socket_path, function(err)
-    connecting = false
-
+  local function on_result(err)
     if err then
-      log("Connect failed: " .. tostring(err))
-      pcall(function() socket:close() end)
-      socket = nil
-
-      -- Schedule reconnect
-      vim.defer_fn(connect, config.reconnect_delay)
+      pcall(function() handle:close() end)
+      -- This callback is a fast event context, where vim.fn/vim.env are
+      -- forbidden -- and the next step needs both, via candidates() in
+      -- schedule_reconnect. Raising here would abort before any retry is
+      -- scheduled, i.e. go dormant forever. Hop onto the main loop first.
+      vim.schedule(function() try_connect(list, idx + 1) end)
       return
     end
 
+    socket = handle
     connected = true
-    log("Connected to " .. config.socket_path)
+    connecting = false
+    attempt = 0
+    active_endpoint = ep
 
-    -- Flush pending messages
-    vim.schedule(flush_pending)
-  end)
+    if ep.kind == "unix" then
+      -- sshd creates a forwarded socket under the login umask (often 022 ->
+      -- 0755), which would let any other user on that host drive this IME. We
+      -- own the file, so tighten it to 0600.
+      pcall(function() uv.fs_chmod(ep.path, 384) end)
+    end
+
+    -- Without read_start libuv never surfaces the peer's EOF, and writes go on
+    -- "succeeding" into a dead socket forever -- which is why a Squirrel
+    -- restart used to kill the bridge until nvim itself was restarted. The
+    -- protocol is one-way, so any payload is ignored; we are here for the close
+    -- notification alone.
+    handle:read_start(function(read_err, data)
+      if read_err or not data then
+        vim.schedule(on_close)
+      end
+    end)
+
+    log("Connected to " .. (ep.kind == "tcp" and (ep.host .. ":" .. ep.port) or ep.path))
+    vim.schedule(function()
+      flush_pending()
+      resync()
+    end)
+  end
+
+  if ep.kind == "tcp" then
+    handle:connect(ep.host, ep.port, on_result)
+  else
+    handle:connect(ep.path, on_result)
+  end
+end
+
+connect = function()
+  if shutting_down or connected or connecting or reconnect_timer then
+    return
+  end
+  connecting = true
+  try_connect(candidates(), 1)
+end
+
+local function disconnect()
+  shutting_down = true
+  if reconnect_timer then
+    pcall(function() reconnect_timer:stop() end)
+    pcall(function() reconnect_timer:close() end)
+    reconnect_timer = nil
+  end
+  connected = false
+  connecting = false
+  if socket then
+    pcall(function() socket:read_stop() end)
+    pcall(function() socket:close() end)
+    socket = nil
+  end
+  active_endpoint = nil
+  pending_messages = {}
+  log("Disconnected")
 end
 
 -- Send message (non-blocking)
@@ -217,27 +343,19 @@ local function send(action, data)
   log("Queueing: " .. action)
 
   if connected and socket then
-    local ok = pcall(function()
-      socket:write(msg)
-    end)
+    -- luv returns nil, err on failure; it does NOT raise. The old pcall-only
+    -- check could therefore never see a write error.
+    local ok, err = socket:write(msg)
     if not ok then
+      log("Write failed: " .. tostring(err))
       on_close()
-      connect()
+      queue(msg)
     end
-  else
-    -- Queue message
-    if #pending_messages < config.max_pending then
-      table.insert(pending_messages, msg)
-    end
-    connect()
+    return
   end
-end
 
--- Disconnect
-local function disconnect()
-  on_close()
-  pending_messages = {}
-  log("Disconnected")
+  queue(msg)
+  connect()
 end
 
 -- Public API
@@ -339,19 +457,11 @@ end
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
 
-  -- Auto-detect rime_user_dir if not provided
-  config.rime_user_dir = config.rime_user_dir or detect_rime_user_dir()
-
-  -- Check if Rime directory exists
-  if not rime_exists() then
-    if config.debug then
-      vim.notify("[rime-ime] Disabled: Rime directory not found at " .. (config.rime_user_dir or "nil"),
-        vim.log.levels.INFO)
-    end
-    return
-  end
-
+  -- No "is Rime installed here?" gate any more: with ssh forwarding the IME can
+  -- live on a completely different machine. Whether an endpoint answers is the
+  -- only signal that means anything.
   enabled = true
+  shutting_down = false
 
   -- Auto-detect app_name and instance if not provided
   config.app_name = config.app_name or detect_app_name()
@@ -370,6 +480,7 @@ function M.setup(opts)
         pcall(function() pending_insert_leave_timer:close() end)
         pending_insert_leave_timer = nil
       end
+      connect()
       M.activate()
       M.restore()
       M.context()
@@ -444,6 +555,7 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd({ "FocusGained" }, {
     group = group,
     callback = function()
+      connect()
       -- 延迟执行以确保在 OS/IDE 焦点切换和状态恢复完成后强制覆盖
       local mode = vim.fn.mode()
       if mode == "i" or mode == "R" then
