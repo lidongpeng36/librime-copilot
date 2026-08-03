@@ -71,6 +71,14 @@ bool WaitForAction(ImeBridgeServer& server, ImeBridgePendingAction::Type type,
   return false;
 }
 
+bool WaitForLiveConnections(ImeBridgeServer& server, int expected) {
+  for (int i = 0; i < 200; ++i) {  // up to ~2s
+    if (server.live_connections() == expected) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
 std::string Msg(const std::string& app, const std::string& instance, const std::string& data) {
   return std::string(R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":")") + app +
          R"(","instance":")" + instance + R"("},"data":)" + data + "}";
@@ -137,4 +145,28 @@ TEST(ImeBridgeSocket, SecondClientTakesOwnershipOverSocket) {
 
   close(fd);
   server.Stop();
+}
+
+TEST(ImeBridgeSocket, StopDrainsConnectionThreads) {
+  // Stop() used to only join the accept thread. Connection threads stayed
+  // parked on read() holding a reference to state_, so a schema redeploy piled
+  // them up and process exit could destroy the singleton out from under them.
+  ImeBridgeServer server;
+  ImeBridgeServer::Config cfg;
+  cfg.socket_path = "/tmp/rime_copilot_test4_" + std::to_string(getpid()) + ".sock";
+  server.Start(cfg);
+
+  int fd = ConnectClient(cfg.socket_path);
+  ASSERT_GE(fd, 0);
+  SendLine(fd, Msg("nvim", "1", R"({"action":"ping"})"));
+  ASSERT_TRUE(WaitForLiveConnections(server, 1));
+
+  auto started = std::chrono::steady_clock::now();
+  server.Stop();
+  auto elapsed = std::chrono::steady_clock::now() - started;
+
+  EXPECT_EQ(0, server.live_connections());
+  EXPECT_LT(elapsed, std::chrono::seconds(2));
+
+  close(fd);
 }

@@ -115,6 +115,21 @@ void ImeBridgeServer::Stop() {
   }
   server_thread_.reset();
 
+  // shutdown() makes each connection thread's blocking read() return 0. Without
+  // this they stay parked forever holding a reference to state_.
+  {
+    std::lock_guard<std::mutex> lock(conn_mutex_);
+    for (int fd : client_fds_) {
+      shutdown(fd, SHUT_RDWR);
+    }
+  }
+  {
+    std::unique_lock<std::mutex> lock(conn_mutex_);
+    if (!conn_cv_.wait_for(lock, std::chrono::seconds(2), [this] { return live_conns_ == 0; })) {
+      LOG(WARNING) << "[ImeBridge] " << live_conns_ << " connection thread(s) did not exit in time";
+    }
+  }
+
   unlink(state_.config_.socket_path.c_str());
 
   LOG(INFO) << "[ImeBridge] Server stopped.";
@@ -139,9 +154,25 @@ void ImeBridgeServer::RunServer() {
       continue;
     }
     // Handle each client on its own thread so multiple Neovim instances can
-    // keep long-lived connections concurrently.
+    // keep long-lived connections concurrently. Register the fd first so
+    // Stop() can shut it down and unblock the read().
+    {
+      std::lock_guard<std::mutex> lock(conn_mutex_);
+      client_fds_.insert(client_fd);
+      ++live_conns_;
+    }
     std::thread([this, client_fd]() {
       HandleConnection(client_fd);
+      {
+        std::lock_guard<std::mutex> lock(conn_mutex_);
+        client_fds_.erase(client_fd);
+        --live_conns_;
+        // Notified under the lock on purpose: Stop() may return and destroy
+        // this server the moment it sees the count hit zero, so the last thing
+        // this thread touches on `this` has to happen before that can be
+        // observed.
+        conn_cv_.notify_all();
+      }
       close(client_fd);
     }).detach();
   }

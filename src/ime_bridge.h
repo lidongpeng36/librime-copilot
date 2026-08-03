@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -128,6 +130,13 @@ class ImeBridgeServer {
   bool IsRunning() const { return running_.load(); }
   bool IsDebug() const { return state_.config_.debug; }
 
+  // Number of connection threads currently alive. Exposed so tests can assert
+  // Stop() actually drained them.
+  int live_connections() const {
+    std::lock_guard<std::mutex> lock(conn_mutex_);
+    return live_conns_;
+  }
+
   // 获取活跃客户端的上下文信息（线程安全）
   std::optional<SurroundingText> GetActiveContext() { return state_.GetActiveContext(); }
 
@@ -153,6 +162,14 @@ class ImeBridgeServer {
   std::atomic<bool> running_{false};
   std::unique_ptr<std::thread> server_thread_;
   std::atomic<int> ref_count_{0};
+
+  // Connection registry. Deliberately guarded by its own mutex: Stop() holds
+  // mutex_ while waiting for these threads, and they must never need mutex_ to
+  // finish, or the two would deadlock.
+  mutable std::mutex conn_mutex_;
+  std::condition_variable conn_cv_;
+  std::set<int> client_fds_;
+  int live_conns_ = 0;
 };
 
 // IME Bridge Processor（每个 session 一个实例，共享服务器）
