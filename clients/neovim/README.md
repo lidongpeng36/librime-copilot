@@ -192,8 +192,13 @@ This plugin manages Rime's `ascii_mode` intelligently to provide a seamless Vim 
    - `restore` previous mode,
    - push `context` immediately and once more after a short delay.
 3. **Insert mode typing**:
-   - push `context` on `CursorMovedI` and `TextChangedI` (deduped: only when the
-     surrounding text actually changed).
+   - push `context` on every `CursorMovedI` and `TextChangedI`, without
+     deduplication. Each push also re-claims ownership of the surrounding
+     context on the server, and that claim is the only thing that reliably
+     follows the keyboard when the terminal does not report focus events
+     (common under tmux and ssh) — suppressing an "unchanged" payload
+     suppressed the re-claim with it, letting a second Neovim keep owning the
+     context while you typed into the first.
 4. **InsertLeave/CmdlineEnter/FocusLost**:
    - set English mode as needed,
    - `deactivate`,

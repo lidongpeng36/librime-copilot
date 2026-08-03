@@ -115,17 +115,22 @@ void ImeBridgeServer::Stop() {
   }
   server_thread_.reset();
 
+  // The two blocks below hold conn_mutex_, NOT the mutex_ taken at the top of
+  // this function; they are named conn_lock so the difference is visible, since
+  // this function's whole correctness argument is which one is held where.
+  //
   // shutdown() makes each connection thread's blocking read() return 0. Without
   // this they stay parked forever holding a reference to state_.
   {
-    std::lock_guard<std::mutex> lock(conn_mutex_);
+    std::lock_guard<std::mutex> conn_lock(conn_mutex_);
     for (int fd : client_fds_) {
       shutdown(fd, SHUT_RDWR);
     }
   }
   {
-    std::unique_lock<std::mutex> lock(conn_mutex_);
-    if (!conn_cv_.wait_for(lock, std::chrono::seconds(2), [this] { return live_conns_ == 0; })) {
+    std::unique_lock<std::mutex> conn_lock(conn_mutex_);
+    if (!conn_cv_.wait_for(conn_lock, std::chrono::seconds(2),
+                           [this] { return live_conns_ == 0; })) {
       LOG(WARNING) << "[ImeBridge] " << live_conns_ << " connection thread(s) did not exit in time";
     }
   }
