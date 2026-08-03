@@ -15,9 +15,20 @@ Neovim plugin for Rime IME Bridge. Automatically switches Rime's `ascii_mode` ba
 
 ## Installation
 
-### lazy.nvim
+The client is one self-contained module directory:
+
+```
+lua/rime_ime/
+├── init.lua       -- connection lifecycle, autocmds, protocol
+└── endpoint.lua   -- pure logic: endpoint parsing, discovery, backoff, identity
+```
+
+Nothing else is needed at runtime — `test/` is not required.
+
+### With a plugin manager
 
 ```lua
+-- lazy.nvim
 {
   dir = "path/to/librime-copilot/clients/neovim",
   config = function()
@@ -25,6 +36,26 @@ Neovim plugin for Rime IME Bridge. Automatically switches Rime's `ascii_mode` ba
   end,
 }
 ```
+
+### Without one, including on a remote host
+
+Drop the directory into any `lua/` on your `runtimepath` and call `setup()`.
+Because it is one directory, copying it is a single command — which is how you
+keep a remote host byte-identical to your laptop:
+
+```sh
+scp -r ~/.config/nvim/lua/rime_ime dev:~/.config/nvim/lua/
+```
+
+Then in the remote `init.lua`:
+
+```lua
+require("rime_ime").setup()
+```
+
+`~/.config/nvim/lua` is already on the runtimepath, so no plugin manager is
+involved. See "Remote Neovim over ssh" below for the tunnel that lets it reach
+your laptop's IME.
 
 ## Configuration
 

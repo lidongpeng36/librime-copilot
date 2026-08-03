@@ -110,7 +110,12 @@ All three can be turned off via `copilot/disabled_plugins` in the schema config.
 - `ax_poc.mm` — macOS Accessibility API proof-of-concept (Apple-only).
 
 ## Clients
-- `clients/neovim/lua/rime_ime.lua` — Neovim client for the IME Bridge.
+- `clients/neovim/lua/rime_ime/` — Neovim client for the IME Bridge, one
+  self-contained module directory so it can be synced to a remote host as a
+  unit. `init.lua` is the stateful part (connection lifecycle, autocmds,
+  protocol); `endpoint.lua` is pure logic (endpoint parsing, discovery order,
+  backoff, instance identity) with no `vim.*` reference, which is what lets
+  `clients/neovim/test/endpoint_spec.lua` run under bare `nvim -l`.
 
 ## Deployment / config
 Users add `copilot` to `engine/processors` (before `key_binder`) and `copilot_translator`

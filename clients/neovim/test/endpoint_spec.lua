@@ -161,7 +161,7 @@ do
 end
 
 do
-  -- A symlink is what rime_ime.lua's lstat reports for a planted link to a
+  -- A symlink is what init.lua's lstat reports for a planted link to a
   -- socket we do own; it must not survive the type check.
   local list = endpoint.candidates({
     uid = 501,

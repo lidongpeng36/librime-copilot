@@ -3,7 +3,7 @@
 --
 -- Deliberately free of any vim.* API and of any side effect, so
 -- clients/neovim/test/endpoint_spec.lua can drive it with `nvim -l` and no test
--- framework. Keep it that way: everything stateful lives in rime_ime.lua.
+-- framework. Keep it that way: everything stateful lives in init.lua.
 
 local M = {}
 
