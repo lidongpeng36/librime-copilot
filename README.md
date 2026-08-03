@@ -105,6 +105,8 @@ copilot:
     enable: true
     socket_path: /tmp/rime_copilot_ime.sock
     client_timeout_minutes: 30  # auto-cleanup stale clients
+    context_ttl_seconds: 60  # age past which the active client's surrounding
+                              # context is treated as absent; 0 disables the check
     debug: false
 
   # Auto Spacer configuration
@@ -248,5 +250,9 @@ JSON Lines format:
 
 - IME Bridge handles multiple clients concurrently.
 - Surrounding context is resolved from the explicitly active client (`activate/deactivate`), not by timeout heuristics.
+
+Neovim on a remote host can drive the local IME over an ssh reverse tunnel —
+see [clients/neovim/README.md](clients/neovim/README.md#remote-neovim-over-ssh).
+The wire protocol is unchanged; the client just dials a forwarded socket.
 
 * Deploy and enjoy.

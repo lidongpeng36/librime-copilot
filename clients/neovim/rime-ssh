@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# ssh, plus one reverse tunnel back to this machine's Rime IME Bridge socket, so
+# that Neovim on the remote host can drive the input method here.
+#
+#   rime-ssh dev            # instead of: ssh dev
+#
+# The remote path is unique per invocation on purpose. Several sessions to the
+# same host then each own their socket, and sshd reclaiming one on logout cannot
+# strand the others. The name must keep matching endpoint.lua's TUNNEL_GLOB
+# (/tmp/rime-ime-*.sock) -- that is how the plugin finds it.
+#
+# Nothing is needed on the remote side: no sshd change, no AcceptEnv, no
+# environment variable. Every tunnel terminates at the same bridge here, so the
+# plugin simply dials whichever one is alive.
+set -eu
+
+LOCAL_SOCK="${RIME_IME_LOCAL_SOCK:-/tmp/rime_copilot_ime.sock}"
+
+# Rime is not running: nothing to forward, so behave exactly like ssh.
+[ -S "$LOCAL_SOCK" ] || exec ssh "$@"
+
+ID=$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)
+exec ssh -R "/tmp/rime-ime-$ID.sock:$LOCAL_SOCK" "$@"
