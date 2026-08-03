@@ -111,6 +111,106 @@ do
   eq(#list, 2, "stale-looking sockets are still offered")
 end
 
+-- candidates: the type+ownership filter applies to EVERY unix candidate ------
+-- Not just globbed ones. /tmp is world-writable, and on a remote host where no
+-- Rime runs the hard-coded default is an unclaimed name any other user can bind
+-- first -- and would then receive a copy of every keystroke.
+
+do
+  -- Outcome 1 of 3 for a non-glob candidate: stat says nil (path absent).
+  -- Keep it. candidates() is recomputed on every dial, so pruning here would
+  -- make "Squirrel has not started yet" permanent for the life of the process.
+  local list = endpoint.candidates({
+    uid = 501,
+    glob = function() return {} end,
+    stat = function() return nil end,
+  })
+  eq(#list, 1, "an absent default is still offered")
+  eq(list[1].path, endpoint.DEFAULT_SOCKET, "...and it is the default")
+end
+
+do
+  -- Outcome 2 of 3: it exists but is not a socket. Drop it.
+  local logged = {}
+  local list = endpoint.candidates({
+    uid = 501,
+    glob = function() return {} end,
+    stat = function() return { type = "file", uid = 501, mtime = 1 } end,
+    log = function(m) logged[#logged + 1] = m end,
+  })
+  eq(#list, 0, "a non-socket at the default path is dropped")
+  eq(#logged, 1, "and the rejection is logged")
+  check(logged[1] and logged[1]:find("not a socket", 1, true) ~= nil,
+        "the log says why: " .. tostring(logged[1]))
+end
+
+do
+  -- Outcome 3 of 3: a socket, but someone else's. Drop it. This is the actual
+  -- keystroke-leak case on a shared host.
+  local logged = {}
+  local list = endpoint.candidates({
+    uid = 501,
+    glob = function() return {} end,
+    stat = function() return { type = "socket", uid = 999, mtime = 1 } end,
+    log = function(m) logged[#logged + 1] = m end,
+  })
+  eq(#list, 0, "a socket owned by another uid is dropped")
+  eq(#logged, 1, "and the rejection is logged")
+  check(logged[1] and logged[1]:find("uid 999", 1, true) ~= nil,
+        "the log names the owner: " .. tostring(logged[1]))
+end
+
+do
+  -- A symlink is what rime_ime.lua's lstat reports for a planted link to a
+  -- socket we do own; it must not survive the type check.
+  local list = endpoint.candidates({
+    uid = 501,
+    glob = function() return {} end,
+    stat = function() return { type = "link", uid = 501, mtime = 1 } end,
+  })
+  eq(#list, 0, "a symlink is not a socket and is dropped")
+end
+
+do
+  -- $RIME_IME_SOCKET and socket_path get no exemption. Only the good one and
+  -- the (absent, hence kept) default survive.
+  local stats = {
+    ["/tmp/env-hijacked.sock"] = { type = "socket", uid = 999, mtime = 9 },
+    ["/tmp/configured-regular-file"] = { type = "file", uid = 501, mtime = 9 },
+    ["/tmp/rime-ime-good.sock"] = { type = "socket", uid = 501, mtime = 9 },
+  }
+  local list = endpoint.candidates({
+    uid = 501,
+    env = "/tmp/env-hijacked.sock",
+    configured = "/tmp/configured-regular-file",
+    glob = function() return { "/tmp/rime-ime-good.sock" } end,
+    stat = function(p) return stats[p] end,
+  })
+  eq(#list, 2, "hijacked env and bogus configured path are both dropped")
+  eq(list[1].path, endpoint.DEFAULT_SOCKET, "the absent default is still tried")
+  eq(list[2].path, "/tmp/rime-ime-good.sock", "our own tunnel survives")
+end
+
+do
+  -- A tcp endpoint cannot be stat'ed, so the filter must leave it alone even
+  -- when stat() would answer for every path handed to it.
+  local list = endpoint.candidates({
+    uid = 501,
+    env = "127.0.0.1:9527",
+    glob = function() return {} end,
+    stat = function() return { type = "file", uid = 999, mtime = 1 } end,
+  })
+  eq(#list, 1, "only the tcp endpoint remains")
+  eq(list[1].kind, "tcp", "tcp endpoints are not filtered")
+end
+
+do
+  -- With no stat injected nothing can be checked, so nothing is dropped: the
+  -- module stays usable (and testable) without a filesystem.
+  local list = endpoint.candidates({ uid = 501, glob = function() return {} end })
+  eq(#list, 1, "without stat, candidates are passed through")
+end
+
 -- backoff ---------------------------------------------------------------
 
 do

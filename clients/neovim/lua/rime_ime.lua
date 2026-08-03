@@ -136,8 +136,15 @@ end
 
 -- Endpoint discovery ------------------------------------------------------
 
+-- lstat, deliberately: fs_stat follows symlinks, so an attacker who plants
+-- /tmp/rime-ime-x.sock as a link to a socket *we* own (tmux server, ssh agent,
+-- a language server) would pass both the type and the ownership check. We would
+-- then write JSON Lines into that daemon, consider ourselves connected -- the
+-- protocol is one-way, so nothing contradicts it -- and never reach the real
+-- tunnel; the fs_chmod below would follow the link too and change that daemon's
+-- socket mode. With lstat a symlink reports type == "link" and is rejected.
 local function stat_endpoint(path)
-  local st = uv.fs_stat(path)
+  local st = uv.fs_lstat(path)
   if not st then
     return nil
   end
@@ -155,6 +162,7 @@ local function candidates()
     glob = function(pattern) return vim.fn.glob(pattern, true, true) end,
     stat = stat_endpoint,
     uid = uv.getuid and uv.getuid() or nil,
+    log = log,
   })
 end
 
@@ -166,7 +174,7 @@ local function any_endpoint_present()
     if ep.kind == "tcp" then
       return true  -- a port cannot be stat'ed; keep trying
     end
-    if uv.fs_stat(ep.path) then
+    if uv.fs_lstat(ep.path) then
       return true
     end
   end

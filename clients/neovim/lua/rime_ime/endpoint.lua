@@ -52,14 +52,71 @@ end
 --- opts.configured explicit socket_path from setup(), or nil
 --- opts.glob       function(pattern) -> list of paths
 --- opts.stat       function(path) -> { type = , uid = , mtime = } or nil
---- opts.uid        our uid; tunnels owned by anyone else are skipped
+---                 must NOT follow symlinks (lstat), or the ownership check
+---                 below can be defeated by a symlink to a socket we do own
+--- opts.uid        our uid; endpoints owned by anyone else are skipped
+--- opts.log        function(msg), optional; called with the reason a candidate
+---                 was dropped
 function M.candidates(opts)
   opts = opts or {}
   local out, seen = {}, {}
 
+  -- One stat per path per call: the tunnel branch needs the mtime to order
+  -- candidates and usable_unix needs the type/uid, and re-stat'ing would also
+  -- open a window where the two disagree.
+  local stat_cache, stat_done = {}, {}
+  local function stat(path)
+    if not opts.stat then
+      return nil
+    end
+    if not stat_done[path] then
+      stat_done[path] = true
+      stat_cache[path] = opts.stat(path)
+    end
+    return stat_cache[path]
+  end
+
+  -- Every unix candidate goes through this, not just the globbed ones. The
+  -- hard-coded default lives in a world-writable /tmp, and on a host where no
+  -- Rime runs (the usual remote case) that name is unclaimed: any other user
+  -- can bind it first and then receive every context push -- i.e. what you are
+  -- typing, per keystroke. $RIME_IME_SOCKET and socket_path get the same
+  -- treatment on purpose; a bridge socket owned by another uid is exotic
+  -- enough that uniformity is worth more than the flexibility.
+  local function usable_unix(path)
+    if not opts.stat then
+      return true  -- nothing injected to check with
+    end
+    local st = stat(path)
+    if not st then
+      -- Absent, not hostile. candidates() is recomputed on every dial, so the
+      -- local default must survive "Squirrel has not started yet": dialling it
+      -- simply fails and we fall through to the next candidate.
+      return true
+    end
+    if st.type ~= "socket" then
+      if opts.log then
+        opts.log("skipping " .. path .. ": not a socket (" .. tostring(st.type) .. ")")
+      end
+      return false
+    end
+    if opts.uid ~= nil and st.uid ~= opts.uid then
+      if opts.log then
+        opts.log("skipping " .. path .. ": owned by uid " .. tostring(st.uid)
+                 .. ", not " .. tostring(opts.uid))
+      end
+      return false
+    end
+    return true
+  end
+
   local function add(s)
     local ep = M.parse(s)
     if not ep then
+      return
+    end
+    -- A tcp endpoint cannot be stat'ed, so it is passed through untouched.
+    if ep.kind == "unix" and not usable_unix(ep.path) then
       return
     end
     local key = endpoint_key(ep)
@@ -74,15 +131,12 @@ function M.candidates(opts)
   add(opts.configured)
   add(M.DEFAULT_SOCKET)
 
+  -- Tunnels are ordered newest-first; add() does the type/ownership filtering.
   local paths = opts.glob and opts.glob(M.TUNNEL_GLOB) or {}
   local usable = {}
   for _, p in ipairs(paths) do
-    local st = opts.stat and opts.stat(p) or nil
-    -- Only real sockets, and only ours: a tunnel owned by another user leads to
-    -- *their* machine's IME, and dialling it would drive their input method.
-    if st and st.type == "socket" and (opts.uid == nil or st.uid == opts.uid) then
-      usable[#usable + 1] = { path = p, mtime = st.mtime or 0 }
-    end
+    local st = stat(p)
+    usable[#usable + 1] = { path = p, mtime = (st and st.mtime) or 0 }
   end
   table.sort(usable, function(a, b)
     if a.mtime == b.mtime then
