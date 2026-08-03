@@ -259,6 +259,16 @@ resync = function()
 end
 
 local function try_connect(list, idx)
+  -- A candidate walk in flight when VimLeavePre runs would otherwise keep
+  -- dialling after disconnect(), and a late success would set socket/connected
+  -- back up and have resync() send set/activate/context *after* the
+  -- reset(true)+unregister the exit path just sent -- re-registering the very
+  -- client we were trying to erase.
+  if shutting_down then
+    connecting = false
+    return
+  end
+
   if idx > #list then
     connecting = false
     schedule_reconnect()
@@ -269,6 +279,14 @@ local function try_connect(list, idx)
   local handle = (ep.kind == "tcp") and uv.new_tcp() or uv.new_pipe(false)
 
   local function on_result(err)
+    if shutting_down then
+      -- Close it here: nothing downstream will, and disconnect() has already
+      -- forgotten about this handle.
+      pcall(function() handle:close() end)
+      connecting = false
+      return
+    end
+
     if err then
       pcall(function() handle:close() end)
       -- This callback is a fast event context, where vim.fn/vim.env are
