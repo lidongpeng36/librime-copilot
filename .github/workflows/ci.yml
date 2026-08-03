@@ -12,10 +12,12 @@ jobs:
     steps:
       - name: Checkout last commit
         uses: actions/checkout@v4
-      - name: Install clang-format
-        run: sudo apt install -y clang-format
+      - name: Install clang-format and neovim
+        run: sudo apt install -y clang-format neovim
       - name: Lint
         run: find src tools -name '*.cc' -o -name '*.h' | xargs clang-format -Werror --dry-run || { echo Please lint your code by '"'"find src tools -name '*.cc' -o -name '*.h' | xargs clang-format -i"'"'.; false; }
+      - name: Lua unit tests
+        run: nvim -l clients/neovim/test/endpoint_spec.lua
 
   build:
     runs-on: ubuntu-24.04
