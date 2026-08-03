@@ -52,8 +52,15 @@ The plugin tries these in order and uses the first that connects:
 1. `$RIME_IME_SOCKET`
 2. `socket_path` from `setup()`
 3. `/tmp/rime_copilot_ime.sock` (the local default)
-4. `/tmp/rime-ime-*.sock` — sockets forwarded here by ssh, newest first,
-   restricted to ones owned by you
+4. `/tmp/rime-ime-*.sock` — sockets forwarded here by ssh, newest first
+
+**Every unix candidate is checked before it is dialled**, not just the globbed
+ones: a path that exists must be a socket (by `lstat`, so a symlink is refused)
+and must be owned by you. A path that does not exist yet is kept and simply
+fails to connect, because the list is rebuilt on every attempt. This matters on
+a shared host: `/tmp` is world-writable, and without the check any other user
+could squat the well-known default and receive what you type. Set `debug = true`
+to see rejections.
 
 Both `/path/to.sock` and `host:port` are accepted wherever an endpoint is given.
 A socket left behind by a crashed session refuses the connection immediately and
@@ -69,29 +76,34 @@ This works because **every tunnel terminates at the same bridge socket on your
 laptop**, so the remote plugin does not have to know which tunnel is "its own":
 any live one is correct.
 
-### Recommended: the `rime-ssh` wrapper
+### Setup
 
-```sh
-ln -s "$PWD/clients/neovim/rime-ssh" ~/bin/rime-ssh
-rime-ssh dev            # instead of: ssh dev
-```
-
-Each invocation forwards a freshly named socket, so several sessions to the same
-host each own theirs and logging out of one cannot strand the others. It does
-not touch `~/.ssh/config`, so `scp`, `git` and `rsync` are unaffected. With Rime
-not running it execs plain `ssh`.
-
-### Alternative: plain `~/.ssh/config`
+All of it lives in `~/.ssh/config` on your laptop. You keep typing `ssh dev`.
 
 ```
 Host dev
+  HostName ...
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 10m
   RemoteForward /tmp/rime-ime-%C.sock /tmp/rime_copilot_ime.sock
 ```
 
-`%C` hashes (local host, remote host, port, remote user). A second concurrent
-session fails to bind that path — ssh only warns — and simply reuses the first
-session's tunnel, which is harmless. The catch is that closing the *first*
-session takes the socket with it and the later ones go dormant.
+`%C` hashes (local host, remote host, port, remote user), so different hosts and
+different accounts get different socket names.
+
+**`ControlMaster` is load-bearing, not a nicety.** ssh_config offers no token
+that varies per session — `%C`, `%l`, `%n`, `%p`, `%r`, `%u` are all functions of
+the host tuple — so every session to a host wants to bind the *same* path.
+Multiplexing removes the contention instead of working around it: all your
+`ssh dev` invocations share one transport, the forward belongs to the master, and
+`ControlPersist` keeps it alive past the last session's exit.
+
+Without it, things still work but degrade: the second concurrent session fails to
+bind, ssh warns, and its Neovim borrows the first session's socket — correct,
+since all tunnels lead to the same place. The catch is that closing the *first*
+session takes the socket with it and the later ones go dormant until any new
+`ssh dev` recreates it (they then recover on the next `InsertEnter`).
 
 > **Do not use `${VAR}` in the path.** The manual says an undefined variable
 > makes ssh ignore the keyword; in practice it is fatal:
@@ -100,24 +112,40 @@ session takes the socket with it and the later ones go dormant.
 > config: terminating, 1 bad configuration options
 > ```
 > `~/.ssh/config` applies to `scp`, `git` and `rsync` too, so that form takes
-> them all down with it. Gating it behind `Match exec` does not help. Use a
-> token that is always defined, or the wrapper.
+> them all down with it. Gating it behind `Match exec` does **not** help — the
+> parse still fails. (`ssh -G` will not show you this: it does not evaluate
+> `Match exec` at all.) Use a token that is always defined.
 
-### Hosts where you cannot change sshd
+### If the forward will not bind
 
-Forward a loopback port instead:
+`Warning: remote port forwarding failed for listen path ...` with no other
+session running usually means a stale socket file from an sshd that died. The
+remote sshd only unlinks one at bind time if it is configured to:
+
+```
+# remote /etc/ssh/sshd_config
+StreamLocalBindUnlink yes
+```
+
+If you cannot set that, delete the stale file, or fall back to a loopback port,
+which needs nothing on the remote side:
 
 ```
 Host locked
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 10m
   RemoteForward 127.0.0.1:9527 /tmp/rime_copilot_ime.sock
 ```
 
 and on the remote host `export RIME_IME_SOCKET=127.0.0.1:9527`.
 
-Note that any user on that host can reach a loopback port. The protocol is
-one-way — the server never replies, so nothing can be read out of it — but they
-could flip your IME to English. Prefer the unix-socket forms; the plugin
-`chmod`s a forwarded socket to 0600 as soon as it picks one.
+Prefer the unix-socket form. Any user on that host can reach a loopback port,
+and unlike a socket file there are no permissions to hide behind. The protocol
+is one-way — the server never replies, so nothing can be read out of it — but
+they could flip your IME to English. A forwarded *socket* is checked for
+ownership before it is dialled and `chmod`ed to 0600 once picked; a port cannot
+be.
 
 ### Focus events
 
@@ -157,6 +185,12 @@ over ssh (it is just an escape sequence).
    the plugin `chmod`-ing it to 0600, it carries sshd's login umask (often
    0755). On a shared host, pre-create a 0700 directory in `~/.profile` and
    forward into that instead.
+5. **Two laptops, one remote account.** "Any live tunnel is correct" holds
+   because every tunnel ends at the same bridge socket — which stops being true
+   if you ssh to the same remote host, as the same user, from two different
+   machines. Both tunnels are then yours by uid and both look valid, but they
+   lead to different IMEs; the plugin takes the newest and may pick the wrong
+   laptop. Pin `$RIME_IME_SOCKET` to one tunnel's path if you work that way.
 
 ## API
 
