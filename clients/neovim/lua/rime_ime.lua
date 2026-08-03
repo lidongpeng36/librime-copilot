@@ -303,10 +303,23 @@ local function try_connect(list, idx)
     end)
   end
 
+  -- The dial can fail without ever invoking on_result: uv_tcp_connect raises
+  -- for a host that is not an IP literal ("localhost:9527", which parse()
+  -- accepts), and returns nil, err inline for e.g. an unusable address family.
+  -- Either way the callback never runs, so `connecting` would stay true for the
+  -- life of the process and every later connect()/schedule_reconnect() would
+  -- no-op -- a permanently dead client that never even tries the next
+  -- candidate. Treat both as this candidate failing.
+  local ok, ret, ret_err
   if ep.kind == "tcp" then
-    handle:connect(ep.host, ep.port, on_result)
+    ok, ret, ret_err = pcall(handle.connect, handle, ep.host, ep.port, on_result)
   else
-    handle:connect(ep.path, on_result)
+    ok, ret, ret_err = pcall(handle.connect, handle, ep.path, on_result)
+  end
+  if not ok or not ret then
+    log("Dial failed: " .. tostring(ok and ret_err or ret))
+    pcall(function() handle:close() end)
+    vim.schedule(function() try_connect(list, idx + 1) end)
   end
 end
 
