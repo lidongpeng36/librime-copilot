@@ -31,6 +31,7 @@ struct ImeBridgeClientState {
   std::string char_before;
   std::string char_after;
   bool context_valid = false;
+  std::chrono::steady_clock::time_point context_time;  // when char_before/after were pushed
 };
 
 // 待处理的 action
@@ -53,6 +54,10 @@ class ImeBridgeState {
     std::string socket_path = "/tmp/rime_copilot_ime.sock";
     bool debug = false;
     int client_timeout_minutes = 30;
+    // A context older than this is treated as absent. Guards against a client
+    // that lost focus without the terminal reporting it still owning the
+    // surrounding text. 0 disables the check.
+    int context_ttl_seconds = 60;
   };
   struct ApplyResult {
     bool should_set = false;

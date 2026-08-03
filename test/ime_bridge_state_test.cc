@@ -209,3 +209,52 @@ TEST(ImeBridgeState, SynthesizedResetIsANoOpAfterACleanExit) {
   auto result = s.ApplyAction(q.front(), /*current_ascii=*/true);
   EXPECT_FALSE(result.should_set);
 }
+
+TEST(ImeBridgeState, FreshContextIsReturned) {
+  ImeBridgeState s;  // default ttl: 60s
+  s.HandleContext("nvim:1", "中", "文");
+  auto ctx = s.GetActiveContext();
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ("中", ctx->before);
+}
+
+// The three tests below are wall-clock based because the knob is in seconds.
+// Margins are deliberately generous (>= 800ms of slack on every assertion) so
+// they stay reliable under ASAN and CI load. Sleeping *longer* than intended
+// can only push a context further past its deadline, so the expiry assertions
+// cannot flake in the false-failure direction; only the "still fresh"
+// assertions need the slack, and they have it.
+
+TEST(ImeBridgeState, StaleContextIsNotReturned) {
+  // Wrong context is worse than no context: a stale owner would make the
+  // re-ranking filter promote candidates for text the user is not typing into.
+  ImeBridgeState s;
+  s.config_.context_ttl_seconds = 1;
+  s.HandleContext("nvim:1", "中", "文");
+  ASSERT_TRUE(s.GetActiveContext().has_value());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+  EXPECT_FALSE(s.GetActiveContext().has_value());
+}
+
+TEST(ImeBridgeState, TtlZeroDisablesExpiry) {
+  ImeBridgeState s;
+  s.config_.context_ttl_seconds = 0;
+  s.HandleContext("nvim:1", "中", "文");
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  EXPECT_TRUE(s.GetActiveContext().has_value());
+}
+
+TEST(ImeBridgeState, RepushingContextRefreshesTheDeadline) {
+  // ttl=2s with a 1200ms re-push leaves 800ms of slack on the final check.
+  ImeBridgeState s;
+  s.config_.context_ttl_seconds = 2;
+  s.HandleContext("nvim:1", "中", "文");
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  s.HandleContext("nvim:1", "国", "文");
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  auto ctx = s.GetActiveContext();
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ("国", ctx->before);
+}

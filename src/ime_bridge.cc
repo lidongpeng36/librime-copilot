@@ -392,6 +392,7 @@ void ImeBridgeState::HandleContext(const std::string& client_key, const std::str
   state.char_before = before;
   state.char_after = after;
   state.context_valid = true;
+  state.context_time = std::chrono::steady_clock::now();
   state.last_active = std::chrono::steady_clock::now();
   active_client_ = client_key;
 
@@ -463,6 +464,12 @@ std::optional<SurroundingText> ImeBridgeState::GetActiveContext() {
   }
   if (!it->second.context_valid) {
     return std::nullopt;
+  }
+  if (config_.context_ttl_seconds > 0) {
+    auto age = std::chrono::steady_clock::now() - it->second.context_time;
+    if (age > std::chrono::seconds(config_.context_ttl_seconds)) {
+      return std::nullopt;
+    }
   }
   return SurroundingText{it->second.char_before, it->second.char_after, active_client_};
 }
@@ -614,6 +621,7 @@ ImeBridge::ImeBridge(const Ticket& ticket) : CopilotPlugin<ImeBridge>(ticket) {
     config->GetString("copilot/ime_bridge/socket_path", &config_.socket_path);
     config->GetBool("copilot/ime_bridge/debug", &config_.debug);
     config->GetInt("copilot/ime_bridge/client_timeout_minutes", &config_.client_timeout_minutes);
+    config->GetInt("copilot/ime_bridge/context_ttl_seconds", &config_.context_ttl_seconds);
   }
 
   if (config_.enable) {
