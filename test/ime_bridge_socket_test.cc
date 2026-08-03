@@ -21,6 +21,7 @@
 #include <string>
 #include <thread>
 
+using rime::ImeBridgePendingAction;
 using rime::ImeBridgeServer;
 
 namespace {
@@ -53,6 +54,23 @@ bool WaitForBefore(ImeBridgeServer& server, const std::string& expected_before) 
   return false;
 }
 
+// Drain pending actions until one of the given type shows up, or time out.
+bool WaitForAction(ImeBridgeServer& server, ImeBridgePendingAction::Type type,
+                   ImeBridgePendingAction* out) {
+  for (int i = 0; i < 200; ++i) {  // up to ~2s
+    auto q = server.TakePendingActions();
+    while (!q.empty()) {
+      if (q.front().type == type) {
+        if (out) *out = q.front();
+        return true;
+      }
+      q.pop();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
 std::string Msg(const std::string& app, const std::string& instance, const std::string& data) {
   return std::string(R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":")") + app +
          R"(","instance":")" + instance + R"("},"data":)" + data + "}";
@@ -76,6 +94,28 @@ TEST(ImeBridgeSocket, ContextOverSocketBecomesActive) {
   EXPECT_EQ("文", ctx->after);
 
   close(fd);
+  server.Stop();
+}
+
+TEST(ImeBridgeSocket, DroppedConnectionSynthesizesReset) {
+  ImeBridgeServer server;
+  ImeBridgeServer::Config cfg;
+  cfg.socket_path = "/tmp/rime_copilot_test3_" + std::to_string(getpid()) + ".sock";
+  server.Start(cfg);
+
+  int fd = ConnectClient(cfg.socket_path);
+  ASSERT_GE(fd, 0);
+  SendLine(fd, Msg("nvim", "1", R"({"action":"set","ascii":true})"));
+  ImeBridgePendingAction set_action;
+  ASSERT_TRUE(WaitForAction(server, ImeBridgePendingAction::kSet, &set_action));
+
+  close(fd);  // no reset, no unregister: exactly what kill -9 looks like
+
+  ImeBridgePendingAction reset_action;
+  ASSERT_TRUE(WaitForAction(server, ImeBridgePendingAction::kReset, &reset_action));
+  EXPECT_EQ("nvim:1", reset_action.client_key);
+  EXPECT_TRUE(reset_action.restore);
+
   server.Stop();
 }
 

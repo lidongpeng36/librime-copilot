@@ -61,8 +61,11 @@ class ImeBridgeState {
 
   ImeBridgeState() = default;
 
-  // Parse one JSON-Lines message and dispatch to the handlers below.
-  void ProcessMessage(const std::string& message);
+  // Parse one JSON-Lines message and dispatch to the handlers below. Returns
+  // the client key the message was attributed to ("app:instance"), or "" when
+  // the message was malformed or not ours. HandleConnection uses the return
+  // value to learn which clients a given connection is carrying.
+  std::string ProcessMessage(const std::string& message);
 
   void HandleSet(const std::string& client_key, bool ascii, bool stack = true);
   void HandleRestore(const std::string& client_key);
@@ -74,6 +77,13 @@ class ImeBridgeState {
   void HandleActivate(const std::string& client_key);
   void HandleDeactivate(const std::string& client_key);
   void TouchClient(const std::string& client_key);
+
+  // Per-connection refcount for a client key. A reconnecting client briefly has
+  // two live connections, so only the last one going away means it is really
+  // gone — at which point we synthesize a reset(restore) so a killed client
+  // cannot leave ascii_mode stuck.
+  void RetainClientConnection(const std::string& client_key);
+  void ReleaseClientConnection(const std::string& client_key);
 
   std::optional<SurroundingText> GetActiveContext();
   std::queue<ImeBridgePendingAction> TakePendingActions();
@@ -88,6 +98,7 @@ class ImeBridgeState {
   mutable std::mutex mutex_;
   std::unordered_map<std::string, ImeBridgeClientState> client_states_;
   std::string active_client_;
+  std::unordered_map<std::string, int> conn_refs_;
   std::queue<ImeBridgePendingAction> pending_actions_;
   std::chrono::steady_clock::time_point last_cleanup_;
 };

@@ -137,3 +137,75 @@ TEST(ImeBridgeState, CleanupKeepsFreshClients) {
   ASSERT_TRUE(ctx.has_value());
   EXPECT_EQ("中", ctx->before);
 }
+
+TEST(ImeBridgeState, ProcessMessageReturnsClientKey) {
+  ImeBridgeState s;
+  EXPECT_EQ("nvim:1",
+            s.ProcessMessage(
+                R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+                R"("data":{"action":"ping"}})"));
+  EXPECT_EQ("", s.ProcessMessage("not json at all"));
+  EXPECT_EQ("", s.ProcessMessage(
+                    R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+                    R"("data":{"action":"ping"}})"));
+}
+
+TEST(ImeBridgeState, LastConnectionCloseSynthesizesReset) {
+  // kill -9 / ssh tunnel drop: the client never sent reset, so the server has
+  // to put ascii_mode back itself.
+  ImeBridgeState s;
+  s.RetainClientConnection("nvim:1");
+  s.HandleSet("nvim:1", true, true);
+  s.TakePendingActions();  // drain the set
+
+  s.ReleaseClientConnection("nvim:1");
+
+  auto q = s.TakePendingActions();
+  ASSERT_EQ(1u, q.size());
+  EXPECT_EQ(ImeBridgePendingAction::kReset, q.front().type);
+  EXPECT_EQ("nvim:1", q.front().client_key);
+  EXPECT_TRUE(q.front().restore);
+}
+
+TEST(ImeBridgeState, OverlappingConnectionsDoNotSynthesizeReset) {
+  // A reconnecting client briefly has two live connections. Losing the old one
+  // must not be mistaken for the client going away.
+  ImeBridgeState s;
+  s.RetainClientConnection("nvim:1");
+  s.RetainClientConnection("nvim:1");
+  s.TakePendingActions();
+
+  s.ReleaseClientConnection("nvim:1");
+  EXPECT_TRUE(s.TakePendingActions().empty());
+
+  s.ReleaseClientConnection("nvim:1");
+  EXPECT_EQ(1u, s.TakePendingActions().size());
+}
+
+TEST(ImeBridgeState, ReleaseWithoutRetainIsIgnored) {
+  ImeBridgeState s;
+  s.ReleaseClientConnection("nvim:never-seen");
+  EXPECT_TRUE(s.TakePendingActions().empty());
+}
+
+TEST(ImeBridgeState, SynthesizedResetIsANoOpAfterACleanExit) {
+  // A clean exit already sent reset+unregister, which erased the client state.
+  // The synthesized reset then finds nothing and asks for no ascii_mode change.
+  ImeBridgeState s;
+  s.RetainClientConnection("nvim:1");
+  s.HandleSet("nvim:1", true, true);
+  for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
+    s.ApplyAction(q.front(), /*current_ascii=*/false);
+  }
+  s.HandleUnregister("nvim:1");
+  for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
+    s.ApplyAction(q.front(), /*current_ascii=*/true);
+  }
+
+  s.ReleaseClientConnection("nvim:1");
+
+  auto q = s.TakePendingActions();
+  ASSERT_EQ(1u, q.size());
+  auto result = s.ApplyAction(q.front(), /*current_ascii=*/true);
+  EXPECT_FALSE(result.should_set);
+}

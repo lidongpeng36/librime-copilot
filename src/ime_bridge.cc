@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <set>
 #include <thread>
 
 #include <rime/context.h>
@@ -149,6 +150,15 @@ void ImeBridgeServer::RunServer() {
 void ImeBridgeServer::HandleConnection(int client_fd) {
   char buffer[kMaxMessageSize];
   std::string message;
+  // Which client keys this connection carries. One connection is normally one
+  // client, but the protocol allows several, so track the set.
+  std::set<std::string> keys;
+
+  auto note = [&](const std::string& key) {
+    if (!key.empty() && keys.insert(key).second) {
+      state_.RetainClientConnection(key);
+    }
+  };
 
   while (true) {
     ssize_t n = read(client_fd, buffer, sizeof(buffer) - 1);
@@ -163,7 +173,7 @@ void ImeBridgeServer::HandleConnection(int client_fd) {
       message = message.substr(pos + 1);
 
       if (!line.empty()) {
-        state_.ProcessMessage(line);
+        note(state_.ProcessMessage(line));
       }
     }
 
@@ -175,30 +185,34 @@ void ImeBridgeServer::HandleConnection(int client_fd) {
   }
 
   if (!message.empty()) {
-    state_.ProcessMessage(message);
+    note(state_.ProcessMessage(message));
+  }
+
+  for (const auto& key : keys) {
+    state_.ReleaseClientConnection(key);
   }
 }
 
-void ImeBridgeState::ProcessMessage(const std::string& message) {
+std::string ImeBridgeState::ProcessMessage(const std::string& message) {
   try {
     auto j = json::parse(message);
 
     int version = j.value("v", 0);
     if (version != kProtocolVersion) {
       LOG(WARNING) << "[ImeBridge] Unsupported protocol version: " << version;
-      return;
+      return "";
     }
 
     std::string ns = j.value("ns", "");
     if (ns != kNamespace) {
       LOG(WARNING) << "[ImeBridge] Unknown namespace: " << ns;
-      return;
+      return "";
     }
 
     std::string type = j.value("type", "");
     if (type != "ascii") {
       LOG(WARNING) << "[ImeBridge] Unknown type: " << type;
-      return;
+      return "";
     }
 
     auto src = j.value("src", json::object());
@@ -244,8 +258,11 @@ void ImeBridgeState::ProcessMessage(const std::string& message) {
       LOG(WARNING) << "[ImeBridge] Unknown action: " << action;
     }
 
+    return client_key;
+
   } catch (const json::exception& e) {
     LOG(ERROR) << "[ImeBridge] JSON parse error: " << e.what();
+    return "";
   }
 }
 
@@ -258,6 +275,43 @@ void ImeBridgeState::TouchClient(const std::string& client_key) {
   auto it = client_states_.find(client_key);
   if (it != client_states_.end()) {
     it->second.last_active = std::chrono::steady_clock::now();
+  }
+}
+
+void ImeBridgeState::RetainClientConnection(const std::string& client_key) {
+  if (client_key.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++conn_refs_[client_key];
+}
+
+void ImeBridgeState::ReleaseClientConnection(const std::string& client_key) {
+  if (client_key.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = conn_refs_.find(client_key);
+  if (it == conn_refs_.end()) {
+    return;
+  }
+  if (--it->second > 0) {
+    return;  // the client is reconnecting; another connection is still live
+  }
+  conn_refs_.erase(it);
+
+  // The client vanished without saying goodbye (kill -9, ssh tunnel dropped).
+  // Put ascii_mode back where we found it, otherwise it stays stuck in English
+  // until the user notices and switches by hand. If the client did exit
+  // cleanly its state is already erased and ApplyAction will no-op.
+  ImeBridgePendingAction action;
+  action.type = ImeBridgePendingAction::kReset;
+  action.client_key = client_key;
+  action.restore = true;
+  pending_actions_.push(action);
+
+  if (config_.debug) {
+    LOG(INFO) << "[ImeBridge] Last connection closed for " << client_key << "; synthesized reset";
   }
 }
 
