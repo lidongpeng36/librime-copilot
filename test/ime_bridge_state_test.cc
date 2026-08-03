@@ -210,6 +210,98 @@ TEST(ImeBridgeState, SynthesizedResetIsANoOpAfterACleanExit) {
   EXPECT_FALSE(result.should_set);
 }
 
+TEST(ImeBridgeState, SynthesizedResetIsMarkedAsSuch) {
+  ImeBridgeState s;
+  s.RetainClientConnection("nvim:1");
+  s.ReleaseClientConnection("nvim:1");
+
+  auto q = s.TakePendingActions();
+  ASSERT_EQ(1u, q.size());
+  EXPECT_TRUE(q.front().synthesized);
+
+  // What the client itself asks for is never marked.
+  s.HandleReset("nvim:1", true);
+  auto q2 = s.TakePendingActions();
+  ASSERT_EQ(1u, q2.size());
+  EXPECT_FALSE(q2.front().synthesized);
+}
+
+TEST(ImeBridgeState, SynthesizedResetIsSkippedWhenTheClientIsBack) {
+  // The tunnel blipped mid-composition: the release synthesized a reset, then
+  // the client reconnected before Rime's next key event. Applying the reset now
+  // would switch the user to English and erase has_initial for good.
+  ImeBridgeState s;
+  s.RetainClientConnection("nvim:1");
+  s.HandleSet("nvim:1", true, true);
+  for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
+    s.ApplyAction(q.front(), /*current_ascii=*/false);  // initial_state = false
+  }
+
+  s.ReleaseClientConnection("nvim:1");  // tunnel dropped
+  auto pending = s.TakePendingActions();
+  ASSERT_EQ(1u, pending.size());
+
+  s.RetainClientConnection("nvim:1");  // ...and it is already back
+
+  auto result = s.ApplyAction(pending.front(), /*current_ascii=*/false);
+  EXPECT_FALSE(result.should_set);
+
+  // The client state survived: a later restore still knows the base, and a
+  // later *explicit* reset still knows the initial state.
+  ImeBridgePendingAction restore;
+  restore.type = ImeBridgePendingAction::kRestore;
+  restore.client_key = "nvim:1";
+  auto r2 = s.ApplyAction(restore, /*current_ascii=*/true);
+  EXPECT_TRUE(r2.should_set);
+  EXPECT_FALSE(r2.ascii_mode);  // back to the base captured above
+}
+
+TEST(ImeBridgeState, SynthesizedResetStillAppliesWhenTheClientIsGone) {
+  // Same setup, but nothing reconnected: the client really died and ascii_mode
+  // must go back to where we found it.
+  ImeBridgeState s;
+  s.RetainClientConnection("nvim:1");
+  s.HandleSet("nvim:1", true, true);
+  for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
+    s.ApplyAction(q.front(), /*current_ascii=*/false);  // initial_state = false
+  }
+
+  s.ReleaseClientConnection("nvim:1");
+  auto pending = s.TakePendingActions();
+  ASSERT_EQ(1u, pending.size());
+
+  auto result = s.ApplyAction(pending.front(), /*current_ascii=*/true);
+  EXPECT_TRUE(result.should_set);
+  EXPECT_FALSE(result.ascii_mode);  // restored to initial_state
+
+  // ...and the state was erased, so a second apply finds nothing.
+  auto again = s.ApplyAction(pending.front(), /*current_ascii=*/true);
+  EXPECT_FALSE(again.should_set);
+}
+
+TEST(ImeBridgeState, ExplicitResetAppliesEvenWithALiveConnection) {
+  // A client that sends reset and then reconnects still means it, so the live
+  // connection must not suppress a reset the client asked for.
+  ImeBridgeState s;
+  s.RetainClientConnection("nvim:1");
+  s.HandleSet("nvim:1", true, true);
+  for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
+    s.ApplyAction(q.front(), /*current_ascii=*/false);  // initial_state = false
+  }
+
+  s.HandleReset("nvim:1", true);
+  auto pending = s.TakePendingActions();
+  ASSERT_EQ(1u, pending.size());
+  ASSERT_FALSE(pending.front().synthesized);
+
+  auto result = s.ApplyAction(pending.front(), /*current_ascii=*/true);
+  EXPECT_TRUE(result.should_set);
+  EXPECT_FALSE(result.ascii_mode);  // restored to initial_state despite conn_refs_
+
+  auto again = s.ApplyAction(pending.front(), /*current_ascii=*/true);
+  EXPECT_FALSE(again.should_set);  // state really was erased
+}
+
 TEST(ImeBridgeState, FreshContextIsReturned) {
   ImeBridgeState s;  // default ttl: 60s
   s.HandleContext("nvim:1", "中", "文");

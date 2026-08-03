@@ -339,6 +339,10 @@ void ImeBridgeState::ReleaseClientConnection(const std::string& client_key) {
   action.type = ImeBridgePendingAction::kReset;
   action.client_key = client_key;
   action.restore = true;
+  // We cannot tell "gone" from "reconnecting" here; ApplyAction runs later, on
+  // Rime's next key event, and by then conn_refs_ can answer that. Mark it so
+  // it knows this reset is ours and may be dropped.
+  action.synthesized = true;
   pending_actions_.push(action);
 
   if (config_.debug) {
@@ -606,6 +610,24 @@ ImeBridgeState::ApplyResult ImeBridgeState::ApplyAction(const ImeBridgePendingAc
     }
 
     case ImeBridgePendingAction::kReset: {
+      // A reset we synthesized on disconnect is moot if the client has a live
+      // connection again by now: the tunnel merely blipped, and applying it
+      // would yank the user back to initial_state (typically English)
+      // mid-composition *and* erase has_initial/base/depth, so nothing could
+      // put them back. resync() deliberately does not re-assert ascii_mode.
+      // conn_refs_ is guarded by mutex_, which we already hold: read it
+      // directly rather than going through Retain/ReleaseClientConnection,
+      // which would deadlock on this non-recursive mutex.
+      if (action.synthesized) {
+        auto conn = conn_refs_.find(action.client_key);
+        if (conn != conn_refs_.end() && conn->second > 0) {
+          if (config_.debug) {
+            LOG(INFO) << "[ImeBridge] ApplyAction kReset: client " << action.client_key
+                      << " reconnected; skipping synthesized reset";
+          }
+          break;
+        }
+      }
       auto it = client_states_.find(action.client_key);
       if (it != client_states_.end()) {
         // reset(true) 恢复到初始状态（Neovim 启动时的状态）

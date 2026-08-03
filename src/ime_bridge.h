@@ -44,6 +44,10 @@ struct ImeBridgePendingAction {
   bool ascii = true;    // for kSet
   bool stack = true;    // for kSet: if true, increment depth and save base
   bool restore = true;  // for kReset
+  // for kReset: true when the server made this up because the last connection
+  // for the client went away, false when the client actually asked for it. A
+  // synthesized reset is moot once the client is back, an explicit one is not.
+  bool synthesized = false;
 };
 
 // Socket-independent ImeBridge state machine: client registry, active-owner
