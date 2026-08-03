@@ -17,7 +17,6 @@ local reconnect_timer = nil
 local attempt = 0
 local active_endpoint = nil
 local pending_insert_leave_timer = nil
-local last_before, last_after = nil, nil
 
 local config = {
   -- Explicit endpoint. nil means "discover it": $RIME_IME_SOCKET, then this
@@ -52,19 +51,15 @@ end
 
 -- Generate unique instance ID
 local function generate_instance_id()
-  local parts = {}
-
-  -- PID is always unique per process
-  table.insert(parts, tostring(vim.fn.getpid()))
-
-  -- Add terminal/GUI info if available
-  if vim.env.TERM_SESSION_ID then
-    table.insert(parts, vim.env.TERM_SESSION_ID:sub(1, 8))
-  elseif vim.env.WINDOWID then
-    table.insert(parts, vim.env.WINDOWID)
-  end
-
-  return table.concat(parts, "-")
+  -- The hostname matters: a remote nvim and a local one easily share a pid, and
+  -- the bridge keys per-client ascii_mode state (depth/base) on this string, so
+  -- a collision would have the two corrupting each other's restore stack.
+  return endpoint.instance_id({
+    hostname = vim.fn.hostname(),
+    pid = vim.fn.getpid(),
+    term_session_id = vim.env.TERM_SESSION_ID,
+    windowid = vim.env.WINDOWID,
+  })
 end
 
 -- Log helper. Several callers are libuv callbacks, and nvim_echo (under
@@ -94,7 +89,11 @@ local function get_surrounding()
 
     -- Convert cursor byte offset to UTF-8 character index, then slice by characters.
     -- This is robust for CJK content and avoids byte-boundary drift.
-    local char_index = vim.str_utfindex(line, col)
+    -- vim.str_utfindex(s, index) is the deprecated 2-arg form (nvim 0.11).
+    -- Counting characters in the prefix is stable across versions and degrades
+    -- gracefully if col ever lands mid-character, instead of throwing into the
+    -- pcall and silently yielding an empty context.
+    local char_index = vim.fn.strchars(line:sub(1, col))
     local char_count = vim.fn.strchars(line)
 
     local want = math.max(1, config.context_chars or 8)
@@ -440,23 +439,19 @@ function M.context()
   end
 
   local before, after = get_surrounding()
-  -- Dedup: skip the redundant send when the boundary is unchanged. The cache is
-  -- reset in clear_context(), which is called on every ownership handoff
-  -- (InsertLeave/FocusLost/deactivate), so a handoff always forces a re-send.
-  -- Caveat: switching between two nvim instances that both stay in insert mode
-  -- with no focus event won't re-push until the first differing keystroke — a
-  -- known limitation of not having reliable terminal focus events.
-  if before == last_before and after == last_after then
-    return
-  end
-  last_before, last_after = before, after
+  -- Deliberately not deduplicated. Every push also re-claims ownership of the
+  -- surrounding context on the server, and that claim is the only thing that
+  -- reliably follows the keyboard when the terminal does not report focus
+  -- events (common under tmux and ssh). Suppressing an "unchanged" payload
+  -- suppressed the re-claim with it, so a second nvim could keep owning the
+  -- context while you typed into the first. ~100 bytes per keystroke is
+  -- nothing next to the terminal's own traffic.
   send("context", { before = before, after = after })
 end
 
 --- Clear surrounding text context
 function M.clear_context()
   if not enabled then return end
-  last_before, last_after = nil, nil
   send("clear_context")
 end
 
@@ -526,20 +521,24 @@ function M.setup(opts)
       if pending_insert_leave_timer then
         pcall(function() pending_insert_leave_timer:stop() end)
         pcall(function() pending_insert_leave_timer:close() end)
+        pending_insert_leave_timer = nil
       end
-      pending_insert_leave_timer = uv.new_timer()
-      pending_insert_leave_timer:start(60, 0, vim.schedule_wrap(function()
-        if not enabled then
-          return
+      -- Capture the handle locally: by the time the callback runs, another
+      -- InsertLeave may already have replaced the module-level variable, and
+      -- closing that one would kill a timer that is still needed.
+      local timer = uv.new_timer()
+      pending_insert_leave_timer = timer
+      timer:start(60, 0, vim.schedule_wrap(function()
+        if enabled then
+          local mode = vim.fn.mode()
+          if mode ~= "i" and mode ~= "R" then
+            M.set(true)
+            M.deactivate()
+            M.clear_context()
+          end
         end
-        local mode = vim.fn.mode()
-        if mode ~= "i" and mode ~= "R" then
-          M.set(true)
-          M.deactivate()
-          M.clear_context()
-        end
-        if pending_insert_leave_timer then
-          pcall(function() pending_insert_leave_timer:close() end)
+        pcall(function() timer:close() end)
+        if pending_insert_leave_timer == timer then
           pending_insert_leave_timer = nil
         end
       end))
