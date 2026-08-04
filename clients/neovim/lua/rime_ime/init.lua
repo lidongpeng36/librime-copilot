@@ -155,20 +155,47 @@ local function stat_endpoint(path)
   }
 end
 
+-- Who owns the LISTEN socket on a loopback port. Returns nil where that cannot
+-- be answered -- macOS has no /proc, and answering it there would mean spawning
+-- lsof from inside the dial path -- so a forwarded port on a macOS *remote* is
+-- trusted the way it was before this check existed. That is the one gap.
+local function tcp_owner(port)
+  local uids = nil
+  for _, path in ipairs({ "/proc/net/tcp", "/proc/net/tcp6" }) do
+    local fh = io.open(path, "r")
+    if fh then
+      local content = fh:read("*a")
+      fh:close()
+      uids = uids or {}
+      for _, u in ipairs(endpoint.listener_uids(content, port)) do
+        uids[#uids + 1] = u
+      end
+    end
+  end
+  return uids
+end
+
 local function candidates()
   return endpoint.candidates({
     env = vim.env.RIME_IME_SOCKET,
     configured = config.socket_path,
     glob = function(pattern) return vim.fn.glob(pattern, true, true) end,
     stat = stat_endpoint,
+    tcp_owner = tcp_owner,
     uid = uv.getuid and uv.getuid() or nil,
     log = log,
   })
 end
 
--- True when there is something worth dialling right now. When nothing exists on
--- disk there is nothing to poll for, so we go dormant instead of burning a
--- timer forever; InsertEnter and FocusGained retry lazily.
+-- True when there is something worth dialling right now. A path that does not
+-- exist is nothing to poll for, so we go dormant instead of burning a timer
+-- forever; InsertEnter and FocusGained retry lazily.
+--
+-- A loopback port leaves no trace on disk, so it can never be ruled out this way
+-- and we keep retrying at the backoff ceiling while one is a candidate. That is
+-- one refused connect every 30s, and it buys picking up a tunnel the moment ssh
+-- reconnects rather than at the next InsertEnter. When another user owns the
+-- port the candidate is dropped upstream, and dormancy comes back.
 local function any_endpoint_present()
   for _, ep in ipairs(candidates()) do
     if ep.kind == "tcp" then

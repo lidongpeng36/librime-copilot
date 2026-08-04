@@ -15,6 +15,47 @@ M.DEFAULT_SOCKET = "/tmp/rime_copilot_ime.sock"
 -- which is why discovery can be this simple.
 M.TUNNEL_GLOB = "/tmp/rime-ime-*.sock"
 
+-- The loopback port form of the same tunnel, and the preferred one. A forwarded
+-- *socket file* outlives its listener: sshd never unlinks it -- not on a clean
+-- `ssh -O exit`, not on SIGKILL -- and refuses to bind over what is left, so the
+-- tunnel works exactly once per host unless the remote sshd sets
+-- StreamLocalBindUnlink. A port has no such residue: when the listener goes, the
+-- port is free, and the next ssh binds it again. Nothing to configure remotely,
+-- nothing to remember after reinstalling a machine.
+--
+-- The cost is that a port carries no ownership, where a socket file has a uid.
+-- listener_uids() below buys that back on Linux.
+M.DEFAULT_TCP_PORT = 19527
+M.DEFAULT_TCP = "127.0.0.1:" .. M.DEFAULT_TCP_PORT
+
+local LOOPBACK = { ["127.0.0.1"] = true, ["localhost"] = true, ["::1"] = true }
+
+--- uids owning LISTEN sockets on `port`, parsed from /proc/net/tcp{,6} content.
+--- Returns {} when nothing is listening, and a list (usually of one) otherwise.
+---
+--- This is the port-world equivalent of the uid check on a socket file. Without
+--- it, any other user on the host can bind the forwarded port while your ssh is
+--- away and then receive every context push -- i.e. what you are typing.
+function M.listener_uids(content, port)
+  local out = {}
+  if type(content) ~= "string" or type(port) ~= "number" then
+    return out
+  end
+  local want = string.format("%04X", port)
+  for line in content:gmatch("[^\n]+") do
+    -- sl: local_address rem_address st tx:rx tr:when retrnsmt uid
+    local local_addr, _, state, _, _, _, uid =
+      line:match("^%s*%d+:%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%d+)")
+    if local_addr and state == "0A" then  -- 0A = TCP_LISTEN
+      local hex = local_addr:match(":(%x+)$")
+      if hex and hex:upper() == want then
+        out[#out + 1] = tonumber(uid)
+      end
+    end
+  end
+  return out
+end
+
 --- Parse an endpoint string.
 --- "/tmp/x.sock"    -> { kind = "unix", path = "/tmp/x.sock" }
 --- "127.0.0.1:9527" -> { kind = "tcp", host = "127.0.0.1", port = 9527 }
@@ -110,13 +151,38 @@ function M.candidates(opts)
     return true
   end
 
+  -- A loopback port is checkable the way a socket file is: whoever holds the
+  -- LISTEN socket owns it. A port on another host is not -- opts.tcp_owner reads
+  -- this machine's table -- so those are passed through.
+  local function usable_tcp(ep)
+    if not opts.tcp_owner or opts.uid == nil or not LOOPBACK[ep.host] then
+      return true
+    end
+    local uids = opts.tcp_owner(ep.port)
+    if not uids then
+      return true  -- no way to tell here (no /proc, e.g. macOS)
+    end
+    for _, u in ipairs(uids) do
+      if u ~= opts.uid then
+        if opts.log then
+          opts.log("skipping 127.0.0.1:" .. ep.port .. ": listener owned by uid "
+                   .. tostring(u) .. ", not " .. tostring(opts.uid))
+        end
+        return false
+      end
+    end
+    return true
+  end
+
   local function add(s)
     local ep = M.parse(s)
     if not ep then
       return
     end
-    -- A tcp endpoint cannot be stat'ed, so it is passed through untouched.
     if ep.kind == "unix" and not usable_unix(ep.path) then
+      return
+    end
+    if ep.kind == "tcp" and not usable_tcp(ep) then
       return
     end
     local key = endpoint_key(ep)
@@ -147,6 +213,10 @@ function M.candidates(opts)
   for _, u in ipairs(usable) do
     add(u.path)
   end
+
+  -- Last: the forwarded loopback port. On the machine Rime runs on, the unix
+  -- socket above has already won, so this only ever carries the remote case.
+  add(M.DEFAULT_TCP)
 
   return out
 end

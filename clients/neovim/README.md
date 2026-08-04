@@ -84,18 +84,29 @@ The plugin tries these in order and uses the first that connects:
 2. `socket_path` from `setup()`
 3. `/tmp/rime_copilot_ime.sock` (the local default)
 4. `/tmp/rime-ime-*.sock` — sockets forwarded here by ssh, newest first
+5. `127.0.0.1:19527` — the forwarded loopback port (the remote case)
 
-**Every unix candidate is checked before it is dialled**, not just the globbed
-ones: a path that exists must be a socket (by `lstat`, so a symlink is refused)
-and must be owned by you. A path that does not exist yet is kept and simply
-fails to connect, because the list is rebuilt on every attempt. This matters on
-a shared host: `/tmp` is world-writable, and without the check any other user
-could squat the well-known default and receive what you type. Set `debug = true`
-to see rejections.
+The list is the same on every machine, which is the point: on the machine Rime
+runs on, 3 connects and the rest is never reached; on a remote host, 3 and 4
+fail and 5 is the tunnel. Nothing to set per host.
+
+**Every candidate is checked before it is dialled.** A unix path that exists
+must be a socket (by `lstat`, so a symlink is refused) and must be owned by you;
+one that does not exist yet is kept and simply fails to connect, because the list
+is rebuilt on every attempt. A loopback port is checked the same way, through
+`/proc/net/tcp`: if someone else holds the listener, the candidate is dropped.
+This matters on a shared host — `/tmp` is world-writable and a port is owned by
+whoever binds it first, so without these checks any other user could squat the
+well-known endpoint and receive what you type. Set `debug = true` to see
+rejections.
+
+> The port check needs `/proc`, so it does not run on macOS. A forwarded port on
+> a **macOS remote** is trusted. On a single-user Mac that is fine; on a shared
+> one, pin `$RIME_IME_SOCKET` to a socket path instead.
 
 Both `/path/to.sock` and `host:port` are accepted wherever an endpoint is given.
-A socket left behind by a crashed session refuses the connection immediately and
-we fall through to the next one, so no cleanup is needed.
+A port on another host is never checked against the local table, so an explicitly
+configured `1.2.3.4:9527` is passed through untouched.
 
 ## Remote Neovim over ssh
 
@@ -117,16 +128,22 @@ Host dev
   ControlMaster auto
   ControlPath ~/.ssh/cm-%u-%r-%h-%p
   ControlPersist 10m
-  RemoteForward /tmp/rime-ime-%u-%r.sock /tmp/rime_copilot_ime.sock
+  RemoteForward 127.0.0.1:19527 /tmp/rime_copilot_ime.sock
   ServerAliveInterval 15
   ServerAliveCountMax 3
 ```
 
-`%u-%r` is the local user and the remote user, which is what keeps accounts apart
-on a shared host. Avoid `%C`: it hashes in `%l`, the local hostname, and on macOS
-with `HostName` unset that is derived from the network — so it changes as you move
-between networks, minting a new socket name each time and stranding the old one
-forever (see below).
+**Forward a port, not a socket file.** This is the one decision that matters, and
+it is not a style preference — see [below](#the-socket-file-outlives-the-forward)
+for what the socket-file form does after its first session. A port leaves no
+residue: when the listener goes, the port is free, and the next `ssh` binds it
+again. Nothing to configure on the remote, and nothing to re-apply when you
+reinstall a machine or add a host.
+
+What a port gives up is ownership — a socket file carries a uid, a port belongs
+to whoever binds it — and the plugin buys that back by refusing a listener that
+is not yours (see [Endpoint discovery](#endpoint-discovery), including the macOS
+gap).
 
 **`ControlMaster` is load-bearing, not a nicety.** ssh_config offers no token
 that varies per session — `%C`, `%l`, `%n`, `%p`, `%r`, `%u` are all functions of
@@ -174,43 +191,31 @@ exit poisons the name for every session after it: the tunnel works exactly once
 per host, and from then on every `ssh` prints that warning and the remote Neovim
 finds a socket file that refuses connection.
 
-Two things fix it, and they are worth having both:
+**This is why the setup above forwards a port.** A port has no such residue, so
+the failure cannot occur; measured across repeated `SIGKILL`s of the master, every
+reconnect bound cleanly.
+
+If you want the socket-file form anyway — the one case where it is genuinely
+better is a **shared macOS remote**, where the port cannot be ownership-checked —
+then set this on that host and do not forget it after a reinstall:
 
 ```
 # remote /etc/ssh/sshd_config (or a drop-in under sshd_config.d/)
 StreamLocalBindUnlink yes
 ```
 
-That is the real cure: sshd unlinks before binding, so the name is always live.
-Requires root on the remote and `systemctl reload ssh`.
+sshd then unlinks before binding, so the name is always live. Requires root and a
+`systemctl reload ssh`.
 
-Where you cannot set it, the plugin covers for it: when a candidate under
-`/tmp/rime-ime-*.sock` refuses connection, it unlinks the file, so the *next* ssh
+Without it the plugin still recovers, but only partly: when a candidate under
+`/tmp/rime-ime-*.sock` refuses connection it unlinks the file, so the *next* ssh
 session binds cleanly. `ECONNREFUSED` is what proves no one is listening — a live
 forward accepts immediately — and only sockets matching the tunnel pattern and
 owned by you are ever touched, so this cannot reach Rime's own socket or another
-user's. The cost is that recovery takes one session: the ssh you are currently
-inside already failed to bind, so the tunnel comes back on the next one.
-
-A loopback port avoids the whole problem — ports leave nothing behind — at a real
-security cost on shared hosts:
-
-```
-Host locked
-  ControlMaster auto
-  ControlPath ~/.ssh/cm-%u-%r-%h-%p
-  ControlPersist 10m
-  RemoteForward 127.0.0.1:9527 /tmp/rime_copilot_ime.sock
-```
-
-and on the remote host `export RIME_IME_SOCKET=127.0.0.1:9527`.
-
-Prefer the unix-socket form. Any user on that host can reach a loopback port,
-and unlike a socket file there are no permissions to hide behind. The protocol
-is one-way — the server never replies, so nothing can be read out of it — but
-they could flip your IME to English. A forwarded *socket* is checked for
-ownership before it is dialled and `chmod`ed to 0600 once picked; a port cannot
-be.
+user's. The catch is that a multiplexed session will not re-establish a forward
+its master failed to bind, so **the session you are in stays without an IME** and
+recovery lands on the next master. In practice that means the first ssh after
+each idle gap is dead. That is the cost the port form avoids.
 
 ### Focus events
 
@@ -246,20 +251,18 @@ over ssh (it is just an escape sequence).
 3. **Actions land on the next keypress.** The bridge applies queued actions from
    Rime's key handler, so an `ascii_mode` change pushed by Neovim takes effect
    when you next press a key in Rime.
-4. **A brief permission window.** Between sshd creating a forwarded socket and
-   the plugin `chmod`-ing it to 0600, it carries sshd's login umask (often
-   0755). On a shared host, pre-create a 0700 directory in `~/.profile` and
-   forward into that instead.
+4. **A brief permission window**, if you forward a socket file rather than the
+   port. Between sshd creating it and the plugin `chmod`-ing it to 0600, it
+   carries sshd's login umask (often 0755). On a shared host, pre-create a 0700
+   directory in `~/.profile` and forward into that instead.
 5. **Two laptops, one remote account.** "Any live tunnel is correct" holds
-   because every tunnel ends at the same bridge socket — which stops being true
-   if you ssh to the same remote host, as the same user, from two different
-   machines. Both tunnels are then yours by uid and both look valid, but they
-   lead to different IMEs. With the `%u-%r` name above they contend for one
-   path, so the outcome is at least unambiguous: whichever laptop bound it last
-   owns it (with `StreamLocalBindUnlink yes`), or the first one keeps it and the
-   second only gets the warning (without). Either way the other laptop's Neovim
-   drives the wrong IME. Give each machine its own suffix in `RemoteForward`, or
-   pin `$RIME_IME_SOCKET` on the remote, if you work that way.
+   because every tunnel ends at the same bridge — which stops being true if you
+   ssh to the same remote host, as the same user, from two different machines.
+   Both are then yours by uid and both look valid, but they lead to different
+   IMEs. With the forwarded port they contend for one number, so the first
+   laptop to bind keeps it and the second gets `Warning: remote port forwarding
+   failed` and no tunnel — annoying, but at least never *silently* driving the
+   wrong Mac. Give each machine its own port if you work that way.
 
 ## API
 
