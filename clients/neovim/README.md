@@ -115,13 +115,18 @@ All of it lives in `~/.ssh/config` on your laptop. You keep typing `ssh dev`.
 Host dev
   HostName ...
   ControlMaster auto
-  ControlPath ~/.ssh/cm-%C
+  ControlPath ~/.ssh/cm-%u-%r-%h-%p
   ControlPersist 10m
-  RemoteForward /tmp/rime-ime-%C.sock /tmp/rime_copilot_ime.sock
+  RemoteForward /tmp/rime-ime-%u-%r.sock /tmp/rime_copilot_ime.sock
+  ServerAliveInterval 15
+  ServerAliveCountMax 3
 ```
 
-`%C` hashes (local host, remote host, port, remote user), so different hosts and
-different accounts get different socket names.
+`%u-%r` is the local user and the remote user, which is what keeps accounts apart
+on a shared host. Avoid `%C`: it hashes in `%l`, the local hostname, and on macOS
+with `HostName` unset that is derived from the network — so it changes as you move
+between networks, minting a new socket name each time and stranding the old one
+forever (see below).
 
 **`ControlMaster` is load-bearing, not a nicety.** ssh_config offers no token
 that varies per session — `%C`, `%l`, `%n`, `%p`, `%r`, `%u` are all functions of
@@ -136,6 +141,15 @@ since all tunnels lead to the same place. The catch is that closing the *first*
 session takes the socket with it and the later ones go dormant until any new
 `ssh dev` recreates it (they then recover on the next `InsertEnter`).
 
+`ServerAlive*` is not about this plugin, but multiplexing makes it matter more.
+When a master's TCP dies silently — network change, VPN drop, laptop resume —
+every new `ssh dev` blocks on the mux handshake with **no timeout of its own**;
+`ConnectTimeout` does not apply to it. The only thing that ends the wait is the
+master giving up and exiting, so the keepalive interval *is* the hang duration:
+measured at 14s with `5 x 2`, and the stock `60 x 3` would be about three
+minutes. Multiplexing concentrates this — one wedged master hangs every session
+at once, which is why it looks worse when several are open.
+
 > **Do not use `${VAR}` in the path.** The manual says an undefined variable
 > makes ssh ignore the keyword; in practice it is fatal:
 > ```
@@ -147,24 +161,44 @@ session takes the socket with it and the later ones go dormant until any new
 > parse still fails. (`ssh -G` will not show you this: it does not evaluate
 > `Match exec` at all.) Use a token that is always defined.
 
-### If the forward will not bind
+### The socket file outlives the forward — read this one
 
-`Warning: remote port forwarding failed for listen path ...` with no other
-session running usually means a stale socket file from an sshd that died. The
-remote sshd only unlinks one at bind time if it is configured to:
+`Warning: remote port forwarding failed for listen path ...` is not an edge case
+you might hit. It is the **default second outcome on every host**, and it is the
+single most likely reason a remote setup that worked once never works again.
+
+sshd does not remove the forwarded socket file when the forward goes away. Not on
+a clean `ssh -O exit`, not on `SIGKILL` — both were measured leaving the file
+behind. And sshd refuses to bind over an existing file. So the first session to
+exit poisons the name for every session after it: the tunnel works exactly once
+per host, and from then on every `ssh` prints that warning and the remote Neovim
+finds a socket file that refuses connection.
+
+Two things fix it, and they are worth having both:
 
 ```
-# remote /etc/ssh/sshd_config
+# remote /etc/ssh/sshd_config (or a drop-in under sshd_config.d/)
 StreamLocalBindUnlink yes
 ```
 
-If you cannot set that, delete the stale file, or fall back to a loopback port,
-which needs nothing on the remote side:
+That is the real cure: sshd unlinks before binding, so the name is always live.
+Requires root on the remote and `systemctl reload ssh`.
+
+Where you cannot set it, the plugin covers for it: when a candidate under
+`/tmp/rime-ime-*.sock` refuses connection, it unlinks the file, so the *next* ssh
+session binds cleanly. `ECONNREFUSED` is what proves no one is listening — a live
+forward accepts immediately — and only sockets matching the tunnel pattern and
+owned by you are ever touched, so this cannot reach Rime's own socket or another
+user's. The cost is that recovery takes one session: the ssh you are currently
+inside already failed to bind, so the tunnel comes back on the next one.
+
+A loopback port avoids the whole problem — ports leave nothing behind — at a real
+security cost on shared hosts:
 
 ```
 Host locked
   ControlMaster auto
-  ControlPath ~/.ssh/cm-%C
+  ControlPath ~/.ssh/cm-%u-%r-%h-%p
   ControlPersist 10m
   RemoteForward 127.0.0.1:9527 /tmp/rime_copilot_ime.sock
 ```
@@ -220,8 +254,12 @@ over ssh (it is just an escape sequence).
    because every tunnel ends at the same bridge socket — which stops being true
    if you ssh to the same remote host, as the same user, from two different
    machines. Both tunnels are then yours by uid and both look valid, but they
-   lead to different IMEs; the plugin takes the newest and may pick the wrong
-   laptop. Pin `$RIME_IME_SOCKET` to one tunnel's path if you work that way.
+   lead to different IMEs. With the `%u-%r` name above they contend for one
+   path, so the outcome is at least unambiguous: whichever laptop bound it last
+   owns it (with `StreamLocalBindUnlink yes`), or the first one keeps it and the
+   second only gets the warning (without). Either way the other laptop's Neovim
+   drives the wrong IME. Give each machine its own suffix in `RemoteForward`, or
+   pin `$RIME_IME_SOCKET` on the remote, if you work that way.
 
 ## API
 

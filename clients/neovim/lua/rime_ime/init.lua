@@ -258,6 +258,48 @@ resync = function()
   end
 end
 
+-- sshd does not remove a forwarded socket file when the forward goes away --
+-- not on a clean `ssh -O exit`, not on SIGKILL -- and it refuses to bind over an
+-- existing file. So the first session to exit poisons the name for every session
+-- after it: the tunnel works exactly once per host and is then dead for good,
+-- with "remote port forwarding failed for listen path ..." on every later ssh.
+--
+-- The remote-side cure is `StreamLocalBindUnlink yes` in sshd_config; unlinking
+-- here is what recovers hosts whose sshd we cannot change. It is also the only
+-- thing that reaches sockets left behind under a name no longer in use (the
+-- ssh_config token changed, an alias was renamed) -- nothing else ever will.
+--
+-- ECONNREFUSED is the proof that no one is listening: a live forward accepts
+-- immediately, and a broken Mac-side bridge only shows up after accept. We
+-- narrow it further to sockets that ssh itself minted (is_tunnel) and that we
+-- own, so this can never touch Rime's own socket or another user's.
+--
+-- A new master could bind between the refused connect and the unlink, in which
+-- case we drop a live socket; the window is sub-millisecond and the next ssh
+-- session rebinds, whereas leaving the file costs the tunnel permanently.
+local function reap_stale_tunnel(ep, err)
+  if ep.kind ~= "unix" or not endpoint.is_tunnel(ep.path) then
+    return
+  end
+  if not (err and tostring(err):find("ECONNREFUSED", 1, true)) then
+    return
+  end
+  local st = uv.fs_lstat(ep.path)
+  if not st or st.type ~= "socket" then
+    return
+  end
+  local uid = uv.getuid and uv.getuid() or nil
+  if uid and st.uid ~= uid then
+    return
+  end
+  local ok, unlink_err = uv.fs_unlink(ep.path)
+  if ok then
+    log("Removed dead tunnel socket " .. ep.path .. "; the next ssh session can bind it")
+  else
+    log("Could not remove dead tunnel socket " .. ep.path .. ": " .. tostring(unlink_err))
+  end
+end
+
 local function try_connect(list, idx)
   -- A candidate walk in flight when VimLeavePre runs would otherwise keep
   -- dialling after disconnect(), and a late success would set socket/connected
@@ -289,6 +331,7 @@ local function try_connect(list, idx)
 
     if err then
       pcall(function() handle:close() end)
+      reap_stale_tunnel(ep, err)
       -- This callback is a fast event context, where vim.fn/vim.env are
       -- forbidden -- and the next step needs both, via candidates() in
       -- schedule_reconnect. Raising here would abort before any retry is
@@ -342,8 +385,10 @@ local function try_connect(list, idx)
     ok, ret, ret_err = pcall(handle.connect, handle, ep.path, on_result)
   end
   if not ok or not ret then
-    log("Dial failed: " .. tostring(ok and ret_err or ret))
+    local dial_err = ok and ret_err or ret
+    log("Dial failed: " .. tostring(dial_err))
     pcall(function() handle:close() end)
+    reap_stale_tunnel(ep, dial_err)
     vim.schedule(function() try_connect(list, idx + 1) end)
   end
 end

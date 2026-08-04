@@ -151,6 +151,35 @@ function M.candidates(opts)
   return out
 end
 
+--- True when `path` is one of the ssh-forwarded tunnel sockets -- a name our own
+--- ssh_config minted, as opposed to Rime's socket or anything a user configured
+--- by hand. Derived from TUNNEL_GLOB so the two cannot drift apart.
+---
+--- This gates what init.lua is allowed to unlink when a candidate turns out to
+--- be dead, so it has to be exact: the `*` must match at least one character and
+--- may not span a directory separator, or "/tmp/rime-ime-" and
+--- "/tmp/rime-ime-x.sock/../../etc/passwd" would both qualify.
+function M.is_tunnel(path)
+  if type(path) ~= "string" then
+    return false
+  end
+  local prefix, suffix = M.TUNNEL_GLOB:match("^(.-)%*(.*)$")
+  if not prefix then
+    return false
+  end
+  if #path <= #prefix + #suffix then
+    return false
+  end
+  if path:sub(1, #prefix) ~= prefix then
+    return false
+  end
+  if suffix ~= "" and path:sub(-#suffix) ~= suffix then
+    return false
+  end
+  local middle = path:sub(#prefix + 1, #path - #suffix)
+  return middle ~= "" and not middle:find("/", 1, true)
+end
+
 --- Exponential backoff with a ceiling. `attempt` is 1-based; returns ms.
 function M.backoff(attempt, base, max)
   base = base or 1000

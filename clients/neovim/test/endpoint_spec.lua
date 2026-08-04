@@ -4,9 +4,13 @@
 --   nvim -l clients/neovim/test/endpoint_spec.lua
 
 local here = debug.getinfo(1, "S").source:sub(2):match("(.*/)") or "./"
-package.path = here .. "../lua/?.lua;" .. here .. "../lua/?/init.lua;" .. package.path
 
-local endpoint = require("rime_ime.endpoint")
+-- loadfile, not require: nvim resolves require() through its own runtimepath
+-- loader first, so on a machine that has this plugin installed under
+-- ~/.config/nvim/lua the spec would silently test the *installed* copy instead
+-- of the one in this checkout. That is invisible while the two agree and
+-- actively misleading the moment they do not.
+local endpoint = assert(loadfile(here .. "../lua/rime_ime/endpoint.lua"))()
 
 local failures = 0
 local function check(ok, msg)
@@ -209,6 +213,30 @@ do
   -- module stays usable (and testable) without a filesystem.
   local list = endpoint.candidates({ uid = 501, glob = function() return {} end })
   eq(#list, 1, "without stat, candidates are passed through")
+end
+
+-- is_tunnel ---------------------------------------------------------------
+-- Gates what init.lua may unlink, so over-matching here means deleting a socket
+-- that is not ours to delete.
+
+do
+  check(endpoint.is_tunnel("/tmp/rime-ime-lidongpeng-udeer.sock"),
+        "a forwarded tunnel socket is recognised")
+  check(endpoint.is_tunnel("/tmp/rime-ime-a.sock"), "a one-character id counts")
+
+  check(not endpoint.is_tunnel(endpoint.DEFAULT_SOCKET),
+        "Rime's own socket is NOT a tunnel and must never be unlinked")
+  check(not endpoint.is_tunnel("/tmp/rime-ime-.sock"),
+        "the wildcard must match at least one character")
+  check(not endpoint.is_tunnel("/tmp/rime-ime-x.sock/../../etc/passwd"),
+        "the wildcard must not span a directory separator")
+  check(not endpoint.is_tunnel("/tmp/sub/rime-ime-x.sock"),
+        "a tunnel name in another directory does not count")
+  check(not endpoint.is_tunnel("/tmp/rime-ime-x.socket"), "the suffix must match exactly")
+  check(not endpoint.is_tunnel("/var/tmp/rime-ime-x.sock"), "the prefix must match exactly")
+  check(not endpoint.is_tunnel("/tmp/other.sock"), "an unrelated socket does not count")
+  check(not endpoint.is_tunnel(nil), "nil is not a tunnel")
+  check(not endpoint.is_tunnel(42), "a non-string is not a tunnel")
 end
 
 -- backoff ---------------------------------------------------------------
