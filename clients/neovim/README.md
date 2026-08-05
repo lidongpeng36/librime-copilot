@@ -78,20 +78,30 @@ context (keep it in step with `copilot/surrounding_context_chars`, default 8).
 
 ### Endpoint discovery
 
-The plugin tries these in order and uses the first that connects:
+The candidates, in order:
 
 1. `$RIME_IME_SOCKET`
 2. `socket_path` from `setup()`
 3. `/tmp/rime_copilot_ime.sock` (the local default)
 4. `/tmp/rime-ime-*.sock` — sockets forwarded here by ssh, newest first
-5. `127.0.0.1:19527` — the forwarded loopback port (the remote case)
+5. `127.0.0.1:19527` — a fixed forwarded port; the pre-`SetEnv` remote setup
 6. every loopback port that could be an ssh reverse tunnel — **only when
    `$LC_RIME_IME_HOST` is set**, see [Which machine is at the far
-   end?](#which-machine-is-at-the-far-end) below
+   end?](#which-machine-is-at-the-far-end)
 
-The list is the same on every machine, which is the point: on the machine Rime
-runs on, 3 connects and the rest is never reached; on a remote host, 3 and 4
-fail and the tunnel is 5 or 6. Nothing to set per host.
+4 and 5 are kept for setups that predate greetings; the current one uses 6.
+
+How the list is consumed depends on whether there is anything to verify against:
+
+- **`$LC_RIME_IME_HOST` unset** — tried in order, first one that connects wins.
+- **set** — all dialled at once, and the first whose greeting names the expected
+  machine wins; the rest are closed unread. Concurrent because a candidate that
+  is not a bridge never answers, and waiting out its timeout before trying the
+  next would serialise exactly the case this exists to make fast.
+
+Either way the list is the same on every machine, which is the point: where Rime
+runs, 3 connects and the rest is never reached; on a remote host 3 and 4 fail and
+the tunnel is 5 or 6. Nothing to set per host.
 
 **Every candidate is checked before it is dialled.** A unix path that exists
 must be a socket (by `lstat`, so a symlink is refused) and must be owned by you;

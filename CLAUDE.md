@@ -42,7 +42,22 @@ cmake --build build
   no Rime engine is stood up, since `Engine::Create()` pulls in Switcher/deployer init a bare
   test main can't provide. To test AutoSpacer logic without an engine, extract it into a free
   function / `auto_spacer_detail` helper and drive it directly (see `ComputeSpaceCommitText`).
-  CI runs lint + build-with-ASAN + this suite.
+  `test/ime_bridge_socket_test.cc` is the one exception to "pure logic": it stands up a real
+  `ImeBridgeServer` on a Unix socket (no Rime engine) to cover the parts that only exist over
+  a real connection — the greeting, connection refcounting, `Stop()` draining.
+- **Lua tests** run under bare `nvim -l`, no framework:
+  ```sh
+  nvim -l clients/neovim/test/endpoint_spec.lua   # pure helpers
+  nvim -l clients/neovim/test/verify_spec.lua     # real sockets, timers, handle cleanup
+  ```
+  `verify_spec` drives the actual connection path against fake bridges. It runs each scenario
+  in a **child nvim**: reloading the module leaves the previous instance's sockets and timers
+  alive in the event loop, and they go on talking, silently invalidating the next scenario.
+  Both specs load the module under test via explicit path (`loadfile` / `package.preload`),
+  never `require` — nvim's runtimepath loader resolves `rime_ime` to the copy installed under
+  `~/.config/nvim` first, so on a machine that has the plugin installed a plain `require`
+  tests the *installed* code. That has produced falsely-green runs twice; do not undo it.
+  CI runs lint + both Lua specs + build-with-ASAN + the GTest suite.
 
 ### macOS vs Linux
 
@@ -114,8 +129,37 @@ All three can be turned off via `copilot/disabled_plugins` in the schema config.
   self-contained module directory so it can be synced to a remote host as a
   unit. `init.lua` is the stateful part (connection lifecycle, autocmds,
   protocol); `endpoint.lua` is pure logic (endpoint parsing, discovery order,
-  backoff, instance identity) with no `vim.*` reference, which is what lets
-  `clients/neovim/test/endpoint_spec.lua` run under bare `nvim -l`.
+  tunnel-port enumeration, greeting parsing, backoff, instance identity) with no
+  `vim.*` reference, which is what lets `endpoint_spec.lua` run under bare
+  `nvim -l`. Keep it that way — anything stateful belongs in `init.lua`.
+
+### Remote Neovim, and why the client verifies who answers
+The client can run on a machine that is not the one Rime is on, reached through
+`RemoteForward` in the user's `~/.ssh/config`. Two facts drive the design, both
+measured (see `docs/superpowers/specs/2026-08-05-nvim-remote-identity-design.md`
+for the full record and the alternatives that were eliminated):
+
+- **sshd never unlinks a forwarded socket file** — not on `ssh -O exit`, not on
+  SIGKILL — and refuses to bind over one, so the socket-file form of the tunnel
+  works once per host and is dead after. Hence a forwarded **port**.
+- **Two laptops on one remote account** each get a tunnel to a *different* IME,
+  indistinguishable from the far end. Hence `RemoteForward 127.0.0.1:0` (a
+  private port per laptop, no coordination) plus a greeting: `ImeBridgeServer`
+  writes one `type:"hello"` line naming its host the instant it accepts, and the
+  client keeps only the tunnel whose host matches `$LC_RIME_IME_HOST` (delivered
+  by `SetEnv LC_RIME_IME_HOST=%L`).
+
+Invariants to preserve when touching this:
+- The greeting must be **unprompted** — a client must never have to send a
+  keystroke to discover it reached the wrong machine.
+- A connection that sends no action must register **no** client state. Discovery
+  probes other laptops' tunnels; if a silent probe registered a client, its
+  disconnect would synthesize a reset and flip that machine's `ascii_mode`.
+  Guaranteed by `HandleConnection` filling `keys` only from `ProcessMessage`.
+- With `$LC_RIME_IME_HOST` unset the client must behave exactly as before,
+  greeting or not: that is the local case and every pre-existing setup.
+- No match means **no** input method. Refusing is the point; guessing is what
+  drove the wrong laptop.
 
 ## Deployment / config
 Users add `copilot` to `engine/processors` (before `key_binder`) and `copilot_translator`
