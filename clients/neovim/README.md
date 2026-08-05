@@ -85,10 +85,13 @@ The plugin tries these in order and uses the first that connects:
 3. `/tmp/rime_copilot_ime.sock` (the local default)
 4. `/tmp/rime-ime-*.sock` — sockets forwarded here by ssh, newest first
 5. `127.0.0.1:19527` — the forwarded loopback port (the remote case)
+6. every loopback port that could be an ssh reverse tunnel — **only when
+   `$LC_RIME_IME_HOST` is set**, see [Which machine is at the far
+   end?](#which-machine-is-at-the-far-end) below
 
 The list is the same on every machine, which is the point: on the machine Rime
 runs on, 3 connects and the rest is never reached; on a remote host, 3 and 4
-fail and 5 is the tunnel. Nothing to set per host.
+fail and the tunnel is 5 or 6. Nothing to set per host.
 
 **Every candidate is checked before it is dialled.** A unix path that exists
 must be a socket (by `lstat`, so a symlink is refused) and must be owned by you;
@@ -108,15 +111,43 @@ Both `/path/to.sock` and `host:port` are accepted wherever an endpoint is given.
 A port on another host is never checked against the local table, so an explicitly
 configured `1.2.3.4:9527` is passed through untouched.
 
+### Which machine is at the far end?
+
+"Any live tunnel is correct" holds only while every tunnel on a host leads to the
+same laptop. Sign into one remote account from **two** laptops and it stops being
+true: both tunnels are yours by uid, both look valid, and the one you are not
+typing on is just as reachable. Measured, before this existed: typing in a Neovim
+started from laptop B drove laptop **A**'s input method, with no warning on
+either side, because A had bound the shared port first and B's forward had
+silently failed.
+
+So the tunnel is now asked who it reaches. The bridge greets every connection the
+instant it accepts, before the client has said anything:
+
+```json
+{"v":1,"ns":"rime.ime","type":"hello","data":{"host":"my-laptop"}}
+```
+
+and the client keeps the tunnel whose `host` matches `$LC_RIME_IME_HOST` — the
+machine its own ssh session came from. Everything else is closed unread. A probe
+that only reads the greeting registers nothing on the far side, so sweeping past
+another laptop's tunnel cannot disturb its input method.
+
+Two consequences worth knowing:
+
+- **No match means no input method**, deliberately. Refusing is the whole point;
+  guessing is what drove the wrong laptop.
+- `$LC_RIME_IME_HOST` unset — running where Rime runs, or an ssh setup without
+  the `SetEnv` line — skips all of this and behaves exactly as it did before,
+  greeting or no greeting. Nothing to migrate.
+
+Set it up in [Remote Neovim over ssh](#remote-neovim-over-ssh) below.
+
 ## Remote Neovim over ssh
 
 Run Neovim on a remote host and have it drive the input method on your laptop.
 Nothing is needed on the remote side beyond the plugin — no sshd change, no
-`AcceptEnv`, no environment variable.
-
-This works because **every tunnel terminates at the same bridge socket on your
-laptop**, so the remote plugin does not have to know which tunnel is "its own":
-any live one is correct.
+`AcceptEnv` edit, no per-host configuration.
 
 ### Setup
 
@@ -128,22 +159,43 @@ Host dev
   ControlMaster auto
   ControlPath ~/.ssh/cm-%u-%r-%h-%p
   ControlPersist 10m
-  RemoteForward 127.0.0.1:19527 /tmp/rime_copilot_ime.sock
+  RemoteForward 127.0.0.1:0 /tmp/rime_copilot_ime.sock
+  SetEnv        LC_RIME_IME_HOST=%L
   ServerAliveInterval 15
   ServerAliveCountMax 3
 ```
 
-**Forward a port, not a socket file.** This is the one decision that matters, and
-it is not a style preference — see [below](#the-socket-file-outlives-the-forward)
-for what the socket-file form does after its first session. A port leaves no
-residue: when the listener goes, the port is free, and the next `ssh` binds it
-again. Nothing to configure on the remote, and nothing to re-apply when you
-reinstall a machine or add a host.
+That is the whole configuration, and it is the same on every laptop you own —
+adding a second or a third needs no edit here at all.
 
-What a port gives up is ownership — a socket file carries a uid, a port belongs
-to whoever binds it — and the plugin buys that back by refusing a listener that
-is not yours (see [Endpoint discovery](#endpoint-discovery), including the macOS
-gap).
+**Forward a port, not a socket file.** Not a style preference — see
+[below](#the-socket-file-outlives-the-forward) for what the socket-file form does
+after its first session. A port leaves no residue: when the listener goes the
+port is free, and the next `ssh` binds it again.
+
+**Port `0`, so sshd picks a free one.** With a fixed number, two laptops signed
+into the same remote account race for it; the winner works and the loser gets no
+tunnel while its Neovim happily drives the winner's IME. Dynamic allocation gives
+each laptop its own port with nothing to coordinate. The client finds it by
+looking at loopback listeners it could own and keeping the one whose greeting
+names the right machine — on Linux from `/proc/net/tcp`, narrowed to the
+ephemeral range (a bind to port 0 is served from exactly there, so a service on a
+well-known port is never even connected to); on macOS from `lsof`, which names
+the owning process, so only `sshd`'s listeners are touched. Measured on real
+hosts: one candidate each.
+
+**`SetEnv LC_RIME_IME_HOST=%L`** is what makes the greeting checkable — `%L` is
+this laptop's short hostname, and `LC_*` passes through the stock `AcceptEnv`, so
+no remote change is needed. Pin the hostname once per machine:
+
+```sh
+sudo scutil --set HostName my-laptop     # macOS; left unset it is derived from
+                                         # the network and changes as you move
+```
+
+If a host does strip `LC_*`, the client cannot tell which machine a tunnel
+reaches and refuses all of them: no input method, never the wrong one. `debug =
+true` says so in as many words.
 
 **`ControlMaster` is load-bearing, not a nicety.** ssh_config offers no token
 that varies per session — `%C`, `%l`, `%n`, `%p`, `%r`, `%u` are all functions of
@@ -255,14 +307,18 @@ over ssh (it is just an escape sequence).
    port. Between sshd creating it and the plugin `chmod`-ing it to 0600, it
    carries sshd's login umask (often 0755). On a shared host, pre-create a 0700
    directory in `~/.profile` and forward into that instead.
-5. **Two laptops, one remote account.** "Any live tunnel is correct" holds
-   because every tunnel ends at the same bridge — which stops being true if you
-   ssh to the same remote host, as the same user, from two different machines.
-   Both are then yours by uid and both look valid, but they lead to different
-   IMEs. With the forwarded port they contend for one number, so the first
-   laptop to bind keeps it and the second gets `Warning: remote port forwarding
-   failed` and no tunnel — annoying, but at least never *silently* driving the
-   wrong Mac. Give each machine its own port if you work that way.
+5. **Both ends must agree about greetings.** A client that expects one (because
+   `$LC_RIME_IME_HOST` is set) and talks to a bridge too old to send one refuses
+   the tunnel: correct, but it means no input method until that laptop's Rime is
+   updated too. The reverse is fine — an old client ignores the greeting. If you
+   run two laptops, update both before adding the `SetEnv` line, or add it per
+   laptop as each is updated.
+6. **One probe per unrelated listener, on Linux.** `/proc` will not say which
+   process owns a socket that `sshd` holds, so the candidate set there is "ports
+   in the ephemeral range that you own" rather than "ports `sshd` holds". A
+   service of your own on such a port gets one connection that sends nothing and
+   is closed as soon as it fails to greet. macOS has no such gap: `lsof` names
+   the owner.
 
 ## API
 

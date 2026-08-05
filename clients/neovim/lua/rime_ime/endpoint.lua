@@ -250,6 +250,111 @@ function M.is_tunnel(path)
   return middle ~= "" and not middle:find("/", 1, true)
 end
 
+-- Tunnel discovery for the remote case -------------------------------------
+--
+-- `RemoteForward 127.0.0.1:0` lets sshd pick a free port, so two laptops
+-- sharing one remote account each get their own tunnel instead of racing for
+-- one number -- and a port, unlike a socket file, leaves nothing behind when
+-- the forward dies. The price is that nobody knows the number in advance, so
+-- the client has to find it and then prove it leads to the right machine.
+
+--- Ports listening on IPv4 loopback, owned by `uid`, parsed from the content of
+--- /proc/net/tcp (or tcp6, same columns).
+---
+--- `lo`/`hi`, when given, keep only ports inside the ephemeral range. That is
+--- not a heuristic: a bind to port 0 is served from exactly that range, so a
+--- long-lived service on a well-known port (8080, 11434, ...) cannot be one of
+--- our tunnels and does not deserve a probe.
+function M.listen_ports(content, uid, lo, hi)
+  local out = {}
+  if type(content) ~= "string" then
+    return out
+  end
+  for line in content:gmatch("[^\n]+") do
+    local addr, state, owner =
+      line:match("^%s*%d+:%s+(%S+)%s+%S+%s+(%S+)%s+%S+%s+%S+%s+%S+%s+(%d+)")
+    if addr and state == "0A" then  -- 0A = TCP_LISTEN
+      local ip, hex = addr:match("^(%x+):(%x+)$")
+      -- 0100007F is 127.0.0.1 in the little-endian hex /proc uses.
+      if ip == "0100007F" and (uid == nil or tonumber(owner) == uid) then
+        local port = tonumber(hex, 16)
+        if port and (not lo or (port >= lo and port <= hi)) then
+          out[#out + 1] = port
+        end
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+--- "10240\t65535" -> 10240, 65535. nil when unparseable, which means "do not
+--- filter by range" rather than "drop everything".
+function M.parse_port_range(content)
+  if type(content) ~= "string" then
+    return nil
+  end
+  local lo, hi = content:match("(%d+)%s+(%d+)")
+  if not lo then
+    return nil
+  end
+  return tonumber(lo), tonumber(hi)
+end
+
+--- Loopback ports held by sshd, from `lsof -nP -iTCP -sTCP:LISTEN -a -u<uid>`.
+--- macOS has no /proc, but it does let us see the owning process, so there the
+--- candidate set is exact and no unrelated service is ever probed.
+function M.lsof_ssh_ports(output)
+  local out, seen = {}, {}
+  if type(output) ~= "string" then
+    return out
+  end
+  for line in output:gmatch("[^\n]+") do
+    local cmd = line:match("^(%S+)")
+    if cmd and cmd:lower():find("sshd", 1, true) then
+      local port = line:match("127%.0%.0%.1:(%d+)%s+%(LISTEN%)")
+      if port and not seen[port] then
+        seen[port] = true
+        out[#out + 1] = tonumber(port)
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+--- The host named in a `hello` greeting, or nil if this is not one.
+function M.parse_hello(line, decode)
+  if type(line) ~= "string" or not decode then
+    return nil
+  end
+  local ok, msg = pcall(decode, line)
+  if not ok or type(msg) ~= "table" then
+    return nil
+  end
+  if msg.ns ~= "rime.ime" or msg.type ~= "hello" then
+    return nil
+  end
+  local host = type(msg.data) == "table" and msg.data.host or nil
+  if type(host) ~= "string" or host == "" then
+    return nil
+  end
+  return host
+end
+
+--- Does a greeting from `host` mean we reached the machine we came from?
+--- Hostnames are case-insensitive, and ssh's %L is truncated at the first dot,
+--- so compare the short forms.
+function M.host_matches(host, expected)
+  if type(host) ~= "string" or type(expected) ~= "string" then
+    return false
+  end
+  local function short(s)
+    return (s:gsub("%..*$", "")):lower()
+  end
+  return short(host) ~= "" and short(host) == short(expected)
+end
+
 --- Exponential backoff with a ceiling. `attempt` is 1-based; returns ms.
 function M.backoff(attempt, base, max)
   base = base or 1000

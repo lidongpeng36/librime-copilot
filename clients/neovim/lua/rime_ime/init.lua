@@ -17,6 +17,10 @@ local reconnect_timer = nil
 local attempt = 0
 local active_endpoint = nil
 local pending_insert_leave_timer = nil
+-- Connections dialled but not yet adopted or rejected. Tracked so disconnect()
+-- can close them: a probe still awaiting a greeting when VimLeavePre runs would
+-- otherwise outlive the client it belongs to.
+local probe_handles = {}
 
 local config = {
   -- Explicit endpoint. nil means "discover it": $RIME_IME_SOCKET, then this
@@ -29,6 +33,10 @@ local config = {
   reconnect_delay = 1000,     -- ms, first retry
   reconnect_max_delay = 30000, -- ms, ceiling
   max_pending = 10,           -- max queued messages
+  -- How long to wait for the bridge's greeting when verifying which machine a
+  -- tunnel reaches. Only reached by a candidate that accepts and then stays
+  -- silent; a real greeting crosses the ssh link in 5-30ms on real hosts.
+  probe_timeout = 500,
   -- How many characters before the cursor to send. The plugin needs only the
   -- boundary character for auto-spacing, but uses the rest as the n-gram
   -- prediction context (copilot/surrounding_context_chars, default 8).
@@ -156,9 +164,10 @@ local function stat_endpoint(path)
 end
 
 -- Who owns the LISTEN socket on a loopback port. Returns nil where that cannot
--- be answered -- macOS has no /proc, and answering it there would mean spawning
--- lsof from inside the dial path -- so a forwarded port on a macOS *remote* is
--- trusted the way it was before this check existed. That is the one gap.
+-- be answered -- macOS has no /proc -- in which case the port is not filtered
+-- on ownership. When we are verifying greetings (the remote case) that gap is
+-- closed anyway: a tunnel someone else opened answers with someone else's
+-- hostname and is refused.
 local function tcp_owner(port)
   local uids = nil
   for _, path in ipairs({ "/proc/net/tcp", "/proc/net/tcp6" }) do
@@ -175,8 +184,59 @@ local function tcp_owner(port)
   return uids
 end
 
+local function read_file(path)
+  local fh = io.open(path, "r")
+  if not fh then
+    return nil
+  end
+  local content = fh:read("*a")
+  fh:close()
+  return content
+end
+
+-- The machine this ssh session came from, announced by `SetEnv LC_RIME_IME_HOST
+-- =%L`. Its presence is what puts us in "remote, must verify" mode; without it
+-- (running on the machine Rime itself is on, or an ssh setup that predates
+-- this) nothing below changes behaviour at all.
+local function expected_host()
+  local h = vim.env.LC_RIME_IME_HOST
+  if type(h) == "string" and h ~= "" then
+    return h
+  end
+  return nil
+end
+
+-- Loopback ports that could be an ssh reverse tunnel. Deliberately narrow: we
+-- open a connection to each one to read its greeting, and a port that cannot be
+-- a tunnel should never be touched.
+local function tunnel_ports()
+  local proc = read_file("/proc/net/tcp")
+  if proc then
+    local lo, hi = endpoint.parse_port_range(read_file("/proc/sys/net/ipv4/ip_local_port_range"))
+    local uid = uv.getuid and uv.getuid() or nil
+    local ports = endpoint.listen_ports(proc, uid, lo, hi)
+    local six = read_file("/proc/net/tcp6")
+    if six then
+      for _, p in ipairs(endpoint.listen_ports(six, uid, lo, hi)) do
+        ports[#ports + 1] = p
+      end
+    end
+    return ports
+  end
+
+  -- macOS: no /proc, but lsof names the owning process, so the candidate set is
+  -- exact -- ollama, language servers and the like are never dialled.
+  local ok, out = pcall(vim.fn.system, {
+    "lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-u" .. tostring(uv.getuid and uv.getuid() or 0),
+  })
+  if not ok or vim.v.shell_error ~= 0 then
+    return {}
+  end
+  return endpoint.lsof_ssh_ports(out)
+end
+
 local function candidates()
-  return endpoint.candidates({
+  local list = endpoint.candidates({
     env = vim.env.RIME_IME_SOCKET,
     configured = config.socket_path,
     glob = function(pattern) return vim.fn.glob(pattern, true, true) end,
@@ -185,6 +245,26 @@ local function candidates()
     uid = uv.getuid and uv.getuid() or nil,
     log = log,
   })
+
+  -- Only worth enumerating when there is something to check the answer
+  -- against; otherwise we would be dialling ports with no way to tell whose
+  -- they are, which is exactly what we are trying to avoid.
+  if expected_host() then
+    local seen = {}
+    for _, ep in ipairs(list) do
+      if ep.kind == "tcp" then
+        seen[ep.port] = true
+      end
+    end
+    for _, port in ipairs(tunnel_ports()) do
+      if not seen[port] then
+        seen[port] = true
+        list[#list + 1] = { kind = "tcp", host = "127.0.0.1", port = port }
+      end
+    end
+  end
+
+  return list
 end
 
 -- True when there is something worth dialling right now. A path that does not
@@ -327,6 +407,195 @@ local function reap_stale_tunnel(ep, err)
   end
 end
 
+-- Take `handle` as the live connection. Shared by both dial paths, so the
+-- socket ends up in exactly the same state whether or not a greeting was
+-- verified first.
+local function adopt(handle, ep, already_reading)
+  socket = handle
+  connected = true
+  connecting = false
+  attempt = 0
+  active_endpoint = ep
+
+  if ep.kind == "unix" then
+    -- sshd creates a forwarded socket under the login umask (often 022 ->
+    -- 0755), which would let any other user on that host drive this IME. We
+    -- own the file, so tighten it to 0600.
+    pcall(function() uv.fs_chmod(ep.path, 384) end)
+  end
+
+  -- Without read_start libuv never surfaces the peer's EOF, and writes go on
+  -- "succeeding" into a dead socket forever -- which is why a Squirrel restart
+  -- used to kill the bridge until nvim itself was restarted. Past the greeting
+  -- the protocol is one-way, so any payload is ignored; we are here for the
+  -- close notification alone.
+  if already_reading then
+    pcall(function() handle:read_stop() end)
+  end
+  handle:read_start(function(read_err, data)
+    if read_err or not data then
+      vim.schedule(on_close)
+    end
+  end)
+
+  log("Connected to " .. (ep.kind == "tcp" and (ep.host .. ":" .. ep.port) or ep.path))
+  vim.schedule(function()
+    flush_pending()
+    resync()
+  end)
+end
+
+local function ep_name(ep)
+  return ep.kind == "tcp" and (ep.host .. ":" .. ep.port) or ep.path
+end
+
+-- Remote path: dial every candidate at once and keep the first whose greeting
+-- names the machine this ssh session came from.
+--
+-- Concurrent rather than serial because a candidate that is not a bridge at all
+-- never answers, and waiting out its timeout before trying the next one would
+-- serialise the very case this exists to make fast. In flight they cost one
+-- round trip in total instead of one each.
+--
+-- Refusing is the safe outcome, not a bug: no tunnel means no input method,
+-- where guessing means typing into the other laptop's IME.
+local function verified_connect(list, expected)
+  local done = false
+  local live = {}       -- handle -> true, connected and awaiting a greeting
+  local remaining = #list
+  local timer = nil
+
+  local function release(handle)
+    live[handle] = nil
+    probe_handles[handle] = nil
+    pcall(function() handle:read_stop() end)
+    pcall(function() handle:close() end)
+  end
+
+  local function finish(winner, ep)
+    if done then
+      return
+    end
+    done = true
+    if timer then
+      pcall(function() timer:stop() end)
+      pcall(function() timer:close() end)
+      timer = nil
+    end
+    for handle in pairs(live) do
+      if handle ~= winner then
+        release(handle)
+      end
+    end
+    if winner then
+      live[winner] = nil
+      probe_handles[winner] = nil
+      adopt(winner, ep, true)
+    else
+      connecting = false
+      schedule_reconnect()
+    end
+  end
+
+  -- One candidate is out. When the last one goes we have nothing to connect to.
+  local function reject(handle)
+    if done then
+      return
+    end
+    if handle then
+      release(handle)
+    end
+    remaining = remaining - 1
+    if remaining <= 0 then
+      log("No tunnel reaches " .. expected .. "; not guessing")
+      finish(nil)
+    end
+  end
+
+  for _, ep in ipairs(list) do
+    if done or shutting_down then
+      break
+    end
+    local handle = (ep.kind == "tcp") and uv.new_tcp() or uv.new_pipe(false)
+    local buf = ""
+
+    local function on_conn(err)
+      if done or shutting_down then
+        pcall(function() handle:close() end)
+        probe_handles[handle] = nil
+        return
+      end
+      if err then
+        reap_stale_tunnel(ep, err)
+        vim.schedule(function() reject(handle) end)
+        return
+      end
+      live[handle] = true
+
+      handle:read_start(function(read_err, data)
+        if done then
+          return
+        end
+        if read_err or not data then
+          vim.schedule(function() reject(handle) end)
+          return
+        end
+        buf = buf .. data
+        local line = buf:match("^([^\n]*)\n")
+        if not line then
+          -- A peer that talks but never sends a newline is not our bridge.
+          if #buf > 8192 then
+            vim.schedule(function() reject(handle) end)
+          end
+          return
+        end
+        -- vim.json.decode is a plain C call, safe in this fast event context;
+        -- everything that touches editor state is deferred below.
+        local host = endpoint.parse_hello(line, vim.json.decode)
+        if host and endpoint.host_matches(host, expected) then
+          vim.schedule(function() finish(handle, ep) end)
+        else
+          vim.schedule(function()
+            if host then
+              log("Skipping " .. ep_name(ep) .. ": tunnel leads to " .. host
+                  .. ", not " .. expected)
+            end
+            reject(handle)
+          end)
+        end
+      end)
+    end
+
+    probe_handles[handle] = true
+    local ok, ret, ret_err
+    if ep.kind == "tcp" then
+      ok, ret, ret_err = pcall(handle.connect, handle, ep.host, ep.port, on_conn)
+    else
+      ok, ret, ret_err = pcall(handle.connect, handle, ep.path, on_conn)
+    end
+    if not ok or not ret then
+      local dial_err = ok and ret_err or ret
+      reap_stale_tunnel(ep, dial_err)
+      vim.schedule(function() reject(handle) end)
+    end
+  end
+
+  if remaining <= 0 then
+    finish(nil)
+    return
+  end
+
+  -- Backstop for a candidate that accepts and then says nothing. Generous: the
+  -- greeting crosses the ssh link, measured at 5-30ms on real hosts.
+  timer = uv.new_timer()
+  timer:start(config.probe_timeout, 0, vim.schedule_wrap(function()
+    if not done then
+      log("No greeting within " .. config.probe_timeout .. "ms; not guessing")
+      finish(nil)
+    end
+  end))
+end
+
 local function try_connect(list, idx)
   -- A candidate walk in flight when VimLeavePre runs would otherwise keep
   -- dialling after disconnect(), and a late success would set socket/connected
@@ -367,35 +636,7 @@ local function try_connect(list, idx)
       return
     end
 
-    socket = handle
-    connected = true
-    connecting = false
-    attempt = 0
-    active_endpoint = ep
-
-    if ep.kind == "unix" then
-      -- sshd creates a forwarded socket under the login umask (often 022 ->
-      -- 0755), which would let any other user on that host drive this IME. We
-      -- own the file, so tighten it to 0600.
-      pcall(function() uv.fs_chmod(ep.path, 384) end)
-    end
-
-    -- Without read_start libuv never surfaces the peer's EOF, and writes go on
-    -- "succeeding" into a dead socket forever -- which is why a Squirrel
-    -- restart used to kill the bridge until nvim itself was restarted. The
-    -- protocol is one-way, so any payload is ignored; we are here for the close
-    -- notification alone.
-    handle:read_start(function(read_err, data)
-      if read_err or not data then
-        vim.schedule(on_close)
-      end
-    end)
-
-    log("Connected to " .. (ep.kind == "tcp" and (ep.host .. ":" .. ep.port) or ep.path))
-    vim.schedule(function()
-      flush_pending()
-      resync()
-    end)
+    adopt(handle, ep, false)
   end
 
   -- The dial can fail without ever invoking on_result: uv_tcp_connect raises
@@ -425,7 +666,15 @@ connect = function()
     return
   end
   connecting = true
-  try_connect(candidates(), 1)
+  local expected = expected_host()
+  if expected then
+    verified_connect(candidates(), expected)
+  else
+    -- No ssh session told us which machine to expect, so there is nothing to
+    -- verify against and nothing to gain by waiting for a greeting: the local
+    -- case, and any setup predating LC_RIME_IME_HOST, behaves exactly as before.
+    try_connect(candidates(), 1)
+  end
 end
 
 local function disconnect()
@@ -442,6 +691,15 @@ local function disconnect()
     pcall(function() socket:close() end)
     socket = nil
   end
+  -- A probe that has connected but not yet been judged holds an open socket to
+  -- some bridge. Left alone it would sit there past VimLeavePre, and a greeting
+  -- arriving after the exit path already sent reset+unregister would adopt it
+  -- and re-register the very client we just erased.
+  for handle in pairs(probe_handles) do
+    pcall(function() handle:read_stop() end)
+    pcall(function() handle:close() end)
+  end
+  probe_handles = {}
   active_endpoint = nil
   pending_messages = {}
   log("Disconnected")

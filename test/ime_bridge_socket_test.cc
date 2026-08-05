@@ -105,6 +105,82 @@ TEST(ImeBridgeSocket, ContextOverSocketBecomesActive) {
   server.Stop();
 }
 
+// A remote client dials every candidate endpoint it can find and keeps only the
+// one whose greeting names the machine its ssh session came from. Two things
+// have to hold for that to be safe, and both are tested here.
+
+TEST(ImeBridgeSocket, GreetingArrivesBeforeTheClientSaysAnything) {
+  ImeBridgeServer server;
+  ImeBridgeServer::Config cfg;
+  cfg.socket_path = "/tmp/rime_copilot_test_hello_" + std::to_string(getpid()) + ".sock";
+  cfg.host_id = "test-laptop";
+  server.Start(cfg);
+
+  int fd = ConnectClient(cfg.socket_path);
+  ASSERT_GE(fd, 0);
+
+  // Read without having written: the greeting must be unprompted, or a client
+  // would have to leak keystrokes to the wrong machine to discover it is wrong.
+  std::string got;
+  char buf[512];
+  for (int i = 0; i < 200 && got.find('\n') == std::string::npos; ++i) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n > 0) {
+      got.append(buf, static_cast<size_t>(n));
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_NE(std::string::npos, got.find('\n')) << "no greeting arrived";
+  EXPECT_NE(std::string::npos, got.find(R"("type":"hello")")) << got;
+  EXPECT_NE(std::string::npos, got.find(R"("host":"test-laptop")")) << got;
+
+  close(fd);
+  server.Stop();
+}
+
+TEST(ImeBridgeSocket, ProbeThatOnlyReadsTheGreetingLeavesNoState) {
+  // This is what happens to the *other* laptop's tunnel on every discovery
+  // sweep: we connect, read the greeting, see the wrong host, and hang up
+  // without sending a byte. That must not register a client -- if it did, the
+  // disconnect would synthesize a reset and flip the other laptop's ascii_mode.
+  ImeBridgeServer server;
+  ImeBridgeServer::Config cfg;
+  cfg.socket_path = "/tmp/rime_copilot_test_probe_" + std::to_string(getpid()) + ".sock";
+  server.Start(cfg);
+
+  // A real client first, so the server has state that a stray reset would show
+  // up against.
+  int owner = ConnectClient(cfg.socket_path);
+  ASSERT_GE(owner, 0);
+  SendLine(owner, Msg("nvim", "owner", R"({"action":"context","before":"中","after":"文"})"));
+  ASSERT_TRUE(WaitForBefore(server, "中"));
+  server.TakePendingActions();  // drain
+
+  for (int i = 0; i < 3; ++i) {
+    int probe = ConnectClient(cfg.socket_path);
+    ASSERT_GE(probe, 0);
+    char buf[512];
+    (void)read(probe, buf, sizeof(buf));  // greeting only
+    close(probe);
+  }
+  ASSERT_TRUE(WaitForLiveConnections(server, 1)) << "probes should have drained";
+
+  auto q = server.TakePendingActions();
+  while (!q.empty()) {
+    EXPECT_NE(ImeBridgePendingAction::kReset, q.front().type)
+        << "a silent probe must not synthesize a reset";
+    q.pop();
+  }
+  // And the real client still owns the context.
+  auto ctx = server.GetActiveContext();
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ("中", ctx->before);
+
+  close(owner);
+  server.Stop();
+}
+
 TEST(ImeBridgeSocket, DroppedConnectionSynthesizesReset) {
   ImeBridgeServer server;
   ImeBridgeServer::Config cfg;

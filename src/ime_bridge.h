@@ -64,6 +64,12 @@ class ImeBridgeState {
     // that lost focus without the terminal reporting it still owning the
     // surrounding text. 0 disables the check.
     int context_ttl_seconds = 60;
+    // Identity announced to every client the moment it connects, so a client
+    // reached through an ssh tunnel can tell *which* machine's IME it is about
+    // to drive. Empty means "derive it": gethostname() truncated at the first
+    // dot, which is what ssh's %L expands to -- the value a remote client gets
+    // via `SetEnv LC_RIME_IME_HOST=%L`. Override only if the two disagree.
+    std::string host_id;
   };
   struct ApplyResult {
     bool should_set = false;
@@ -103,10 +109,23 @@ class ImeBridgeState {
 
   static std::string MakeClientKey(const std::string& app, const std::string& instance);
 
+  // This machine's short hostname, or config_.host_id when set. Cached: it is
+  // read once per connection and gethostname() is a syscall.
+  const std::string& HostId() const;
+
+  // The greeting written to a client the instant it connects, newline included.
+  // A remote client compares data.host against the machine its ssh session came
+  // from, and refuses a tunnel that leads somewhere else -- which is the only
+  // thing standing between two laptops sharing one remote account and one of
+  // them silently driving the other's input method.
+  std::string BuildHello() const;
+
   Config config_;
 
  private:
   mutable std::mutex mutex_;
+  mutable std::string host_id_cache_;
+  mutable bool host_id_cached_ = false;
   std::unordered_map<std::string, ImeBridgeClientState> client_states_;
   std::string active_client_;
   std::unordered_map<std::string, int> conn_refs_;

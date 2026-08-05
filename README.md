@@ -107,6 +107,10 @@ copilot:
     client_timeout_minutes: 30  # auto-cleanup stale clients
     context_ttl_seconds: 60  # age past which the active client's surrounding
                               # context is treated as absent; 0 disables the check
+    host_id: ""  # identity announced to every client on connect, so a client
+                 # reached over an ssh tunnel can tell which machine it is about
+                 # to drive. Empty derives it from the hostname, truncated at the
+                 # first dot -- what ssh's %L expands to. Set only if they differ.
     debug: false
 
   # Auto Spacer configuration
@@ -231,6 +235,31 @@ JSON Lines format:
 {"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"clear_context"}}
 {"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"deactivate"}}
 ```
+
+### The greeting
+
+The server speaks first, and only once: the instant it accepts a connection it
+writes one line naming the machine it is running on, before the client has sent
+anything.
+
+```json
+{"v":1,"ns":"rime.ime","type":"hello","data":{"host":"my-laptop"}}
+```
+
+Past that line the protocol is one-way as before, and a client is free to ignore
+it — everything below works exactly the same whether or not it is read.
+
+It exists for clients reached over an ssh tunnel. Sign into one remote account
+from two laptops and each has a tunnel to a *different* IME, both equally
+reachable and indistinguishable from the far end; the greeting is what lets a
+client keep the one that leads home and close the rest unread. `host` defaults to
+this machine's hostname truncated at the first dot — the value ssh's `%L`
+expands to, so a remote client can compare it against `$LC_RIME_IME_HOST` — and
+is overridable via `copilot/ime_bridge/host_id`.
+
+Reading the greeting and hanging up registers nothing: client state is created
+only by the actions below, so probing a connection cannot disturb whoever is
+using it.
 
 ### Actions
 

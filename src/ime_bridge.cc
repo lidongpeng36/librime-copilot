@@ -4,6 +4,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <set>
 #include <thread>
@@ -27,6 +28,35 @@ constexpr size_t kMaxMessageSize = 4096;
 constexpr size_t kMaxPendingBytes = 1 << 20;  // 1 MiB
 constexpr int kCleanupIntervalSeconds = 60;
 constexpr int kAcceptRetryDelayMs = 100;
+
+// Write everything, tolerating short writes, and never raise SIGPIPE: this runs
+// inside the IME process, so a client that hangs up mid-greeting must not be
+// able to kill it. Linux gets MSG_NOSIGNAL per call; BSD/macOS has no such flag
+// and needs SO_NOSIGPIPE set on the socket instead.
+bool WriteAllNoSignal(int fd, const std::string& data) {
+#ifdef SO_NOSIGPIPE
+  int on = 1;
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#endif
+#ifdef MSG_NOSIGNAL
+  constexpr int kFlags = MSG_NOSIGNAL;
+#else
+  constexpr int kFlags = 0;
+#endif
+  size_t sent = 0;
+  while (sent < data.size()) {
+    ssize_t n = send(fd, data.data() + sent, data.size() - sent, kFlags);
+    if (n > 0) {
+      sent += static_cast<size_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
 
 }  // namespace
 
@@ -184,6 +214,18 @@ void ImeBridgeServer::RunServer() {
 }
 
 void ImeBridgeServer::HandleConnection(int client_fd) {
+  // Greet first, before reading anything. A client that dialled the wrong
+  // tunnel learns so without having sent us a single keystroke, and one that is
+  // merely probing can hang up here having registered nothing: `keys` below is
+  // filled only from ProcessMessage, so a connection that says nothing leaves
+  // no client state and triggers no synthesized reset.
+  if (!WriteAllNoSignal(client_fd, state_.BuildHello())) {
+    // Perfectly ordinary: probes close as soon as they have read the greeting.
+    if (state_.config_.debug) {
+      LOG(INFO) << "[ImeBridge] Client hung up before the greeting was sent";
+    }
+  }
+
   char buffer[kMaxMessageSize];
   std::string message;
   // Which client keys this connection carries. One connection is normally one
@@ -304,6 +346,37 @@ std::string ImeBridgeState::ProcessMessage(const std::string& message) {
 
 std::string ImeBridgeState::MakeClientKey(const std::string& app, const std::string& instance) {
   return app + ":" + instance;
+}
+
+const std::string& ImeBridgeState::HostId() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!host_id_cached_) {
+    host_id_cached_ = true;
+    if (!config_.host_id.empty()) {
+      host_id_cache_ = config_.host_id;
+    } else {
+      char buf[256] = {0};
+      if (gethostname(buf, sizeof(buf) - 1) == 0) {
+        host_id_cache_ = buf;
+        // ssh's %L is the hostname truncated at the first dot, and %L is what
+        // the remote client is comparing against. macOS reports
+        // "name.local" here, so without this every comparison would fail.
+        auto dot = host_id_cache_.find('.');
+        if (dot != std::string::npos) {
+          host_id_cache_.erase(dot);
+        }
+      }
+    }
+  }
+  return host_id_cache_;
+}
+
+std::string ImeBridgeState::BuildHello() const {
+  json msg = {{"v", kProtocolVersion},
+              {"ns", kNamespace},
+              {"type", "hello"},
+              {"data", {{"host", HostId()}}}};
+  return msg.dump() + "\n";
 }
 
 void ImeBridgeState::TouchClient(const std::string& client_key) {
@@ -680,6 +753,7 @@ ImeBridge::ImeBridge(const Ticket& ticket) : CopilotPlugin<ImeBridge>(ticket) {
     config->GetBool("copilot/ime_bridge/debug", &config_.debug);
     config->GetInt("copilot/ime_bridge/client_timeout_minutes", &config_.client_timeout_minutes);
     config->GetInt("copilot/ime_bridge/context_ttl_seconds", &config_.context_ttl_seconds);
+    config->GetString("copilot/ime_bridge/host_id", &config_.host_id);
   }
 
   if (config_.enable) {

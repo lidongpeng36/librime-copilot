@@ -328,6 +328,117 @@ do
   check(not loopback, "while the loopback default, owned by uid 999, is dropped")
 end
 
+-- listen_ports / parse_port_range -----------------------------------------
+-- Real /proc/net/tcp rows. 0100007F is 127.0.0.1; 0A is TCP_LISTEN.
+
+local PROC = [[
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1 0 100 0 0 10 0
+   1: 0100007F:8FB1 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 222 1 0 100 0 0 10 0
+   2: 0100007F:6659 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 333 1 0 100 0 0 10 0
+   3: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 444 1 0 100 0 0 10 0
+   4: 0100007F:9C41 0100007F:8FB1 01 00000000:00000000 00:00000000 00000000  1000        0 555 1 0 100 0 0 10 0
+]]
+
+do
+  local p = endpoint.listen_ports(PROC, 1000)
+  eq(#p, 2, "two loopback listeners owned by uid 1000")
+  eq(p[1], 8080, "0x1F90 = 8080")
+  eq(p[2], 36785, "0x8FB1 = 36785")
+
+  -- Row 2 belongs to another user: dialling it would hand our keystrokes over.
+  -- Row 3 listens on 0.0.0.0 and is root's sshd. Row 4 is ESTABLISHED, not a
+  -- listener -- counting it would make us probe our own outbound connection.
+  p = endpoint.listen_ports(PROC, 1001)
+  eq(#p, 1, "uid 1001 sees only its own")
+  eq(p[1], 26201, "0x6659 = 26201")
+
+  eq(#endpoint.listen_ports(PROC, 4242), 0, "a uid that owns nothing gets nothing")
+  eq(#endpoint.listen_ports("", 1000), 0, "empty content")
+  eq(#endpoint.listen_ports(nil, 1000), 0, "nil content")
+end
+
+do
+  -- The range filter is what keeps long-lived services out of the probe set:
+  -- a bind to port 0 is served from the ephemeral range, so 8080 cannot be a
+  -- tunnel of ours.
+  local p = endpoint.listen_ports(PROC, 1000, 10240, 65535)
+  eq(#p, 1, "8080 is below the ephemeral range and is excluded")
+  eq(p[1], 36785, "only the dynamically allocated port survives")
+
+  eq(#endpoint.listen_ports(PROC, 1000, 40000, 65535), 0,
+     "a port below the range is excluded too")
+end
+
+do
+  local lo, hi = endpoint.parse_port_range("10240\t65535\n")
+  eq(lo, 10240, "range low")
+  eq(hi, 65535, "range high")
+  eq(endpoint.parse_port_range("garbage"), nil, "unparseable means do not filter")
+  eq(endpoint.parse_port_range(nil), nil, "nil means do not filter")
+end
+
+-- lsof_ssh_ports (macOS) ---------------------------------------------------
+
+local LSOF = [[
+COMMAND     PID       USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+ollama    12345 lidongpeng   10u  IPv4 0x1                 0t0  TCP 127.0.0.1:11434 (LISTEN)
+sshd-sess 23456 lidongpeng   12u  IPv4 0x2                 0t0  TCP 127.0.0.1:19527 (LISTEN)
+sshd-sess 23457 lidongpeng   13u  IPv4 0x3                 0t0  TCP 127.0.0.1:56025 (LISTEN)
+node      34567 lidongpeng   24u  IPv6 0x4                 0t0  TCP [::1]:18789 (LISTEN)
+sshd-sess 23458 lidongpeng   14u  IPv4 0x5                 0t0  TCP 127.0.0.1:56025 (LISTEN)
+]]
+
+do
+  local p = endpoint.lsof_ssh_ports(LSOF)
+  eq(#p, 2, "only sshd rows, deduplicated")
+  eq(p[1], 19527, "first ssh forward")
+  eq(p[2], 56025, "second ssh forward")
+
+  -- ollama and node are the whole point of reading the owner on macOS: they
+  -- never get probed.
+  eq(#endpoint.lsof_ssh_ports(""), 0, "empty output")
+  eq(#endpoint.lsof_ssh_ports(nil), 0, "nil output")
+end
+
+-- parse_hello / host_matches ----------------------------------------------
+
+do
+  local decode = function(s)
+    -- Stand-in for vim.json.decode, enough for these fixtures.
+    local host = s:match('"host"%s*:%s*"([^"]*)"')
+    local ns = s:match('"ns"%s*:%s*"([^"]*)"')
+    local ty = s:match('"type"%s*:%s*"([^"]*)"')
+    if not ns then error("bad json") end
+    return { ns = ns, type = ty, data = host and { host = host } or nil }
+  end
+
+  local good = '{"v":1,"ns":"rime.ime","type":"hello","data":{"host":"Lis-MacBook-Pro"}}'
+  eq(endpoint.parse_hello(good, decode), "Lis-MacBook-Pro", "host is extracted")
+
+  eq(endpoint.parse_hello('{"ns":"other","type":"hello","data":{"host":"x"}}', decode), nil,
+     "a greeting from another protocol is not ours")
+  eq(endpoint.parse_hello('{"ns":"rime.ime","type":"ascii","data":{"host":"x"}}', decode), nil,
+     "only type=hello counts")
+  eq(endpoint.parse_hello('{"ns":"rime.ime","type":"hello"}', decode), nil, "no host, no match")
+  eq(endpoint.parse_hello("not json", decode), nil, "a non-JSON line is rejected, not raised")
+  eq(endpoint.parse_hello(good, nil), nil, "without a decoder there is no greeting")
+end
+
+do
+  check(endpoint.host_matches("Lis-MacBook-Pro", "Lis-MacBook-Pro"), "exact match")
+  check(endpoint.host_matches("lis-macbook-pro", "Lis-MacBook-Pro"), "hostnames are case-insensitive")
+  -- gethostname() reports "name.local" on macOS while ssh's %L truncates at the
+  -- first dot; comparing the full forms would fail every time.
+  check(endpoint.host_matches("Lis-MacBook-Pro.local", "Lis-MacBook-Pro"), "domain is ignored")
+  check(endpoint.host_matches("Lis-MacBook-Pro", "Lis-MacBook-Pro.lan"), "on either side")
+
+  check(not endpoint.host_matches("mac-mini", "Lis-MacBook-Pro"), "a different machine is refused")
+  check(not endpoint.host_matches("", "Lis-MacBook-Pro"), "an empty host never matches")
+  check(not endpoint.host_matches(nil, "Lis-MacBook-Pro"), "nil never matches")
+  check(not endpoint.host_matches("Lis-MacBook-Pro", nil), "no expectation, no match")
+end
+
 -- is_tunnel ---------------------------------------------------------------
 -- Gates what init.lua may unlink, so over-matching here means deleting a socket
 -- that is not ours to delete.

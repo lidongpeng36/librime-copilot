@@ -11,8 +11,12 @@
 
 #include "ime_bridge.h"
 
+#include <unistd.h>
+
 #include <chrono>
 #include <thread>
+
+#include <nlohmann/json.hpp>
 
 using rime::ImeBridgePendingAction;
 using rime::ImeBridgeState;
@@ -148,6 +152,55 @@ TEST(ImeBridgeState, ProcessMessageReturnsClientKey) {
   EXPECT_EQ("", s.ProcessMessage(
                     R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
                     R"("data":{"action":"ping"}})"));
+}
+
+// The greeting is what lets a client on a remote host tell whose IME sits at
+// the far end of the tunnel it just dialled. Two laptops sharing one remote
+// account is the case that needs it; without it the second one silently drives
+// the first one's input method.
+
+TEST(ImeBridgeState, HelloCarriesTheConfiguredHostId) {
+  ImeBridgeState s;
+  s.config_.host_id = "my-laptop";
+
+  auto hello = s.BuildHello();
+  ASSERT_FALSE(hello.empty());
+  EXPECT_EQ('\n', hello.back()) << "the greeting must be one JSON Lines record";
+  EXPECT_EQ(std::string::npos, hello.substr(0, hello.size() - 1).find('\n'))
+      << "and must not contain an embedded newline";
+
+  auto msg = nlohmann::json::parse(hello);
+  EXPECT_EQ(1, msg["v"]);
+  EXPECT_EQ("rime.ime", msg["ns"]);
+  EXPECT_EQ("hello", msg["type"]);
+  EXPECT_EQ("my-laptop", msg["data"]["host"]);
+}
+
+TEST(ImeBridgeState, HostIdDefaultsToTheShortHostname) {
+  ImeBridgeState s;  // host_id left empty -> derive from gethostname()
+  auto host = nlohmann::json::parse(s.BuildHello())["data"]["host"].get<std::string>();
+
+  // ssh's %L -- what the remote client compares against -- is the hostname
+  // truncated at the first dot. macOS reports "name.local" from gethostname(),
+  // so a dot surviving here would make every comparison fail.
+  EXPECT_EQ(std::string::npos, host.find('.'))
+      << "derived host id must be the short name, got: " << host;
+
+  char expected[256] = {0};
+  ASSERT_EQ(0, gethostname(expected, sizeof(expected) - 1));
+  std::string want(expected);
+  auto dot = want.find('.');
+  if (dot != std::string::npos) {
+    want.erase(dot);
+  }
+  EXPECT_EQ(want, host);
+}
+
+TEST(ImeBridgeState, HostIdIsStableAcrossCalls) {
+  // Cached behind a mutex and read once per connection; a second call must not
+  // observe a half-populated cache.
+  ImeBridgeState s;
+  EXPECT_EQ(s.BuildHello(), s.BuildHello());
 }
 
 TEST(ImeBridgeState, LastConnectionCloseSynthesizesReset) {
