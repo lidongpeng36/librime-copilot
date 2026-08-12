@@ -119,6 +119,15 @@ copilot:
     # e.g. "测|试" + "test" -> "测 test 试".
     # default: true
     enable_right_space: true
+
+  # tmux pane scrape (for terminal emulators IMK can never answer for; see
+  # "tmux Source" below). default: disabled
+  tmux_source:
+    enabled: true                    # default false; opt-in
+    binary: /opt/homebrew/bin/tmux   # optional; probed if empty
+    socket: ""                       # optional; tmux default socket if empty
+    app_bundle_ids: []               # optional; empty = the built-in terminal list
+    timeout_ms: 50
 ```
 
 ### Prediction Context
@@ -213,6 +222,29 @@ than librime's "last commit only".
     - add left space when needed (`中文|English` boundary),
     - add right space when needed (`English|中文` boundary, controlled by `enable_right_space`).
 - Chinese punctuation never gets auto-surrounded with spaces.
+
+### tmux Source
+
+Terminal emulators built on winit (Alacritty, and every other winit app)
+hardcode `selectedRange = NSNotFound`, so the IMK query in `imk_client.mm` can
+never answer for them. `copilot/tmux_source` scrapes the active tmux pane
+instead, from outside any pane, so it works no matter which winit terminal
+is in front — as long as you are inside a tmux session there.
+
+It is opt-in (`enabled: false` by default) because it reaches into another
+process and scrapes a screen. `app_bundle_ids` gates which frontmost
+applications may trigger the scrape at all; the built-in list already covers
+ten terminals — Alacritty, kitty, WezTerm, Apple Terminal, iTerm2, Ghostty,
+Hyper, Warp, Rio, Tabby. Setting `app_bundle_ids` in config **narrows** that
+gate, it never adds to it — you cannot widen coverage past the built-in list
+from config, only restrict it to a subset.
+
+This source ranks below ImeBridge in the surrounding-text chain (see
+`surrounding_source.h`), so the Neovim client keeps winning while it is in
+insert mode, with no nvim-side configuration change needed. The source
+refuses to answer — falling back to `commit_history` — whenever the answer
+would be a guess: two attached tmux clients tied on activity, the frontmost
+app is not one of the known terminals, or tmux itself cannot be reached.
 
 ## IME Bridge
 

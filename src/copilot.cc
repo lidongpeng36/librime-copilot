@@ -21,6 +21,7 @@
 #include "prediction_context.h"
 #include "select_character.h"
 #include "surrounding_source.h"
+#include "tmux_source.h"
 
 namespace rime {
 
@@ -69,11 +70,11 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
     config->GetBool("copilot/use_surrounding_context", &use_surrounding_context_);
     config->GetInt("copilot/surrounding_context_chars", &surrounding_context_chars_);
     surrounding_context_chars_ = std::clamp(surrounding_context_chars_, 1, 64);
-#ifdef __APPLE__
-    // Ask the IMK hook for as much text as its consumers need — the prediction
-    // context and the re-ranking filter each have their own length. Left at 1
-    // (the boundary character AutoSpacer uses) when neither is on, so the
-    // per-key query stays exactly as cheap as before.
+    // Both the IMK hook and the tmux pane scrape return this many characters
+    // — the prediction context and the re-ranking filter each have their own
+    // length, and both surrounding-text sources should reach equally deep.
+    // Left at 1 (the boundary character AutoSpacer uses) when neither is on,
+    // so the per-key query stays exactly as cheap as before.
     int prefix_chars = use_surrounding_context_ ? surrounding_context_chars_ : 1;
     bool rerank_enable = true;
     int rerank_chars = 8;
@@ -82,8 +83,32 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
     if (rerank_enable) {
       prefix_chars = std::max(prefix_chars, std::clamp(rerank_chars, 1, 64));
     }
+#ifdef __APPLE__
     SetIMKSurroundingPrefixChars(prefix_chars);
 #endif
+
+    TmuxSourceConfig tmux_config;
+    config->GetBool("copilot/tmux_source/enabled", &tmux_config.enabled);
+    config->GetString("copilot/tmux_source/binary", &tmux_config.binary);
+    config->GetString("copilot/tmux_source/socket", &tmux_config.socket);
+    config->GetInt("copilot/tmux_source/timeout_ms", &tmux_config.timeout_ms);
+    tmux_config.timeout_ms = std::clamp(tmux_config.timeout_ms, 5, 500);
+    tmux_config.prefix_chars = prefix_chars;
+    // Left empty, ConfigureTmuxSource substitutes DefaultTerminalBundleIds().
+    // A schema that does set the list is narrowing the gate, never widening it
+    // past what it wrote.
+    if (auto list = config->GetList("copilot/tmux_source/app_bundle_ids")) {
+      for (size_t i = 0; i < list->size(); ++i) {
+        if (auto item = list->GetValueAt(i)) {
+          string bundle_id;
+          if (item->GetString(&bundle_id)) {
+            tmux_config.app_bundle_ids.push_back(bundle_id);
+          }
+        }
+      }
+    }
+    ConfigureTmuxSource(tmux_config);
+
     if (auto list = config->GetList("copilot/disabled_plugins")) {
       for (size_t i = 0; i < list->size(); ++i) {
         if (auto item = list->GetValueAt(i)) {

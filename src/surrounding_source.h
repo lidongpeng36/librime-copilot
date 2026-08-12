@@ -13,6 +13,7 @@
 namespace rime {
 
 // Priority: IMK client (macOS system query) > ImeBridge client (e.g. Neovim) >
+// tmux pane scrape (terminal emulators the IMK query can never answer for) >
 // nullopt. A nullopt result means no real context is available and the caller
 // must fall back to its own history.
 std::optional<SurroundingText> GetSurroundingContext();
