@@ -32,17 +32,19 @@ endif()
 aux_source_directory(src copilot_src)
 
 # `aux_source_directory` may collect Objective-C++ source on non-Apple hosts.
-# Keep IMK integration strictly macOS-only to avoid Linux CI trying to compile
-# `imk_client.mm` without Objective-C++ toolchain (cc1objplus).
-list(REMOVE_ITEM copilot_src src/imk_client.mm)
+# Keep IMK/AppKit integration strictly macOS-only to avoid Linux CI trying to
+# compile `.mm` sources without an Objective-C++ toolchain (cc1objplus).
+list(REMOVE_ITEM copilot_src src/imk_client.mm src/frontmost_app.mm)
 
 set(LINK_LIBS llama nlohmann_json::nlohmann_json)
 if (APPLE)
   find_library(IOKIT_LIBRARY IOKit REQUIRED)
   find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
-  list(APPEND LINK_LIBS ${IOKIT_LIBRARY} ${COREFOUNDATION_LIBRARY})
-  # ObjC++ source for IMK client access (not picked up by aux_source_directory)
-  list(APPEND copilot_src src/imk_client.mm)
+  find_library(APPKIT_LIBRARY AppKit REQUIRED)
+  list(APPEND LINK_LIBS ${IOKIT_LIBRARY} ${COREFOUNDATION_LIBRARY} ${APPKIT_LIBRARY})
+  # ObjC++ source for IMK client access and frontmost-app queries (not picked
+  # up by aux_source_directory)
+  list(APPEND copilot_src src/imk_client.mm src/frontmost_app.mm)
 endif()
 
 add_library(rime-copilot-objs OBJECT ${copilot_src})
