@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <thread>
 
 #include <rime/common.h>
 
@@ -36,11 +37,18 @@ std::string ResolveBinary(const std::string& configured) {
   if (g_binary_resolved) {
     return g_resolved_binary;
   }
-  const char* candidates[] = {"/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"};
   std::string found;
-  if (!configured.empty() && access(configured.c_str(), X_OK) == 0) {
-    found = configured;
+  if (!configured.empty()) {
+    // An explicit path is a deliberate choice -- a wrapper, a different
+    // install, one bound to a different socket namespace. Honor it or fail;
+    // silently substituting a well-known path would mean reading a different
+    // tmux server's panes and handing that text to AutoSpacer, which is
+    // exactly the guessing this feature must refuse to do.
+    if (access(configured.c_str(), X_OK) == 0) {
+      found = configured;
+    }
   } else {
+    const char* candidates[] = {"/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"};
     for (const char* c : candidates) {
       if (access(c, X_OK) == 0) {
         found = c;
@@ -73,6 +81,11 @@ bool RunTmux(const std::string& bin, const std::vector<std::string>& args, int t
   posix_spawn_file_actions_adddup2(&actions, devnull, STDIN_FILENO);
   posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
   posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+  // dup2 leaves the original fds[1] number open in the child alongside its
+  // duplicate on stdout. Close it: if anything the child hands off to ever
+  // inherited and held that extra reference, the parent would never see EOF
+  // on the pipe and would sit out the full deadline for nothing.
+  posix_spawn_file_actions_addclose(&actions, fds[1]);
   posix_spawn_file_actions_addclose(&actions, fds[0]);
 
   std::vector<char*> argv;
@@ -125,13 +138,38 @@ bool RunTmux(const std::string& bin, const std::vector<std::string>& args, int t
   if (timed_out) {
     kill(pid, SIGKILL);
   }
+
+  // A raw blocking `waitpid` here could stall the input thread with no
+  // bound: a poll/read error other than EINTR exits the loop above with
+  // `timed_out` still false and no guarantee the child has actually exited.
+  // posix_spawn above is called with a null attrp (no
+  // POSIX_SPAWN_SETSIGDEF), so the child inherits the IME's signal
+  // dispositions -- if SIGPIPE is ignored there, a broken pipe alone won't
+  // kill it. Poll for exit with WNOHANG up to the original deadline; only
+  // past that force it, and the final wait is bounded because a killed
+  // process reaps essentially immediately.
   int status = 0;
-  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  pid_t reaped = 0;
+  while (true) {
+    reaped = waitpid(pid, &status, timed_out ? 0 : WNOHANG);
+    if (reaped == pid) break;
+    if (reaped < 0) {
+      if (errno == EINTR) continue;
+      break;  // e.g. ECHILD: nothing left to wait for
+    }
+    // reaped == 0: still running and not timed out yet.
+    if (Clock::now() >= deadline) {
+      kill(pid, SIGKILL);
+      timed_out = true;
+      continue;  // next iteration blocks; SIGKILL guarantees a fast exit
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
+
   if (timed_out) {
     return false;
   }
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  return reaped == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 }  // namespace
@@ -162,6 +200,16 @@ void ConfigureTmuxSource(const TmuxSourceConfig& config) {
   if (g_config.app_bundle_ids.empty()) {
     g_config.app_bundle_ids = DefaultTerminalBundleIds();
   }
+  // Task 4 clamps at the config-read site too, but this function is the
+  // public API and RunTmux is the deadline owner, so the clamp belongs here
+  // as well -- the same belt-and-suspenders pattern as
+  // copilot.cc's surrounding_context_chars clamp plus
+  // imk_client.mm's SetIMKSurroundingPrefixChars clamp. Unclamped, 0 or
+  // negative makes every query declare an instant timeout (feature
+  // permanently dead, spawn+kill every 5s forever), and a large value turns
+  // into a synchronous IME freeze on a keystroke.
+  g_config.timeout_ms = std::clamp(g_config.timeout_ms, 1, 500);
+  g_config.prefix_chars = std::clamp(g_config.prefix_chars, 1, 64);
   g_resolved_binary.clear();
   g_binary_resolved = false;
   g_backoff_until = Clock::time_point{};
@@ -187,6 +235,13 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   // handed the terminal's text. ConfigureTmuxSource guarantees the list is
   // non-empty, so a lookup miss means "not a terminal", not "unconfigured".
   const std::string frontmost = FrontmostBundleId();
+  // An empty id means "unknown app" (always true on non-Apple, and possible
+  // on Apple too), not "matches everything". Without this check, a user
+  // config with one empty app_bundle_ids entry -- or FrontmostBundleId()
+  // simply not knowing -- would turn the gate into "always pass".
+  if (frontmost.empty()) {
+    return std::nullopt;
+  }
   if (std::find(config.app_bundle_ids.begin(), config.app_bundle_ids.end(), frontmost) ==
       config.app_bundle_ids.end()) {
     return std::nullopt;
@@ -202,24 +257,7 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
     return std::nullopt;
   }
 
-  // No -t anywhere: display-message and capture-pane must resolve the *same*
-  // current pane, and letting tmux decide that is the entire point.
-  std::vector<std::string> args;
-  if (!config.socket.empty()) {
-    args.push_back("-S");
-    args.push_back(config.socket);
-  }
-  args.push_back("list-clients");
-  args.push_back("-F");
-  args.push_back("CLI|#{client_activity}");
-  args.push_back(";");
-  args.push_back("display-message");
-  args.push_back("-p");
-  args.push_back("-F");
-  args.push_back("CUR|#{pane_id}|#{cursor_x}|#{cursor_y}|#{pane_width}");
-  args.push_back(";");
-  args.push_back("capture-pane");
-  args.push_back("-p");
+  const std::vector<std::string> args = tmux_detail::BuildTmuxArgs(config.socket);
 
   std::string out;
   if (!RunTmux(binary, args, config.timeout_ms, &out)) {
@@ -247,11 +285,7 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
     return std::nullopt;
   }
 
-  // The pane id MUST be in the key: AutoSpacer indexes per-client state by it
-  // (src/auto_spacer.cc:282-286), so a constant key would let one pane's
-  // spacing state bleed into the next.
-  const std::string socket_tag = config.socket.empty() ? "default" : config.socket;
-  const std::string client_key = "tmux:" + socket_tag + ":" + snap->pane_id;
+  const std::string client_key = tmux_detail::MakeClientKey(config.socket, snap->pane_id);
   return SurroundingText{ctx->before, ctx->after, client_key};
 }
 

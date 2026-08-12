@@ -153,3 +153,60 @@ TEST(TmuxAmbiguity, TiedActivityRefuses) {
   // cannot tell which terminal the keyboard is pointed at.
   EXPECT_TRUE(ClientsAreAmbiguous({1786506891, 1786506891}));
 }
+
+TEST(TmuxArgs, NoSocketOmitsDashS) {
+  auto args = BuildTmuxArgs("");
+  EXPECT_EQ(std::find(args.begin(), args.end(), "-S"), args.end());
+}
+
+TEST(TmuxArgs, SocketAddsDashSAsItsOwnPairOfElements) {
+  auto args = BuildTmuxArgs("/tmp/mysock");
+  ASSERT_GE(args.size(), 2u);
+  EXPECT_EQ(args[0], "-S");
+  EXPECT_EQ(args[1], "/tmp/mysock");
+}
+
+TEST(TmuxArgs, EachSemicolonIsItsOwnArgvElement) {
+  // tmux's command separator must never be glued onto an adjacent token, or
+  // it stops being recognized as a separator at all.
+  auto args = BuildTmuxArgs("");
+  int semicolons = 0;
+  for (const auto& a : args) {
+    if (a == ";") ++semicolons;
+    EXPECT_EQ(a.find(';'), a == ";" ? 0u : std::string::npos);
+  }
+  EXPECT_EQ(semicolons, 2);
+}
+
+TEST(TmuxArgs, NoDashTAnywhere) {
+  // display-message and capture-pane must resolve the *same* current pane;
+  // an explicit -t would defeat that.
+  auto args = BuildTmuxArgs("/tmp/mysock");
+  EXPECT_EQ(std::find(args.begin(), args.end(), "-t"), args.end());
+}
+
+TEST(TmuxArgs, ContainsTheThreeSubcommandsInOrder) {
+  auto args = BuildTmuxArgs("");
+  auto lc = std::find(args.begin(), args.end(), "list-clients");
+  auto dm = std::find(args.begin(), args.end(), "display-message");
+  auto cp = std::find(args.begin(), args.end(), "capture-pane");
+  ASSERT_NE(lc, args.end());
+  ASSERT_NE(dm, args.end());
+  ASSERT_NE(cp, args.end());
+  EXPECT_LT(lc, dm);
+  EXPECT_LT(dm, cp);
+}
+
+TEST(TmuxClientKey, EmptySocketUsesDefaultTag) {
+  EXPECT_EQ(MakeClientKey("", "%3"), "tmux:default:%3");
+}
+
+TEST(TmuxClientKey, EmbedsTheConfiguredSocket) {
+  EXPECT_EQ(MakeClientKey("/tmp/mysock", "%3"), "tmux:/tmp/mysock:%3");
+}
+
+TEST(TmuxClientKey, DifferentPaneIdsProduceDifferentKeys) {
+  // The pane id must be load-bearing: AutoSpacer indexes per-client state by
+  // this key, so two panes sharing a key would bleed spacing state together.
+  EXPECT_NE(MakeClientKey("", "%1"), MakeClientKey("", "%2"));
+}

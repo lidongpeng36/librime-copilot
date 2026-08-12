@@ -205,5 +205,39 @@ inline std::optional<Context> ExtractContext(const Snapshot& snap, int prefix_ch
   return ctx;
 }
 
+// The one-exec argv: marker-tagged lines first (list-clients), then the
+// cursor header, then the raw pane dump — in that order so a pane dump line
+// that happens to start with "CLI|" or "CUR|" can never be mistaken for a
+// marker (ParseTmuxOutput only treats those prefixes specially before the
+// header is seen). No `-t` anywhere: display-message and capture-pane must
+// resolve the *same* current pane, and letting tmux decide that is the point.
+inline std::vector<std::string> BuildTmuxArgs(const std::string& socket) {
+  std::vector<std::string> args;
+  if (!socket.empty()) {
+    args.push_back("-S");
+    args.push_back(socket);
+  }
+  args.push_back("list-clients");
+  args.push_back("-F");
+  args.push_back("CLI|#{client_activity}");
+  args.push_back(";");
+  args.push_back("display-message");
+  args.push_back("-p");
+  args.push_back("-F");
+  args.push_back("CUR|#{pane_id}|#{cursor_x}|#{cursor_y}|#{pane_width}");
+  args.push_back(";");
+  args.push_back("capture-pane");
+  args.push_back("-p");
+  return args;
+}
+
+// The pane id MUST be in the key: AutoSpacer indexes per-client state by it
+// (src/auto_spacer.cc:282-286), so a constant key would let one pane's
+// spacing state bleed into the next.
+inline std::string MakeClientKey(const std::string& socket, const std::string& pane_id) {
+  const std::string socket_tag = socket.empty() ? "default" : socket;
+  return "tmux:" + socket_tag + ":" + pane_id;
+}
+
 }  // namespace tmux_detail
 }  // namespace rime
