@@ -26,6 +26,10 @@ struct Snapshot {
   int pane_width = 0;
   std::vector<std::string> rows;           // capture-pane -p, one row per entry
   std::vector<long long> client_activity;  // one per attached client
+  // tmux's global `focus-events`. Load-bearing whenever more than one client
+  // is attached: it is what makes tmux's "current client" track macOS window
+  // focus, and it is *off* by default. See JudgeClients.
+  bool focus_events = false;
 };
 
 struct Context {
@@ -122,9 +126,18 @@ inline std::string NormalizeBlanks(const std::string& s) {
   return out;
 }
 
-// `CLI|<activity>` lines, then one `CUR|<pane>|<x>|<y>|<width>` header, then
-// the pane dump. Rows after the header are taken verbatim, so a row that
-// happens to start with "CUR|" stays a row.
+// `#{focus-events}` renders as tmux's boolean format ("1"/"0"), but
+// `show-options`-style spellings exist for choice options and older tmux may
+// not know the variable at all (rendering it empty). Anything we do not
+// positively recognize as "on" counts as off, which only ever costs a refusal.
+inline bool ParseTmuxFlag(const std::string& value) {
+  return value == "1" || value == "on" || value == "true";
+}
+
+// `CLI|<activity>` and `FOC|<flag>` lines, then one
+// `CUR|<pane>|<x>|<y>|<width>` header, then the pane dump. Rows after the
+// header are taken verbatim, so a row that happens to start with "CUR|" stays
+// a row.
 inline std::optional<Snapshot> ParseTmuxOutput(const std::string& raw) {
   Snapshot snap;
   bool saw_header = false;
@@ -144,6 +157,10 @@ inline std::optional<Snapshot> ParseTmuxOutput(const std::string& raw) {
     }
     if (line.rfind("CLI|", 0) == 0) {
       snap.client_activity.push_back(std::atoll(line.c_str() + 4));
+      continue;
+    }
+    if (line.rfind("FOC|", 0) == 0) {
+      snap.focus_events = ParseTmuxFlag(line.substr(4));
       continue;
     }
     if (line.rfind("CUR|", 0) == 0) {
@@ -179,8 +196,70 @@ inline bool ClientsAreAmbiguous(std::vector<long long> activity) {
   return activity[0] == activity[1];
 }
 
+// Whether the attached-client list lets us believe the pane tmux resolved is
+// the one the keyboard is pointed at. Deliberately separate from
+// `ClientsAreAmbiguous`: "no client at all" is absence, not ambiguity, and
+// folding it into the same predicate is what let the detached-session case
+// slip through.
+enum class ClientVerdict {
+  kAccept,
+  kNoClientAttached,
+  kFocusEventsOff,
+  kAmbiguousClients,
+};
+
+inline const char* DescribeVerdict(ClientVerdict verdict) {
+  switch (verdict) {
+    case ClientVerdict::kAccept:
+      return "accepted";
+    case ClientVerdict::kNoClientAttached:
+      return "no attached client; display-message would answer from a detached session";
+    case ClientVerdict::kFocusEventsOff:
+      return "multiple clients with focus-events off; tmux's current client does not track "
+             "window focus";
+    case ClientVerdict::kAmbiguousClients:
+      return "attached clients tied on activity";
+  }
+  return "unknown";
+}
+
+inline ClientVerdict JudgeClients(const std::vector<long long>& activity, bool focus_events) {
+  // An empty list means nothing is attached to this server. `display-message
+  // -p` with no target still answers, falling back to the most-recently-used
+  // session, so we would hand AutoSpacer a pane nobody is looking at -- e.g.
+  // the user typing at a bare shell while a tmux session sits detached.
+  if (activity.empty()) {
+    return ClientVerdict::kNoClientAttached;
+  }
+  if (activity.size() > 1) {
+    // With >1 client tmux answers for the most recently active one. That
+    // tracks macOS window focus only because `focus-events on` makes tmux
+    // enable DECSET 1004, so focusing a window writes a focus sequence to that
+    // client's tty and bumps its client_activity. focus-events is off by
+    // default; without it the "most recent" client is merely whichever one was
+    // last typed into, and answering from it is exactly the cross-talk this
+    // source exists to avoid -- confidently, which is worse than a tie.
+    if (!focus_events) {
+      return ClientVerdict::kFocusEventsOff;
+    }
+    if (ClientsAreAmbiguous(activity)) {
+      return ClientVerdict::kAmbiguousClients;
+    }
+  }
+  return ClientVerdict::kAccept;
+}
+
 inline std::optional<Context> ExtractContext(const Snapshot& snap, int prefix_chars) {
   if (snap.cursor_y < 0 || snap.cursor_y >= static_cast<int>(snap.rows.size())) {
+    return std::nullopt;
+  }
+  // cursor_x is a pane-relative display column, so pane_width bounds it. The
+  // bound is not cosmetic: SliceBeforeColumn materialises the blanks tmux
+  // trimmed off the row end, so an unbounded column out of a malformed header
+  // (`std::atoi` will happily return 2000000000) becomes a multi-gigabyte
+  // append on the input thread. `== pane_width` is allowed: the caret legally
+  // sits one past the last cell just before a wrap.
+  if (snap.pane_width <= 0 || snap.cursor_x < 0 || snap.cursor_x > snap.pane_width) {
     return std::nullopt;
   }
   const std::string& row = snap.rows[snap.cursor_y];
@@ -190,7 +269,7 @@ inline std::optional<Context> ExtractContext(const Snapshot& snap, int prefix_ch
     // Column 0 is either a fresh line or the continuation of a wrapped one.
     // Only a row above that fills the pane exactly is a wrap; treating a short
     // row as adjacent would glue two unrelated lines together.
-    if (snap.cursor_y > 0 && snap.pane_width > 0) {
+    if (snap.cursor_y > 0) {
       const std::string& prev = snap.rows[snap.cursor_y - 1];
       if (DisplayWidthOf(prev) == snap.pane_width) before = prev;
     }
@@ -205,12 +284,16 @@ inline std::optional<Context> ExtractContext(const Snapshot& snap, int prefix_ch
   return ctx;
 }
 
-// The one-exec argv: marker-tagged lines first (list-clients), then the
-// cursor header, then the raw pane dump — in that order so a pane dump line
-// that happens to start with "CLI|" or "CUR|" can never be mistaken for a
-// marker (ParseTmuxOutput only treats those prefixes specially before the
-// header is seen). No `-t` anywhere: display-message and capture-pane must
-// resolve the *same* current pane, and letting tmux decide that is the point.
+// The one-exec argv: marker-tagged lines first (list-clients, focus-events),
+// then the cursor header, then the raw pane dump — in that order so a pane
+// dump line that happens to start with "CLI|", "FOC|" or "CUR|" can never be
+// mistaken for a marker (ParseTmuxOutput only treats those prefixes specially
+// before the header is seen). No `-t` anywhere: display-message and
+// capture-pane must resolve the *same* current pane, and letting tmux decide
+// that is the point.
+//
+// focus-events rides along in this same exec on purpose: a second spawn to
+// read one option would double the per-key cost of the whole feature.
 inline std::vector<std::string> BuildTmuxArgs(const std::string& socket) {
   std::vector<std::string> args;
   if (!socket.empty()) {
@@ -220,6 +303,11 @@ inline std::vector<std::string> BuildTmuxArgs(const std::string& socket) {
   args.push_back("list-clients");
   args.push_back("-F");
   args.push_back("CLI|#{client_activity}");
+  args.push_back(";");
+  args.push_back("display-message");
+  args.push_back("-p");
+  args.push_back("-F");
+  args.push_back("FOC|#{focus-events}");
   args.push_back(";");
   args.push_back("display-message");
   args.push_back("-p");

@@ -275,8 +275,9 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   }
 
   // Transient, so no backoff: refuse this one query and try again next time.
-  if (tmux_detail::ClientsAreAmbiguous(snap->client_activity)) {
-    DLOG(INFO) << "[tmux] Attached clients tied on activity; refusing to guess";
+  const auto verdict = tmux_detail::JudgeClients(snap->client_activity, snap->focus_events);
+  if (verdict != tmux_detail::ClientVerdict::kAccept) {
+    DLOG(INFO) << "[tmux] Refusing to answer: " << tmux_detail::DescribeVerdict(verdict);
     return std::nullopt;
   }
 

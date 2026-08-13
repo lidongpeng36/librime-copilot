@@ -33,6 +33,44 @@ TEST(TmuxParse, MissingHeaderIsRejected) {
   EXPECT_FALSE(ParseTmuxOutput("CLI|123\nno header here\n").has_value());
 }
 
+TEST(TmuxParse, ReadsTheFocusEventsMarker) {
+  auto on = ParseTmuxOutput("CLI|1\nFOC|1\nCUR|%0|1|0|40\nx\n");
+  ASSERT_TRUE(on.has_value());
+  EXPECT_TRUE(on->focus_events);
+
+  auto off = ParseTmuxOutput("CLI|1\nFOC|0\nCUR|%0|1|0|40\nx\n");
+  ASSERT_TRUE(off.has_value());
+  EXPECT_FALSE(off->focus_events);
+}
+
+TEST(TmuxParse, FocusEventsDefaultsToOffWhenTmuxDoesNotReportIt) {
+  // An older tmux that does not know #{focus-events} renders it empty; the
+  // marker line may also be missing entirely. Either way we must not assume on.
+  auto empty_value = ParseTmuxOutput("CLI|1\nFOC|\nCUR|%0|1|0|40\nx\n");
+  ASSERT_TRUE(empty_value.has_value());
+  EXPECT_FALSE(empty_value->focus_events);
+
+  auto absent = ParseTmuxOutput("CLI|1\nCUR|%0|1|0|40\nx\n");
+  ASSERT_TRUE(absent.has_value());
+  EXPECT_FALSE(absent->focus_events);
+}
+
+TEST(TmuxParse, AcceptsBothSpellingsOfAnOnFlag) {
+  EXPECT_TRUE(ParseTmuxFlag("1"));
+  EXPECT_TRUE(ParseTmuxFlag("on"));
+  EXPECT_FALSE(ParseTmuxFlag("0"));
+  EXPECT_FALSE(ParseTmuxFlag("off"));
+  EXPECT_FALSE(ParseTmuxFlag(""));
+}
+
+TEST(TmuxParse, APaneRowStartingWithTheFocusMarkerIsStillARow) {
+  auto snap = ParseTmuxOutput("CUR|%1|0|0|80\nFOC|1\n");
+  ASSERT_TRUE(snap.has_value());
+  EXPECT_FALSE(snap->focus_events);  // the marker came after the header
+  ASSERT_EQ(snap->rows.size(), 1u);
+  EXPECT_EQ(snap->rows[0], "FOC|1");
+}
+
 TEST(TmuxParse, RowThatLooksLikeAHeaderIsStillARow) {
   auto snap = ParseTmuxOutput("CUR|%1|0|0|80\nCUR|%9|3|3|80\n");
   ASSERT_TRUE(snap.has_value());
@@ -139,9 +177,55 @@ TEST(TmuxContext, CursorRowOutOfRangeIsRefused) {
   EXPECT_FALSE(ExtractContext(snap, 1).has_value());
 }
 
+TEST(TmuxContext, CursorColumnPastThePaneWidthIsRefused) {
+  // `std::atoi` on a malformed header will return anything at all, and
+  // SliceBeforeColumn materialises the blanks tmux trimmed -- so an unbounded
+  // column is a multi-gigabyte allocation on the input thread.
+  Snapshot snap;
+  snap.cursor_x = 2000000000;
+  snap.cursor_y = 0;
+  snap.pane_width = 40;
+  snap.rows = {"hello"};
+  EXPECT_FALSE(ExtractContext(snap, 1).has_value());
+
+  snap.cursor_x = 41;
+  EXPECT_FALSE(ExtractContext(snap, 1).has_value());
+}
+
+TEST(TmuxContext, CursorColumnExactlyAtThePaneWidthIsAccepted) {
+  // The caret legally sits one past the last cell just before a wrap.
+  Snapshot snap;
+  snap.cursor_x = 5;
+  snap.cursor_y = 0;
+  snap.pane_width = 5;
+  snap.rows = {"hello"};
+  auto ctx = ExtractContext(snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->before, "o");
+}
+
+TEST(TmuxContext, NegativeCursorColumnIsRefused) {
+  Snapshot snap;
+  snap.cursor_x = -1;
+  snap.cursor_y = 0;
+  snap.pane_width = 40;
+  snap.rows = {"hello"};
+  EXPECT_FALSE(ExtractContext(snap, 1).has_value());
+}
+
+TEST(TmuxContext, NonPositivePaneWidthIsRefused) {
+  // A zero width is what an unparseable header field decays to; without a
+  // width there is nothing to bound the column against.
+  Snapshot snap;
+  snap.cursor_x = 3;
+  snap.cursor_y = 0;
+  snap.pane_width = 0;
+  snap.rows = {"hello"};
+  EXPECT_FALSE(ExtractContext(snap, 1).has_value());
+}
+
 TEST(TmuxAmbiguity, SingleClientIsNeverAmbiguous) {
   EXPECT_FALSE(ClientsAreAmbiguous({1786506891}));
-  EXPECT_FALSE(ClientsAreAmbiguous({}));
 }
 
 TEST(TmuxAmbiguity, DistinctActivityPicksAWinner) {
@@ -152,6 +236,34 @@ TEST(TmuxAmbiguity, TiedActivityRefuses) {
   // client_activity has one-second granularity; a tie means we genuinely
   // cannot tell which terminal the keyboard is pointed at.
   EXPECT_TRUE(ClientsAreAmbiguous({1786506891, 1786506891}));
+}
+
+TEST(TmuxVerdict, OneAttachedClientIsAccepted) {
+  // A single client is unambiguous whatever focus-events says -- there is
+  // nothing for tmux to pick between.
+  EXPECT_EQ(JudgeClients({1786506891}, true), ClientVerdict::kAccept);
+  EXPECT_EQ(JudgeClients({1786506891}, false), ClientVerdict::kAccept);
+}
+
+TEST(TmuxVerdict, NoAttachedClientIsRefused) {
+  // `display-message -p` with no target still answers by falling back to the
+  // most-recently-used session, so an empty client list means we would be
+  // reading a pane nobody is looking at: the user types at a bare shell while
+  // a tmux session sits detached, and AutoSpacer gets the detached pane.
+  EXPECT_EQ(JudgeClients({}, true), ClientVerdict::kNoClientAttached);
+  EXPECT_EQ(JudgeClients({}, false), ClientVerdict::kNoClientAttached);
+}
+
+TEST(TmuxVerdict, MultipleClientsWithFocusEventsOffAreRefused) {
+  // Distinct activity timestamps look decisive, but with focus-events off they
+  // track "last typed into", not "focused" -- so tmux answers confidently from
+  // the wrong pane. That is worse than a tie, not better.
+  EXPECT_EQ(JudgeClients({1786506891, 1786506800}, false), ClientVerdict::kFocusEventsOff);
+}
+
+TEST(TmuxVerdict, MultipleClientsWithFocusEventsOnFollowActivity) {
+  EXPECT_EQ(JudgeClients({1786506891, 1786506800}, true), ClientVerdict::kAccept);
+  EXPECT_EQ(JudgeClients({1786506891, 1786506891}, true), ClientVerdict::kAmbiguousClients);
 }
 
 TEST(TmuxArgs, NoSocketOmitsDashS) {
@@ -175,7 +287,27 @@ TEST(TmuxArgs, EachSemicolonIsItsOwnArgvElement) {
     if (a == ";") ++semicolons;
     EXPECT_EQ(a.find(';'), a == ";" ? 0u : std::string::npos);
   }
-  EXPECT_EQ(semicolons, 2);
+  EXPECT_EQ(semicolons, 3);
+}
+
+TEST(TmuxArgs, AsksForFocusEventsInTheSameExec) {
+  // A second spawn to read one option would double the per-key cost.
+  auto args = BuildTmuxArgs("");
+  EXPECT_NE(std::find(args.begin(), args.end(), "FOC|#{focus-events}"), args.end());
+}
+
+TEST(TmuxArgs, EveryMarkerIsEmittedBeforeThePaneDump) {
+  // ParseTmuxOutput only treats CLI|/FOC| specially before the CUR header, so
+  // a pane row that starts with a marker stays a row. That only holds if the
+  // argv really does put both markers ahead of capture-pane.
+  auto args = BuildTmuxArgs("");
+  auto cli = std::find(args.begin(), args.end(), "CLI|#{client_activity}");
+  auto foc = std::find(args.begin(), args.end(), "FOC|#{focus-events}");
+  auto cur = std::find(args.begin(), args.end(),
+                       "CUR|#{pane_id}|#{cursor_x}|#{cursor_y}|#{pane_width}");
+  ASSERT_NE(cur, args.end());
+  EXPECT_LT(cli, cur);
+  EXPECT_LT(foc, cur);
 }
 
 TEST(TmuxArgs, NoDashTAnywhere) {
