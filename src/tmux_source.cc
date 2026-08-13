@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 
@@ -31,6 +32,14 @@ TmuxSourceConfig g_config;
 std::string g_resolved_binary;  // "" = not resolved yet or resolved to nothing
 bool g_binary_resolved = false;
 Clock::time_point g_backoff_until;
+
+// Per-key-event memo. See InvalidateTmuxSnapshot in tmux_source.h for why the
+// generation counter is the invalidation trigger rather than a clock.
+uint64_t g_generation = 1;
+bool g_snapshot_valid = false;
+uint64_t g_snapshot_generation = 0;
+std::string g_snapshot_frontmost;
+std::optional<SurroundingText> g_snapshot;
 
 // Test seams; null means "use the real thing". Read under g_mutex is
 // unnecessary -- tests install them before any query runs.
@@ -265,26 +274,34 @@ void ConfigureTmuxSource(const TmuxSourceConfig& config) {
   // imk_client.mm's SetIMKSurroundingPrefixChars clamp. Unclamped, 0 or
   // negative makes every query declare an instant timeout (feature
   // permanently dead, spawn+kill every 5s forever), and a large value turns
-  // into a synchronous IME freeze on a keystroke.
-  g_config.timeout_ms = std::clamp(g_config.timeout_ms, 1, 500);
+  // into a synchronous IME freeze on a keystroke. The lower bound matches
+  // copilot.cc's clamp exactly; two different floors would mean the effective
+  // minimum depended on which one ran last.
+  g_config.timeout_ms = std::clamp(g_config.timeout_ms, kMinTimeoutMs, kMaxTimeoutMs);
   g_config.prefix_chars = std::clamp(g_config.prefix_chars, 1, 64);
   g_resolved_binary.clear();
   g_binary_resolved = false;
   g_backoff_until = Clock::time_point{};
+  // Anything cached was produced under the old config -- a different socket,
+  // depth, or gate.
+  ++g_generation;
+  g_snapshot_valid = false;
+  g_snapshot.reset();
+}
+
+void InvalidateTmuxSnapshot() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  ++g_generation;
+  g_snapshot_valid = false;
+  g_snapshot.reset();
 }
 
 std::optional<SurroundingText> GetTmuxSurroundingText() {
-  TmuxSourceConfig config;
-  std::string binary;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_config.enabled) {
       return std::nullopt;
     }
-    if (Clock::now() < g_backoff_until) {
-      return std::nullopt;
-    }
-    config = g_config;
   }
 
   // The IME process is never frontmost while handling a key event, so this is
@@ -292,6 +309,10 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   // answers NSNotFound -- Electron, Java, assorted web inputs -- would be
   // handed the terminal's text. ConfigureTmuxSource guarantees the list is
   // non-empty, so a lookup miss means "not a terminal", not "unconfigured".
+  //
+  // Queried before the memo is consulted, and folded into the memo's key: it
+  // is far cheaper than a spawn, and it means a snapshot can never survive
+  // into a different application even if the generation somehow did.
   const std::string frontmost = Frontmost();
   // An empty id means "unknown app" (always true on non-Apple, and possible
   // on Apple too), not "matches everything". Without this check, a user
@@ -300,25 +321,86 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   if (frontmost.empty()) {
     return std::nullopt;
   }
-  if (std::find(config.app_bundle_ids.begin(), config.app_bundle_ids.end(), frontmost) ==
-      config.app_bundle_ids.end()) {
-    return std::nullopt;
-  }
 
+  std::string binary;
+  std::string configured_binary;
+  std::string socket;
+  int timeout_ms = 0;
+  int prefix_chars = 1;
+  uint64_t generation = 0;
+  bool probed_now = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    ResolveBinaryLocked(config.binary, &binary);
+    // The gate runs against the live list rather than a copy: this is the hot
+    // path, and deep-copying ten bundle ids on every keystroke in every
+    // application -- before even knowing the app is a terminal -- was pure
+    // waste.
+    if (std::find(g_config.app_bundle_ids.begin(), g_config.app_bundle_ids.end(), frontmost) ==
+        g_config.app_bundle_ids.end()) {
+      return std::nullopt;
+    }
+    if (g_snapshot_valid && g_snapshot_generation == g_generation &&
+        g_snapshot_frontmost == frontmost) {
+      return g_snapshot;
+    }
+    if (Clock::now() < g_backoff_until) {
+      return std::nullopt;
+    }
+    configured_binary = g_config.binary;
+    probed_now = ResolveBinaryLocked(configured_binary, &binary);
+    socket = g_config.socket;
+    timeout_ms = g_config.timeout_ms;
+    prefix_chars = g_config.prefix_chars;
+    generation = g_generation;
   }
+
+  // Install a result for this generation. Skipped if a key event bumped the
+  // generation while the query was in flight: that snapshot describes a pane
+  // state the new generation has not vouched for, and a stale pane handed to
+  // AutoSpacer is exactly the cross-talk this source exists to prevent.
+  auto remember = [&](std::optional<SurroundingText> value) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_generation == generation) {
+      g_snapshot = value;
+      g_snapshot_generation = generation;
+      g_snapshot_frontmost = frontmost;
+      g_snapshot_valid = true;
+    }
+    return value;
+  };
+
   if (binary.empty()) {
+    if (probed_now) {
+      // One-shot: the probe result is cached until the next reconfigure, so
+      // this cannot fire per keystroke. Without it a user whose tmux is not at
+      // one of these paths enables the feature and gets nothing at all, with
+      // no way to tell whether the gate, the binary or the parse failed.
+      std::string paths;
+      if (!configured_binary.empty()) {
+        paths = configured_binary + " (from copilot/tmux_source/binary)";
+      } else {
+        for (const auto& candidate : tmux_detail::TmuxBinaryCandidates()) {
+          if (!paths.empty()) paths += ", ";
+          paths += candidate;
+        }
+      }
+      LOG(WARNING) << "[tmux] No executable tmux found; the tmux surrounding source is off. "
+                   << "Probed: " << paths
+                   << ". Set copilot/tmux_source/binary to an absolute path.";
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     g_backoff_until = Clock::now() + std::chrono::seconds(60);
     return std::nullopt;
   }
 
-  const std::vector<std::string> args = tmux_detail::BuildTmuxArgs(config.socket);
+  const std::vector<std::string> args = tmux_detail::BuildTmuxArgs(socket);
 
   std::string out;
-  if (!RunTmux(binary, args, config.timeout_ms, &out)) {
+  if (!RunTmux(binary, args, timeout_ms, &out)) {
+    // Logged at the transition, not while polling: we only reach here when the
+    // backoff has expired, so this is at most one line per backoff window.
+    DLOG(INFO) << "[tmux] Query failed (no server, timeout past " << timeout_ms
+               << "ms, or non-zero exit); backing off 5s";
     std::lock_guard<std::mutex> lock(g_mutex);
     g_backoff_until = Clock::now() + std::chrono::seconds(5);
     return std::nullopt;
@@ -327,6 +409,7 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   auto snap = tmux_detail::ParseTmuxOutput(out);
   if (!snap) {
     // A tmux that answers garbage will keep answering garbage.
+    DLOG(INFO) << "[tmux] Unparseable output (" << out.size() << " bytes); backing off 5s";
     std::lock_guard<std::mutex> lock(g_mutex);
     g_backoff_until = Clock::now() + std::chrono::seconds(5);
     return std::nullopt;
@@ -336,16 +419,19 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   const auto verdict = tmux_detail::JudgeClients(snap->client_activity, snap->focus_events);
   if (verdict != tmux_detail::ClientVerdict::kAccept) {
     DLOG(INFO) << "[tmux] Refusing to answer: " << tmux_detail::DescribeVerdict(verdict);
-    return std::nullopt;
+    return remember(std::nullopt);
   }
 
-  auto ctx = tmux_detail::ExtractContext(*snap, config.prefix_chars);
+  auto ctx = tmux_detail::ExtractContext(*snap, prefix_chars);
   if (!ctx) {
-    return std::nullopt;
+    DLOG(INFO) << "[tmux] Cursor out of the captured pane (x=" << snap->cursor_x
+               << ", y=" << snap->cursor_y << ", width=" << snap->pane_width
+               << ", rows=" << snap->rows.size() << ")";
+    return remember(std::nullopt);
   }
 
-  const std::string client_key = tmux_detail::MakeClientKey(config.socket, snap->pane_id);
-  return SurroundingText{ctx->before, ctx->after, client_key};
+  const std::string client_key = tmux_detail::MakeClientKey(socket, snap->pane_id);
+  return remember(SurroundingText{ctx->before, ctx->after, client_key});
 }
 
 }  // namespace rime

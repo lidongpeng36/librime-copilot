@@ -92,11 +92,13 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
     config->GetString("copilot/tmux_source/binary", &tmux_config.binary);
     config->GetString("copilot/tmux_source/socket", &tmux_config.socket);
     config->GetInt("copilot/tmux_source/timeout_ms", &tmux_config.timeout_ms);
-    tmux_config.timeout_ms = std::clamp(tmux_config.timeout_ms, 5, 500);
+    tmux_config.timeout_ms = std::clamp(tmux_config.timeout_ms, kMinTimeoutMs, kMaxTimeoutMs);
     tmux_config.prefix_chars = prefix_chars;
     // Left empty, ConfigureTmuxSource substitutes DefaultTerminalBundleIds().
-    // A schema that does set the list is narrowing the gate, never widening it
-    // past what it wrote.
+    // A schema that does set the list *replaces* the built-in one: the default
+    // exists so the out-of-the-box behavior is safe, not to forbid a
+    // deliberate override, and intersecting would lock out terminals we never
+    // listed. The user then owns what they put in it.
     if (auto list = config->GetList("copilot/tmux_source/app_bundle_ids")) {
       for (size_t i = 0; i < list->size(); ++i) {
         if (auto item = list->GetValueAt(i)) {
@@ -158,6 +160,20 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
   }
   auto* ctx = engine_->context();
   auto keycode = key_event.keycode();
+
+  // Start of a key event: the tmux pane may have moved on, so drop the
+  // memoized scrape. Everything downstream in this event -- AutoSpacer, the
+  // re-ranking filter's menu build, GetPredictionContext -- then shares one
+  // `posix_spawn` instead of forking two or three times per keystroke.
+  //
+  // Not while composing, for the same reason imk_client.mm skips its query
+  // there: the preedit is drawn by the frontend and never reaches the PTY, so
+  // tmux's grid cannot change until something is committed. That freezes the
+  // snapshot at composition start, which is also what GetPredictionContext
+  // already documents itself as relying on.
+  if (!ctx || !ctx->IsComposing()) {
+    InvalidateTmuxSnapshot();
+  }
 
   // LOG(INFO) << "IsCompusing: " << ctx->IsComposing() << ", HasMenu:" << ctx->HasMenu()
   //           << ", Preedit:'" << ctx->GetPreedit().text << "'"
