@@ -224,6 +224,36 @@ TEST(TmuxContext, NonPositivePaneWidthIsRefused) {
   EXPECT_FALSE(ExtractContext(snap, 1).has_value());
 }
 
+TEST(TmuxContext, ImplausiblePaneWidthIsRefused) {
+  // The exact repro that motivated kMaxPaneWidth: a header of
+  // CUR|%0|2000000000|0|2000000000 passes every *other* guard --
+  // pane_width > 0, cursor_x >= 0, cursor_x <= pane_width -- because both
+  // fields are equally huge std::atoi output. Without an upper bound on
+  // pane_width alone, this reaches SliceBeforeColumn and tries to append
+  // ~2e9 blank characters on the input thread.
+  Snapshot snap;
+  snap.cursor_x = 2000000000;
+  snap.cursor_y = 0;
+  snap.pane_width = 2000000000;
+  snap.rows = {"short row"};
+  EXPECT_FALSE(ExtractContext(snap, 1).has_value());
+}
+
+TEST(TmuxContext, WidePaneWithinTheBoundIsStillAccepted) {
+  // A real wide terminal -- an ultrawide or a 4K display at a small font --
+  // can plausibly reach several hundred columns. The bound must not reject
+  // ordinary use to guard against implausible ones.
+  const int width = 400;
+  Snapshot snap;
+  snap.cursor_x = width;
+  snap.cursor_y = 0;
+  snap.pane_width = width;
+  snap.rows = {std::string(static_cast<size_t>(width) - 1, 'x') + "y"};
+  auto ctx = ExtractContext(snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->before, "y");
+}
+
 TEST(TmuxAmbiguity, SingleClientIsNeverAmbiguous) {
   EXPECT_FALSE(ClientsAreAmbiguous({1786506891}));
 }

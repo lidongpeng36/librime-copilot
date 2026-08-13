@@ -37,6 +37,19 @@ struct Context {
   std::string after;
 };
 
+// Upper bound on a plausible `pane_width`. Real terminals top out in the low
+// hundreds of columns (a 4K display at a tiny font is still under 1000); a
+// few thousand is generously beyond anything real while staying far below
+// where `pane_width` stops being able to bound `cursor_x` safely. Both come
+// straight from `std::atoi` on a tmux header field (ParseTmuxOutput), which
+// on a malformed or adversarial answer returns whatever -- e.g.
+// `CUR|%0|2000000000|0|2000000000` passes `cursor_x <= pane_width` cleanly
+// while still being ~2e9. Without this bound, ExtractContext's existing
+// `cursor_x > pane_width` guard cannot catch that case, and
+// SliceBeforeColumn would try to append billions of blank characters on the
+// input thread.
+constexpr int kMaxPaneWidth = 4096;
+
 // East Asian Wide/Fullwidth occupy two cells; combining marks occupy none.
 // tmux computes cursor_x with the same rule, so this must agree with it.
 inline int DisplayWidth(uint32_t cp) {
@@ -258,8 +271,13 @@ inline std::optional<Context> ExtractContext(const Snapshot& snap, int prefix_ch
   // trimmed off the row end, so an unbounded column out of a malformed header
   // (`std::atoi` will happily return 2000000000) becomes a multi-gigabyte
   // append on the input thread. `== pane_width` is allowed: the caret legally
-  // sits one past the last cell just before a wrap.
-  if (snap.pane_width <= 0 || snap.cursor_x < 0 || snap.cursor_x > snap.pane_width) {
+  // sits one past the last cell just before a wrap. pane_width itself must
+  // also be bounded (kMaxPaneWidth): it is the same unchecked std::atoi
+  // output, and a header with both fields equally huge
+  // (`CUR|%0|2000000000|0|2000000000`) would pass the cursor_x <= pane_width
+  // check while still driving the same multi-gigabyte append.
+  if (snap.pane_width <= 0 || snap.pane_width > kMaxPaneWidth || snap.cursor_x < 0 ||
+      snap.cursor_x > snap.pane_width) {
     return std::nullopt;
   }
   const std::string& row = snap.rows[snap.cursor_y];
