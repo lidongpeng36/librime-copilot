@@ -16,6 +16,7 @@
 #include <rime/common.h>
 
 #include "frontmost_app.h"
+#include "tmux_source_internal.h"
 #include "tmux_source_util.h"
 
 extern char** environ;
@@ -31,45 +32,73 @@ std::string g_resolved_binary;  // "" = not resolved yet or resolved to nothing
 bool g_binary_resolved = false;
 Clock::time_point g_backoff_until;
 
-// An IMK process inherits a minimal PATH, and on a Homebrew Mac `tmux` is not
-// on it at all, so absolute probing is the only thing that works.
-std::string ResolveBinary(const std::string& configured) {
-  if (g_binary_resolved) {
-    return g_resolved_binary;
+// Test seams; null means "use the real thing". Read under g_mutex is
+// unnecessary -- tests install them before any query runs.
+tmux_detail::FrontmostBundleIdFn g_frontmost_hook = nullptr;
+tmux_detail::RunTmuxFn g_run_hook = nullptr;
+
+// Set FD_CLOEXEC so a spawn from another thread, racing between our pipe()
+// and the posix_spawn below, cannot inherit this call's write end and hold
+// the pipe open -- which would cost us the full deadline waiting for an EOF
+// that never comes. posix_spawn's adddup2 clears the flag on the duplicate,
+// so our own child still gets its stdout.
+void SetCloexec(int fd) {
+  const int flags = fcntl(fd, F_GETFD);
+  if (flags >= 0) {
+    fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
   }
-  std::string found;
+}
+
+// Resolve once and remember, including a miss. Callers hold g_mutex.
+// Returns true when this call performed the probe (so a failure is logged
+// exactly once per configuration, not once per keystroke).
+bool ResolveBinaryLocked(const std::string& configured, std::string* resolved) {
+  if (g_binary_resolved) {
+    *resolved = g_resolved_binary;
+    return false;
+  }
+  g_resolved_binary = tmux_detail::ProbeTmuxBinary(configured);
+  g_binary_resolved = true;
+  *resolved = g_resolved_binary;
+  return true;
+}
+
+}  // namespace
+
+namespace tmux_detail {
+
+const std::vector<std::string>& TmuxBinaryCandidates() {
+  static const std::vector<std::string> candidates = {"/opt/homebrew/bin/tmux",
+                                                      "/usr/local/bin/tmux", "/usr/bin/tmux"};
+  return candidates;
+}
+
+std::string ProbeTmuxBinary(const std::string& configured) {
   if (!configured.empty()) {
     // An explicit path is a deliberate choice -- a wrapper, a different
     // install, one bound to a different socket namespace. Honor it or fail;
     // silently substituting a well-known path would mean reading a different
     // tmux server's panes and handing that text to AutoSpacer, which is
     // exactly the guessing this feature must refuse to do.
-    if (access(configured.c_str(), X_OK) == 0) {
-      found = configured;
-    }
-  } else {
-    const char* candidates[] = {"/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"};
-    for (const char* c : candidates) {
-      if (access(c, X_OK) == 0) {
-        found = c;
-        break;
-      }
+    return access(configured.c_str(), X_OK) == 0 ? configured : std::string();
+  }
+  for (const auto& candidate : TmuxBinaryCandidates()) {
+    if (access(candidate.c_str(), X_OK) == 0) {
+      return candidate;
     }
   }
-  g_resolved_binary = found;
-  g_binary_resolved = true;
-  return found;
+  return std::string();
 }
 
-// Spawn `bin` with `args`, collect stdout, and never block past `timeout_ms`.
-// Runs on the input thread, so the deadline is load-bearing.
-bool RunTmux(const std::string& bin, const std::vector<std::string>& args, int timeout_ms,
-             std::string* out) {
+bool RunTmuxProcess(const std::string& bin, const std::vector<std::string>& args, int timeout_ms,
+                    std::string* out) {
   int fds[2];
   if (pipe(fds) != 0) {
     return false;
   }
-  const int devnull = open("/dev/null", O_RDWR);
+  SetCloexec(fds[0]);
+  SetCloexec(fds[1]);
+  const int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
   if (devnull < 0) {
     close(fds[0]);
     close(fds[1]);
@@ -77,7 +106,12 @@ bool RunTmux(const std::string& bin, const std::vector<std::string>& args, int t
   }
 
   posix_spawn_file_actions_t actions;
-  posix_spawn_file_actions_init(&actions);
+  if (posix_spawn_file_actions_init(&actions) != 0) {
+    close(fds[0]);
+    close(fds[1]);
+    close(devnull);
+    return false;
+  }
   posix_spawn_file_actions_adddup2(&actions, devnull, STDIN_FILENO);
   posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
   posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
@@ -145,9 +179,15 @@ bool RunTmux(const std::string& bin, const std::vector<std::string>& args, int t
   // posix_spawn above is called with a null attrp (no
   // POSIX_SPAWN_SETSIGDEF), so the child inherits the IME's signal
   // dispositions -- if SIGPIPE is ignored there, a broken pipe alone won't
-  // kill it. Poll for exit with WNOHANG up to the original deadline; only
-  // past that force it, and the final wait is bounded because a killed
-  // process reaps essentially immediately.
+  // kill it. Poll for exit with WNOHANG, and only past a grace window force
+  // it; the final wait is bounded because a killed process reaps essentially
+  // immediately.
+  //
+  // The grace window is its own, deliberately *not* the read deadline: EOF
+  // normally arrives a hair before the child is reapable, so reusing the
+  // deadline meant a query that finished microseconds inside it got SIGKILLed
+  // and its perfectly good output thrown away, with a 5s backoff armed on top.
+  const auto reap_deadline = Clock::now() + std::chrono::milliseconds(10);
   int status = 0;
   pid_t reaped = 0;
   while (true) {
@@ -158,18 +198,36 @@ bool RunTmux(const std::string& bin, const std::vector<std::string>& args, int t
       break;  // e.g. ECHILD: nothing left to wait for
     }
     // reaped == 0: still running and not timed out yet.
-    if (Clock::now() >= deadline) {
+    if (Clock::now() >= reap_deadline) {
       kill(pid, SIGKILL);
       timed_out = true;
       continue;  // next iteration blocks; SIGKILL guarantees a fast exit
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
   if (timed_out) {
     return false;
   }
   return reaped == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+void SetTmuxTestHooks(FrontmostBundleIdFn frontmost, RunTmuxFn run) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_frontmost_hook = frontmost;
+  g_run_hook = run;
+}
+
+}  // namespace tmux_detail
+
+namespace {
+
+std::string Frontmost() { return g_frontmost_hook ? g_frontmost_hook() : FrontmostBundleId(); }
+
+bool RunTmux(const std::string& bin, const std::vector<std::string>& args, int timeout_ms,
+             std::string* out) {
+  return g_run_hook ? g_run_hook(bin, args, timeout_ms, out)
+                    : tmux_detail::RunTmuxProcess(bin, args, timeout_ms, out);
 }
 
 }  // namespace
@@ -234,7 +292,7 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   // answers NSNotFound -- Electron, Java, assorted web inputs -- would be
   // handed the terminal's text. ConfigureTmuxSource guarantees the list is
   // non-empty, so a lookup miss means "not a terminal", not "unconfigured".
-  const std::string frontmost = FrontmostBundleId();
+  const std::string frontmost = Frontmost();
   // An empty id means "unknown app" (always true on non-Apple, and possible
   // on Apple too), not "matches everything". Without this check, a user
   // config with one empty app_bundle_ids entry -- or FrontmostBundleId()
@@ -249,7 +307,7 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
 
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    binary = ResolveBinary(config.binary);
+    ResolveBinaryLocked(config.binary, &binary);
   }
   if (binary.empty()) {
     std::lock_guard<std::mutex> lock(g_mutex);

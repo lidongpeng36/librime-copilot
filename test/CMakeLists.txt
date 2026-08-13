@@ -13,6 +13,7 @@ set(copilot_test_src
   prediction_context_test.cc
   rerank_test.cc
   spacing_matrix_test.cc
+  tmux_source_test.cc
   tmux_source_util_test.cc)
 
 # GTest include dirs are added globally by the librime root CMakeLists.
