@@ -313,8 +313,13 @@ unparseable, refused per the list above). It uses `LOG(INFO)`, not `DLOG`, so �
 unlike the plugin's other debug logging — it is visible in the release build
 Squirrel actually ships: `DLOG` compiles out entirely under `-DNDEBUG`.
 
-The log file is under Squirrel's runtime directory:
-`$TMPDIR/rime.squirrel/rime.squirrel.*.log.INFO.*.log`.
+This plugin statically links its own copy of glog, separate from librime's —
+librime doesn't export its glog symbols, so the plugin can't share it — and
+initializes that copy itself (`rime_copilot_initialize()` in
+`src/copilot_module.cc`). As a result, **plugin log output never lands in
+Squirrel's `rime.squirrel.*` log**, no matter what you set `min_log_level` or
+any other Squirrel logging setting to. Look for the plugin's own file instead:
+`$TMPDIR/rime_copilot.*.log.INFO.*.log`.
 
 #### Two things to know about the socket
 
