@@ -73,10 +73,26 @@ void InitCopilotLogging() {
   // crashing when it can't open a log file, so this is safe either way.
 
   FLAGS_log_dir = log_dir.string();
+  // Matches rime::SetupLogging's call for librime's own copy -- without it,
+  // glog's default filename has no trailing extension, and the two log
+  // families' names would only *look* parallel while actually differing.
+  google::SetLogFilenameExtension(".log");
   // Distinct program name from Squirrel's own `rime.squirrel.*` log files,
   // so a user tailing logs can tell the two apart:
   // rime_copilot.<host>.<user>.log.INFO.<date>.<pid>.log
   google::InitGoogleLogging("rime_copilot");
+
+  // glog creates the log file lazily, on the first LOG() call -- not here in
+  // InitGoogleLogging -- so without this banner, a process that never
+  // happens to hit another LOG() call (e.g. no schema loaded, or every
+  // debug flag off) leaves no file at all, and "the fix ran" is
+  // indistinguishable from "the fix is broken". This unconditional line is
+  // what forces the file into existence and makes the fix verifiable.
+  // Deliberate, not noise: do not delete it as redundant with the LOG(...)
+  // sites it exists to make visible in the first place.
+  LOG(INFO) << "[copilot] logging initialized; plugin diagnostics go to " << FLAGS_log_dir
+            << "/rime_copilot.*.log.INFO.*.log  (NOT the "
+            << "rime.squirrel.* log -- see src/copilot_module.cc)";
 }
 
 }  // namespace
