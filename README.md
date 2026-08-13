@@ -85,6 +85,11 @@ copilot:
   # How many characters before the caret to use as the lookup context.
   # default: 8, clamped to 1..64
   surrounding_context_chars: 8
+  # Log which surrounding-text source answered (IMK / ImeBridge / tmux) and
+  # why tmux refused, if it did. Uses LOG(INFO), not DLOG, so it is visible in
+  # a release build -- see "Finding the log output" under "tmux Source".
+  # default: false
+  surrounding_debug: false
 
   # Contextual candidate re-ranking, as our own filter. Also add
   # `copilot_rerank_filter` to engine/filters. See "Contextual Re-ranking".
@@ -298,6 +303,18 @@ answer would be a guess:
 - two attached clients are tied on `client_activity`, which has one-second
   granularity;
 - tmux cannot be reached, times out, or answers something unparseable.
+
+#### Finding the log output
+
+Set `copilot/surrounding_debug: true` to see which source actually answered
+(`Using IMK context` / `Using ImeBridge context` / `Using tmux context`) and,
+when tmux refused, why (no tmux binary found, query timed out, output
+unparseable, refused per the list above). It uses `LOG(INFO)`, not `DLOG`, so —
+unlike the plugin's other debug logging — it is visible in the release build
+Squirrel actually ships: `DLOG` compiles out entirely under `-DNDEBUG`.
+
+The log file is under Squirrel's runtime directory:
+`$TMPDIR/rime.squirrel/rime.squirrel.*.log.INFO.*.log`.
 
 #### Two things to know about the socket
 

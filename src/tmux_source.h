@@ -32,6 +32,12 @@ struct TmuxSourceConfig {
   std::vector<std::string> app_bundle_ids;  // empty -> DefaultTerminalBundleIds()
   int timeout_ms = 50;
   int prefix_chars = 1;
+  // Release-visible logging (LOG(INFO), not DLOG -- the librime build this
+  // ships in compiles -DNDEBUG, which strips DLOG entirely). Driven by
+  // `copilot/surrounding_debug`, the same key that gates
+  // SetSurroundingDebug() in surrounding_source.h, so one schema setting makes
+  // both "which source won" and tmux's own refusals visible together.
+  bool debug = false;
 };
 
 // Terminal emulators that may receive tmux-scraped context, used when the

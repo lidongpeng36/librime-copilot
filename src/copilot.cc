@@ -87,7 +87,17 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
     SetIMKSurroundingPrefixChars(prefix_chars);
 #endif
 
+    // Gates the "which source won" line in surrounding_source.cc and the
+    // refusal lines in tmux_source.cc with LOG(INFO) instead of DLOG: the
+    // librime build this ships in compiles -DNDEBUG, under which DLOG never
+    // prints, so without this the user has no way to see which surrounding
+    // source answered (or why tmux refused) in the build they actually run.
+    bool surrounding_debug = false;
+    config->GetBool("copilot/surrounding_debug", &surrounding_debug);
+    SetSurroundingDebug(surrounding_debug);
+
     TmuxSourceConfig tmux_config;
+    tmux_config.debug = surrounding_debug;
     config->GetBool("copilot/tmux_source/enabled", &tmux_config.enabled);
     config->GetString("copilot/tmux_source/binary", &tmux_config.binary);
     config->GetString("copilot/tmux_source/socket", &tmux_config.socket);

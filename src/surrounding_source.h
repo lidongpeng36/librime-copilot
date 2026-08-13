@@ -18,4 +18,12 @@ namespace rime {
 // must fall back to its own history.
 std::optional<SurroundingText> GetSurroundingContext();
 
+// Gates the "which source won" logging below with LOG(INFO) rather than
+// DLOG(INFO): the librime build this ships in compiles -DNDEBUG, under which
+// DLOG is stripped entirely, so DLOG here would never print in the build a
+// user actually installs. Driven by `copilot/surrounding_debug`, read once in
+// Copilot's constructor -- read on the input thread, written once at startup,
+// so a plain atomic is enough and avoids a mutex on every key event.
+void SetSurroundingDebug(bool debug);
+
 }  // namespace rime

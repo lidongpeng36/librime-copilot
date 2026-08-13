@@ -329,6 +329,7 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   int prefix_chars = 1;
   uint64_t generation = 0;
   bool probed_now = false;
+  bool debug = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     // The gate runs against the live list rather than a copy: this is the hot
@@ -352,6 +353,7 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
     timeout_ms = g_config.timeout_ms;
     prefix_chars = g_config.prefix_chars;
     generation = g_generation;
+    debug = g_config.debug;
   }
 
   // Install a result for this generation. Skipped if a key event bumped the
@@ -399,8 +401,10 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   if (!RunTmux(binary, args, timeout_ms, &out)) {
     // Logged at the transition, not while polling: we only reach here when the
     // backoff has expired, so this is at most one line per backoff window.
-    DLOG(INFO) << "[tmux] Query failed (no server, timeout past " << timeout_ms
-               << "ms, or non-zero exit); backing off 5s";
+    if (debug) {
+      LOG(INFO) << "[tmux] Query failed (no server, timeout past " << timeout_ms
+                << "ms, or non-zero exit); backing off 5s";
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     g_backoff_until = Clock::now() + std::chrono::seconds(5);
     return std::nullopt;
@@ -409,7 +413,9 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   auto snap = tmux_detail::ParseTmuxOutput(out);
   if (!snap) {
     // A tmux that answers garbage will keep answering garbage.
-    DLOG(INFO) << "[tmux] Unparseable output (" << out.size() << " bytes); backing off 5s";
+    if (debug) {
+      LOG(INFO) << "[tmux] Unparseable output (" << out.size() << " bytes); backing off 5s";
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     g_backoff_until = Clock::now() + std::chrono::seconds(5);
     return std::nullopt;
@@ -418,15 +424,19 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   // Transient, so no backoff: refuse this one query and try again next time.
   const auto verdict = tmux_detail::JudgeClients(snap->client_activity, snap->focus_events);
   if (verdict != tmux_detail::ClientVerdict::kAccept) {
-    DLOG(INFO) << "[tmux] Refusing to answer: " << tmux_detail::DescribeVerdict(verdict);
+    if (debug) {
+      LOG(INFO) << "[tmux] Refusing to answer: " << tmux_detail::DescribeVerdict(verdict);
+    }
     return remember(std::nullopt);
   }
 
   auto ctx = tmux_detail::ExtractContext(*snap, prefix_chars);
   if (!ctx) {
-    DLOG(INFO) << "[tmux] Cursor out of the captured pane (x=" << snap->cursor_x
-               << ", y=" << snap->cursor_y << ", width=" << snap->pane_width
-               << ", rows=" << snap->rows.size() << ")";
+    if (debug) {
+      LOG(INFO) << "[tmux] Cursor out of the captured pane (x=" << snap->cursor_x
+                << ", y=" << snap->cursor_y << ", width=" << snap->pane_width
+                << ", rows=" << snap->rows.size() << ")";
+    }
     return remember(std::nullopt);
   }
 
