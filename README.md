@@ -120,14 +120,17 @@ copilot:
     # default: true
     enable_right_space: true
 
-  # tmux pane scrape (for terminal emulators IMK can never answer for; see
-  # "tmux Source" below). default: disabled
+  # tmux pane scrape (macOS only, for terminal emulators IMK can never answer
+  # for; see "tmux Source" below). default: disabled
   tmux_source:
     enabled: true                    # default false; opt-in
     binary: /opt/homebrew/bin/tmux   # optional; probed if empty
-    socket: ""                       # optional; tmux default socket if empty
-    app_bundle_ids: []               # optional; empty = the built-in terminal list
-    timeout_ms: 50
+    socket: ""                       # optional; a full socket *path* for
+                                     # `tmux -S`, not a `-L` name. Empty uses
+                                     # tmux's own default socket.
+    app_bundle_ids: []               # optional; empty = the built-in terminal
+                                     # list. A non-empty list *replaces* it.
+    timeout_ms: 50                   # clamped to [5, 500]
 ```
 
 ### Prediction Context
@@ -135,12 +138,12 @@ copilot:
 The db n-gram lookup keys are the last few characters before the caret:
 
 - **Surrounding path** (`use_surrounding_context: true`, default): the text is
-  read from the frontend — IMK on macOS, otherwise an IME Bridge client — and
-  the word just committed is appended to it (the snapshot is taken before the
-  key is handled). Because it follows the caret, moving to another paragraph or
-  app immediately predicts from *there*, instead of from whatever was typed
-  earlier in the session.
-- **History fallback**: when the frontend cannot answer (Chrome/Electron and
+  read from the frontend — IMK on macOS, else an IME Bridge client, else the
+  active tmux pane if `tmux_source` is on — and the word just committed is
+  appended to it (the snapshot is taken before the key is handled). Because it
+  follows the caret, moving to another paragraph or app immediately predicts
+  from *there*, instead of from whatever was typed earlier in the session.
+- **History fallback**: when no source can answer (Chrome/Electron and
   terminals often return nothing, and there is no IMK on Linux), the plugin
   falls back to its own commit history — exactly the previous behavior. Setting
   `use_surrounding_context: false` forces this path.
@@ -231,20 +234,96 @@ never answer for them. `copilot/tmux_source` scrapes the active tmux pane
 instead, from outside any pane, so it works no matter which winit terminal
 is in front — as long as you are inside a tmux session there.
 
+**macOS only in practice.** The gate below keys on the frontmost
+application's bundle id, which only exists on Apple; on Linux the source
+compiles but the gate can never pass, by design. Enabling it there does
+nothing.
+
 It is opt-in (`enabled: false` by default) because it reaches into another
-process and scrapes a screen. `app_bundle_ids` gates which frontmost
-applications may trigger the scrape at all; the built-in list already covers
-ten terminals — Alacritty, kitty, WezTerm, Apple Terminal, iTerm2, Ghostty,
-Hyper, Warp, Rio, Tabby. Setting `app_bundle_ids` in config **narrows** that
-gate, it never adds to it — you cannot widen coverage past the built-in list
-from config, only restrict it to a subset.
+process and scrapes a screen.
+
+#### The application gate
+
+`app_bundle_ids` decides which frontmost applications may trigger the scrape
+at all. Left empty it uses the built-in list, which covers ten terminals —
+Alacritty, kitty, WezTerm, Apple Terminal, iTerm2, Ghostty, Hyper, Warp, Rio,
+Tabby.
+
+A non-empty `app_bundle_ids` **replaces** the built-in list rather than
+intersecting with it. The built-in list is there so the *default* is safe, not
+to forbid a deliberate override: editing your schema YAML is a considered act,
+and intersecting would lock you out of terminals we simply never listed —
+custom builds, forks, emulators released after this was written. Whatever you
+put in the list is what gets the scrape, and you own that choice.
+
+Note what that means in the other direction. VS Code and other Electron
+editors are off the built-in list **on purpose**: their integrated terminals
+would benefit, but their editor panes also answer `NSNotFound`, so adding
+`com.microsoft.VSCode` hands your Monaco buffer the tmux pane's text too.
+
+#### Multiple attached clients need `focus-events on`
+
+With more than one client attached to the same tmux server, tmux answers for
+the most recently active one. That tracks which macOS window you are actually
+typing in only because `focus-events on` makes tmux enable DECSET 1004, so
+focusing a window writes a focus sequence to that client's tty and bumps its
+`client_activity`. **`focus-events` is off by default.** Without it the "most
+recent" client is merely whichever one was last typed into, and tmux would
+answer confidently from the wrong pane.
+
+So the source reads `focus-events` (in the same single `tmux` invocation, no
+extra process) and refuses whenever more than one client is attached without
+it. If you use more than one attached client, put this in your `~/.tmux.conf`:
+
+```tmux
+set -g focus-events on
+```
+
+A single attached client is unaffected — there is nothing for tmux to pick
+between.
+
+#### Priority and refusals
 
 This source ranks below ImeBridge in the surrounding-text chain (see
 `surrounding_source.h`), so the Neovim client keeps winning while it is in
-insert mode, with no nvim-side configuration change needed. The source
-refuses to answer — falling back to `commit_history` — whenever the answer
-would be a guess: two attached tmux clients tied on activity, the frontmost
-app is not one of the known terminals, or tmux itself cannot be reached.
+insert mode, with no nvim-side configuration change needed.
+
+The source refuses to answer — falling back to `commit_history` — whenever the
+answer would be a guess:
+
+- the frontmost app is not on the gate list;
+- **no** client is attached to the tmux server (a detached session would still
+  answer, from a pane nobody is looking at);
+- more than one client is attached and `focus-events` is off;
+- two attached clients are tied on `client_activity`, which has one-second
+  granularity;
+- tmux cannot be reached, times out, or answers something unparseable.
+
+#### Two things to know about the socket
+
+`socket` is passed to `tmux -S`, so it is a full filesystem **path** to the
+server socket, not a `-L` short name. Leave it empty to use tmux's default.
+
+And tmux's default socket lives under `$TMUX_TMPDIR`. If you set that in your
+shell rc, your servers are somewhere the IME cannot find: the IME process
+inherits Squirrel's environment, not your login shell's. Set `socket` to the
+absolute path in that case (`tmux display-message -p '#{socket_path}'` from
+inside a session prints it).
+
+#### Known limits
+
+- **Soft-wrapped context reaches back only one row.** When the caret sits on a
+  continuation row, `before` is the text on that row (plus the row above only
+  when that row fills the pane exactly). So with `surrounding_context_chars: 8`
+  and the caret at column 3 of a continuation row, prediction sees 3 columns,
+  not 8. AutoSpacer only ever needs the boundary character, so this costs
+  prediction depth, not spacing correctness.
+- **An allow-listed terminal that is not running tmux still reads the active
+  tmux pane.** Focus kitty at a bare shell while Alacritty holds the tmux
+  session and kitty gets Alacritty's context. Telling them apart needs the
+  window title, which costs a Screen Recording or Accessibility permission.
+  Narrow `app_bundle_ids` to the one terminal you actually run tmux in if this
+  bothers you.
 
 ## IME Bridge
 
