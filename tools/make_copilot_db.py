@@ -40,6 +40,33 @@ DEFAULT_PRIORITY = 100
 BUILDER_NAMES = ('build_copilot', 'build_predict')
 
 
+def iter_body_lines(fin, input_path):
+    """
+    只产出词典正文，跳过 `---` 到 `...` 之间的 YAML 元数据块。
+
+    不跳会怎样：`name: tencent`、`columns:` / `  - text` 这些会被当成词条，拆成
+    前缀/后缀喂给 build_copilot。它按空白切三列，于是 `- text` 拆出的
+    `- t → ext 100` 报「格式错误」，而 `name: custom` 拆出的 `name: → custom`
+    刚好凑够三列，**静默**写进库里。报错的那些只是噪音，没报错的才是脏数据。
+
+    注释行由调用方按 `#` 跳过；这里只管元数据块。`---` 开了却没 `...` 收尾说明
+    文件不对劲，这时宁可报错，也不要把整个词库当元数据吞掉。
+    """
+    in_header = False
+    for line in fin:
+        stripped = line.strip()
+        if in_header:
+            if stripped == '...':
+                in_header = False
+            continue
+        if stripped == '---':
+            in_header = True
+            continue
+        yield line
+    if in_header:
+        raise ValueError(f"{input_path}: YAML 头以 `---` 开始却没有 `...` 收尾")
+
+
 def parse_file(input_path, convert_to_traditional=False):
     """
     读取词典文件，返回词条元组：(word, pinyin, priority)
@@ -50,8 +77,9 @@ def parse_file(input_path, convert_to_traditional=False):
         cc = OpenCC('s2t')
 
     entries = []
+    unusable = []  # 含空白的词：build_copilot 按空白分列，写出去必然错位
     with open(input_path, 'r', encoding='utf-8') as fin:
-        for line in fin:
+        for line in iter_body_lines(fin, input_path):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
@@ -81,7 +109,16 @@ def parse_file(input_path, convert_to_traditional=False):
                 priority = int(priority)
             except ValueError:
                 continue
+            # 兜底：正文里不该有带空白的词。真出现了就是解析出了岔子，
+            # 与其让它悄悄变成一条错位的库条目，不如丢掉并在最后喊一声。
+            if any(c.isspace() for c in word):
+                unusable.append(word)
+                continue
             entries.append((word, pinyin, priority))
+
+    if unusable:
+        preview = ', '.join(repr(w) for w in unusable[:5])
+        print(f"⚠️  {input_path}: 跳过 {len(unusable)} 个含空白的词: {preview}")
     return entries
 
 
