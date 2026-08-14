@@ -2,6 +2,9 @@
 
 #include <rime/processor.h>
 
+#include "rerank_trace.h"
+#include "telemetry.h"
+
 namespace rime {
 
 class Context;
@@ -10,7 +13,9 @@ class CopilotEngineComponent;
 
 class Copilot : public Processor {
  public:
-  Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine);
+  Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
+          an<RerankTraceStore> rerank_traces, an<telemetry::Writer> telemetry,
+          const telemetry::Options& telemetry_options);
   virtual ~Copilot();
 
   ProcessResult ProcessKeyEvent(const KeyEvent& key_event) override;
@@ -19,6 +24,7 @@ class Copilot : public Processor {
   void OnContextUpdate(Context* ctx);
   void OnSelect(Context* ctx);
   void CopilotAndUpdate(Context* ctx, const string& context_query);
+  void OnCommit(Context* ctx);
 
  private:
   ProcessResult RunProcessors(const KeyEvent& key_event);
@@ -36,6 +42,10 @@ class Copilot : public Processor {
   connection select_connection_;
   connection context_update_connection_;
   connection delete_connection_;
+  connection commit_connection_;
+  an<RerankTraceStore> rerank_traces_;
+  an<telemetry::Writer> telemetry_;
+  telemetry::Options telemetry_options_;
 
   int last_keycode_ = 0;
   bool use_surrounding_context_ = true;

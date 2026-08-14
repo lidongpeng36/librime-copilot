@@ -1,9 +1,11 @@
 #include "copilot_engine.h"
 
 #include <map>
+#include <sstream>
 
 #include <rime/candidate.h>
 #include <rime/context.h>
+#include <rime/deployer.h>
 #include <rime/dict/db_pool_impl.h>
 #include <rime/engine.h>
 #include <rime/key_event.h>
@@ -213,6 +215,75 @@ an<CopilotDb> CopilotEngineComponent::GetDb(const string& db_name) {
     return nullptr;
   }
   return db;
+}
+
+an<RerankTraceStore> CopilotEngineComponent::GetRerankTraces(const string& schema_id) {
+  auto& traces = rerank_traces_by_schema_id_[schema_id];
+  if (!traces) {
+    traces = New<RerankTraceStore>();
+  }
+  return traces;
+}
+
+namespace {
+
+// Only the fields Writer::Write/Rotate actually read from the frozen
+// Options — NOT top_n. top_n never reaches the writer at all: OnCommit
+// passes its own freshly-read, per-schema Options straight to
+// BuildCommitEvents, so a later schema's top_n is always honored regardless
+// of what the writer was built with. Including it here would warn about an
+// override that never happens.
+string DescribeTelemetryOptions(const telemetry::Options& options) {
+  std::ostringstream oss;
+  oss << "enable=" << (options.enable ? "true" : "false")
+      << ", max_file_bytes=" << options.max_file_bytes
+      << ", keep_generations=" << options.keep_generations;
+  return oss.str();
+}
+
+}  // namespace
+
+an<telemetry::Writer> CopilotEngineComponent::GetTelemetryWriter(
+    const telemetry::Options& options) {
+  if (!telemetry_writer_) {
+    telemetry_writer_options_ = options;
+    auto& deployer = Service::instance().deployer();
+    // "unknown" until the first deployment (deployer.cc:21). Still worth
+    // writing: a machine that has not deployed yet is still producing data.
+    string machine = deployer.user_id.empty() ? string("unknown") : deployer.user_id;
+    // Under private/: see README "Telemetry" for why — a Rime user directory
+    // is commonly a git repo of the user's own config on top of upstream, and
+    // private/ is the conventional gitignore line, so this transcript of the
+    // user's input cannot be committed by accident.
+    telemetry_writer_ = New<telemetry::Writer>(
+        deployer.user_data_dir / "private" / "copilot_telemetry", machine, options);
+    LOG(INFO) << "[copilot] telemetry: enable=" << options.enable
+              << ", file=" << telemetry_writer_->path();
+    return telemetry_writer_;
+  }
+
+  // The writer is process-wide, built once from the first schema's options
+  // (see the field comment on telemetry_writer_options_); every later
+  // caller's `enable`/`max_file_bytes`/`keep_generations` is silently
+  // overridden — including `enable`, which means a schema that turns
+  // telemetry on can end up writing nothing at all if an earlier-loaded
+  // schema turned it off. Make that observable, but only once per distinct
+  // mismatch: a warning that repeats on every deploy is noise people learn to
+  // ignore. `top_n` is deliberately not compared here; see
+  // DescribeTelemetryOptions.
+  if (options.enable != telemetry_writer_options_.enable ||
+      options.max_file_bytes != telemetry_writer_options_.max_file_bytes ||
+      options.keep_generations != telemetry_writer_options_.keep_generations) {
+    string ignored = DescribeTelemetryOptions(options);
+    if (telemetry_mismatches_logged_.insert(ignored).second) {
+      LOG(WARNING) << "[copilot] telemetry: options differ across schemas; the writer is "
+                      "process-wide and the first schema loaded wins for the whole process. "
+                      "In effect: "
+                   << DescribeTelemetryOptions(telemetry_writer_options_)
+                   << ". Ignored (this schema wanted): " << ignored;
+    }
+  }
+  return telemetry_writer_;
 }
 
 an<CopilotEngine> CopilotEngineComponent::GetInstance(const Ticket& ticket) {

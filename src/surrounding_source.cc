@@ -24,6 +24,7 @@ std::optional<SurroundingText> GetSurroundingContext() {
 #ifdef __APPLE__
   // Priority 1: IMK Client (macOS system query)
   if (auto context = GetIMKSurroundingText()) {
+    context->source = SurroundingSource::kIMK;
     if (debug) {
       LOG(INFO) << "[Surrounding] Using IMK context: before='" << context->before << "', after='"
                 << context->after << "'";
@@ -34,6 +35,7 @@ std::optional<SurroundingText> GetSurroundingContext() {
 
   // Priority 2: ImeBridge (clients like Neovim), used only when IMK has no context.
   if (auto context = ImeBridgeServer::Instance().GetActiveContext()) {
+    context->source = SurroundingSource::kBridge;
     if (debug) {
       LOG(INFO) << "[Surrounding] Using ImeBridge context: before='" << context->before
                 << "', after='" << context->after << "'";
@@ -46,6 +48,7 @@ std::optional<SurroundingText> GetSurroundingContext() {
   // prompt text, survives soft wrap). This catches everything else in the
   // terminal: the shell prompt, less, git commit, REPLs.
   if (auto context = GetTmuxSurroundingText()) {
+    context->source = SurroundingSource::kTmux;
     if (debug) {
       LOG(INFO) << "[Surrounding] Using tmux context: before='" << context->before << "', after='"
                 << context->after << "'";

@@ -3,6 +3,7 @@
 #include <rime/candidate.h>
 #include <rime/composition.h>
 #include <rime/context.h>
+#include <rime/deployer.h>
 #include <rime/dict/db_pool_impl.h>
 #include <rime/engine.h>
 #include <rime/key_event.h>
@@ -13,6 +14,7 @@
 #include <rime/translation.h>
 
 #include <algorithm>
+#include <ctime>
 #include <set>
 
 #include "auto_spacer.h"
@@ -21,6 +23,7 @@
 #include "prediction_context.h"
 #include "select_character.h"
 #include "surrounding_source.h"
+#include "telemetry_commit.h"
 #include "tmux_source.h"
 
 namespace rime {
@@ -56,17 +59,33 @@ inline bool IsContinuingInput(const KeyEvent& key_event) {
 }
 }  // namespace
 
-Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
-    : Processor(ticket), copilot_engine_(copilot_engine) {
+Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
+                 an<RerankTraceStore> rerank_traces, an<telemetry::Writer> telemetry,
+                 const telemetry::Options& telemetry_options)
+    : Processor(ticket),
+      copilot_engine_(copilot_engine),
+      rerank_traces_(rerank_traces),
+      telemetry_(telemetry),
+      telemetry_options_(telemetry_options) {
   // update copilot on context change.
   auto* context = engine_->context();
   select_connection_ = context->select_notifier().connect([this](Context* ctx) { OnSelect(ctx); });
   context_update_connection_ =
       context->update_notifier().connect([this](Context* ctx) { OnContextUpdate(ctx); });
+  commit_connection_ = context->commit_notifier().connect([this](Context* ctx) { OnCommit(ctx); });
 
   // Read disabled plugins from config
   std::set<string> disabled_plugins;
   if (auto* config = engine_->schema()->config()) {
+    config->GetBool("copilot/telemetry/enable", &telemetry_options_.enable);
+    config->GetInt("copilot/telemetry/top_n", &telemetry_options_.top_n);
+    int max_file_bytes = static_cast<int>(telemetry_options_.max_file_bytes);
+    if (config->GetInt("copilot/telemetry/max_file_bytes", &max_file_bytes)) {
+      telemetry_options_.max_file_bytes = max_file_bytes;
+    }
+    config->GetInt("copilot/telemetry/keep_generations", &telemetry_options_.keep_generations);
+    telemetry::ClampOptions(telemetry_options_);
+
     config->GetBool("copilot/use_surrounding_context", &use_surrounding_context_);
     config->GetInt("copilot/surrounding_context_chars", &surrounding_context_chars_);
     surrounding_context_chars_ = std::clamp(surrounding_context_chars_, 1, 64);
@@ -152,6 +171,7 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine)
 Copilot::~Copilot() {
   select_connection_.disconnect();
   context_update_connection_.disconnect();
+  commit_connection_.disconnect();
 }
 
 ProcessResult Copilot::RunProcessors(const KeyEvent& key_event) {
@@ -274,6 +294,24 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
 void Copilot::OnSelect(Context* ctx) { last_action_ = kSelect; }
 
 void Copilot::OnContextUpdate(Context* ctx) {
+  // A composition that ends without a commit — Esc, a click elsewhere, any
+  // Context::Clear() — must not leave its re-ranking decisions behind. The
+  // next composition can reuse the same input and span, and a stale trace
+  // matched against it would credit a promotion that never happened, with the
+  // wrong `ctx`. See the header of rerank_trace.h: dropping an event is fine,
+  // misattributing one is not.
+  //
+  // Here rather than in ProcessKeyEvent's !IsComposing() branch because
+  // Context::Clear() fires update_notifier_ itself (librime
+  // src/rime/context.cc:106-111) and AbortComposition() goes through Clear(),
+  // so this runs the instant the composition is abandoned instead of waiting
+  // for the next keystroke. Above the guards below on purpose: neither the
+  // re-ranking filter nor telemetry consults the `copilot` switch, so a user
+  // who has it off still accumulates traces that must still be cleared.
+  if (ctx && !ctx->IsComposing() && rerank_traces_) {
+    rerank_traces_->Clear();
+  }
+
   if (self_updating_ || !copilot_engine_ || !ctx || !ctx->get_option("copilot")) {
     return;
   }
@@ -366,13 +404,58 @@ void Copilot::CopilotAndUpdate(Context* ctx, const string& context_query) {
   }
 }
 
+void Copilot::OnCommit(Context* ctx) {
+  // Context::Commit() fires this notifier before Clear() (librime
+  // src/rime/context.cc:18-26), so the composition, its menus and every
+  // selected_index are still readable here. That ordering is what this whole
+  // path depends on.
+  //
+  // Every decision lives in BuildCommitEvents, which is tested against
+  // hand-built compositions. Keep this function a call plus a loop: a
+  // condition added here would be a condition with no test.
+  if (!telemetry_ || !telemetry_options_.enable) {
+    return;
+  }
+  // Same fallback as the filename in GetTelemetryWriter, so the `machine`
+  // field and the file it lives in never disagree.
+  const string& user_id = Service::instance().deployer().user_id;
+  const auto events = telemetry::BuildCommitEvents(
+      ctx, rerank_traces_.get(), telemetry_options_, user_id.empty() ? string("unknown") : user_id,
+      engine_->schema() ? engine_->schema()->schema_id() : string(),
+      telemetry::FormatTimestamp(std::time(nullptr)));
+  for (const auto& e : events) {
+    telemetry_->Write(telemetry::SerializeJsonl(e));
+  }
+
+  if (rerank_traces_) {
+    rerank_traces_->Clear();
+  }
+}
+
 CopilotComponent::CopilotComponent(an<CopilotEngineComponent> engine_factory)
     : engine_factory_(engine_factory) {}
 
 CopilotComponent::~CopilotComponent() {}
 
 Copilot* CopilotComponent::Create(const Ticket& ticket) {
-  return new Copilot(ticket, engine_factory_->GetInstance(ticket));
+  telemetry::Options telemetry_options;
+  string schema_id;
+  if (auto* schema = ticket.schema) {
+    schema_id = schema->schema_id();
+    if (auto* config = schema->config()) {
+      config->GetBool("copilot/telemetry/enable", &telemetry_options.enable);
+      config->GetInt("copilot/telemetry/top_n", &telemetry_options.top_n);
+      int max_file_bytes = static_cast<int>(telemetry_options.max_file_bytes);
+      if (config->GetInt("copilot/telemetry/max_file_bytes", &max_file_bytes)) {
+        telemetry_options.max_file_bytes = max_file_bytes;
+      }
+      config->GetInt("copilot/telemetry/keep_generations", &telemetry_options.keep_generations);
+    }
+  }
+  telemetry::ClampOptions(telemetry_options);
+  return new Copilot(ticket, engine_factory_->GetInstance(ticket),
+                     engine_factory_->GetRerankTraces(schema_id),
+                     engine_factory_->GetTelemetryWriter(telemetry_options), telemetry_options);
 }
 
 }  // namespace rime

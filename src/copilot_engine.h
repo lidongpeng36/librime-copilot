@@ -5,8 +5,12 @@
 #include <rime/dict/db_pool.h>
 #include "copilot_db.h"
 
+#include <set>
+
 #include "history.h"
 #include "provider.h"
+#include "rerank_trace.h"
+#include "telemetry.h"
 
 namespace rime {
 
@@ -80,9 +84,29 @@ class CopilotEngineComponent : public CopilotEngine::Component {
   // reads, without mapping it a second time.
   an<CopilotDb> GetDb(const string& db_name);
 
+  // The re-ranking decisions for one schema, shared between the filter that
+  // makes them and the processor that reads them at commit. Per schema, not a
+  // file-level global, so two schemas cannot read each other's decisions.
+  an<RerankTraceStore> GetRerankTraces(const string& schema_id);
+
+  // The telemetry writer. One per process, not per schema: every schema writes
+  // the same machine's file. Created on first request with the options of the
+  // first caller.
+  an<telemetry::Writer> GetTelemetryWriter(const telemetry::Options& options);
+
  protected:
   map<string, weak<CopilotEngine>> copilot_engine_by_schema_id;
   DbPool<CopilotDb> db_pool_;
+  map<string, an<RerankTraceStore>> rerank_traces_by_schema_id_;
+  an<telemetry::Writer> telemetry_writer_;
+  // The options the writer above was actually built with (the first caller's),
+  // kept so later callers whose options differ can be diagnosed instead of
+  // silently overridden. See GetTelemetryWriter.
+  telemetry::Options telemetry_writer_options_;
+  // Distinct mismatch descriptions already warned about, so a schema that
+  // reloads with the same losing options on every deploy warns once, not
+  // every time.
+  std::set<string> telemetry_mismatches_logged_;
 };
 
 }  // namespace rime

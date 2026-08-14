@@ -36,13 +36,13 @@ TEST(TrailingCjk, KeepsTheRunTouchingTheCaret) {
 
 TEST(TrailingCjk, AnythingButAHanCharacterEndsTheContext) {
   // Whatever sits right before the caret decides it: the run must be adjacent.
-  EXPECT_EQ("", TrailingCjkRun("高屋建。", kMax));   // CJK punctuation
-  EXPECT_EQ("", TrailingCjkRun("高屋建.", kMax));    // ASCII punctuation
-  EXPECT_EQ("", TrailingCjkRun("高屋建 ", kMax));    // space
-  EXPECT_EQ("", TrailingCjkRun("高屋建\n", kMax));   // newline
-  EXPECT_EQ("", TrailingCjkRun("高屋建１", kMax));   // fullwidth digit
+  EXPECT_EQ("", TrailingCjkRun("高屋建。", kMax));  // CJK punctuation
+  EXPECT_EQ("", TrailingCjkRun("高屋建.", kMax));   // ASCII punctuation
+  EXPECT_EQ("", TrailingCjkRun("高屋建 ", kMax));   // space
+  EXPECT_EQ("", TrailingCjkRun("高屋建\n", kMax));  // newline
+  EXPECT_EQ("", TrailingCjkRun("高屋建１", kMax));  // fullwidth digit
   EXPECT_EQ("", TrailingCjkRun("高屋建🙂", kMax));  // emoji
-  EXPECT_EQ("", TrailingCjkRun("高屋建a", kMax));    // latin letter
+  EXPECT_EQ("", TrailingCjkRun("高屋建a", kMax));   // latin letter
 }
 
 TEST(TrailingCjk, HonorsTheCharacterCap) {
@@ -131,4 +131,47 @@ TEST(Promotion, RankCountsTiesAsTheSamePosition) {
   auto p = PickPromotion({"瓴"}, {E("甲", 100.0), E("乙", 100.0), E("瓴", 100.0)}, 1);
   EXPECT_EQ(0, p.index);
   EXPECT_EQ(1, p.rank);
+}
+
+// The match level is what distinguishes an exact single-character hit (the
+// shape 了/吗 always take) from a partial one. The telemetry cannot test the
+// "level 3 dominates" hypothesis unless PickPromotion reports it.
+TEST(PickPromotion, ReportsAnExactMatchLevel) {
+  std::vector<std::string> texts = {"建"};
+  std::vector<::copilot::Entry> conts = {
+      {"建", 100.0, ::copilot::ProviderType::kDB},
+  };
+  auto p = rime::PickPromotion(texts, conts, 50);
+  ASSERT_EQ(p.index, 0);
+  EXPECT_EQ(p.level, 3);
+}
+
+TEST(PickPromotion, ReportsACandidateStartingAContinuation) {
+  std::vector<std::string> texts = {"建"};
+  std::vector<::copilot::Entry> conts = {
+      {"建瓴", 100.0, ::copilot::ProviderType::kDB},
+  };
+  auto p = rime::PickPromotion(texts, conts, 50);
+  ASSERT_EQ(p.index, 0);
+  EXPECT_EQ(p.level, 2);
+}
+
+TEST(PickPromotion, ReportsAContinuationStartingACandidate) {
+  std::vector<std::string> texts = {"建瓴之势"};
+  std::vector<::copilot::Entry> conts = {
+      {"建", 100.0, ::copilot::ProviderType::kDB},
+  };
+  auto p = rime::PickPromotion(texts, conts, 50);
+  ASSERT_EQ(p.index, 0);
+  EXPECT_EQ(p.level, 1);
+}
+
+TEST(PickPromotion, ReportsNoLevelWhenNothingMatches) {
+  std::vector<std::string> texts = {"无"};
+  std::vector<::copilot::Entry> conts = {
+      {"建", 100.0, ::copilot::ProviderType::kDB},
+  };
+  auto p = rime::PickPromotion(texts, conts, 50);
+  EXPECT_EQ(p.index, -1);
+  EXPECT_EQ(p.level, 0);
 }

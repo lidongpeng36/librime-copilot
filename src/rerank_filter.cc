@@ -2,6 +2,8 @@
 
 #include <rime/candidate.h>
 #include <rime/config.h>
+#include <rime/context.h>
+#include <rime/engine.h>
 #include <rime/schema.h>
 #include <rime/segmentation.h>
 #include <rime/ticket.h>
@@ -10,6 +12,7 @@
 #include <algorithm>
 
 #include "copilot_engine.h"
+#include "history.h"  // copilot::UTF8
 #include "prediction_context.h"
 #include "rerank.h"
 #include "surrounding_source.h"
@@ -22,10 +25,16 @@ namespace {
 class RerankTranslation : public PrefetchTranslation {
  public:
   RerankTranslation(an<Translation> translation, an<RerankContinuations> continuations,
-                    const RerankOptions& options)
+                    const RerankOptions& options, an<RerankTraceStore> traces, std::string input,
+                    std::string ctx, std::string src, TraceSpan span)
       : PrefetchTranslation(translation),
         continuations_(std::move(continuations)),
-        options_(options) {}
+        options_(options),
+        traces_(std::move(traces)),
+        input_(std::move(input)),
+        ctx_(std::move(ctx)),
+        src_(std::move(src)),
+        span_(span) {}
 
  protected:
   bool Replenish() override;
@@ -33,6 +42,14 @@ class RerankTranslation : public PrefetchTranslation {
  private:
   an<RerankContinuations> continuations_;
   RerankOptions options_;
+  an<RerankTraceStore> traces_;
+  std::string input_;
+  std::string ctx_;
+  std::string src_;
+  // The segment's own extent, captured in Apply(). A translation cannot reach
+  // the Segment — it sees candidates — so it is handed in, exactly like input_,
+  // ctx_ and src_.
+  TraceSpan span_;
   bool reordered_ = false;
 };
 
@@ -75,21 +92,56 @@ bool RerankTranslation::Replenish() {
     }
   }
 
+  // Record what re-ranking saw for this segment, even when it promotes
+  // nothing: a non-first selection here is still worth attributing to the
+  // context it was made against. Filled into a local and handed to the store
+  // in one place at the end, so the interleaving of Apply() and Replenish()
+  // across segments cannot publish a half-filled trace — and so one segment's
+  // decision no longer overwrites another's.
+  //
+  // The span is the SEGMENT's, not the head candidate's. `head_end` above is
+  // the head candidate's end, which is smaller whenever that candidate is a
+  // partial match — and the commit-side lookup keys on the segment's extent
+  // (telemetry_commit.cc, via TraceSpanOf). Keying the write on `head_end`
+  // meant those lookups missed, the event was written with `rr` absent, and
+  // analyze_telemetry.py filed it as "misrank": the bucket that blames the
+  // translator instead of this filter. `head_end` still decides which
+  // candidates may be reordered, above — that is a separate question and its
+  // behaviour is unchanged.
+  RerankTrace trace;
+  trace.valid = true;
+  trace.input = input_;
+  trace.start = span_.start;
+  trace.end = span_.end;
+  trace.ctx = ctx_;
+  trace.src = src_;
+
   // Back off from the most specific context key to the least.
-  for (const auto& entries : *continuations_) {
-    auto promotion = PickPromotion(texts, entries, options_.max_rank);
+  for (const auto& set : *continuations_) {
+    auto promotion = PickPromotion(texts, set.entries, options_.max_rank);
     if (promotion.index < 0) {
       continue;
     }
     const size_t from = positions[static_cast<size_t>(promotion.index)];
     DLOG(INFO) << "[copilot] rerank: promoting '" << window[from]->text() << "' from " << from
                << " (rank=" << promotion.rank << ")";
+    trace.record.key = set.key;
+    trace.record.key_len = set.key_len;
+    trace.record.n = static_cast<int>(set.entries.size());
+    trace.record.text = window[from]->text();
+    trace.record.from = static_cast<int>(from);
+    trace.record.rank = promotion.rank;
+    trace.record.level = promotion.level;
     if (from > 0) {
       auto promoted = window[from];
       window.erase(window.begin() + from);
       window.insert(window.begin(), promoted);
     }
     break;
+  }
+
+  if (traces_) {
+    traces_->Record(trace);
   }
 
   for (auto& cand : window) {
@@ -101,8 +153,8 @@ bool RerankTranslation::Replenish() {
 }  // namespace
 
 CopilotRerankFilter::CopilotRerankFilter(const Ticket& ticket, const an<CopilotDb>& db,
-                                         const RerankOptions& options)
-    : Filter(ticket), db_(db), options_(options) {
+                                         const RerankOptions& options, an<RerankTraceStore> traces)
+    : Filter(ticket), db_(db), options_(options), traces_(std::move(traces)) {
   LOG(INFO) << "[copilot] rerank: enable=" << options_.enable
             << ", max_context_chars=" << options_.max_context_chars
             << ", window=" << options_.window << ", max_rank=" << options_.max_rank
@@ -110,7 +162,22 @@ CopilotRerankFilter::CopilotRerankFilter(const Ticket& ticket, const an<CopilotD
 }
 
 bool CopilotRerankFilter::AppliesToSegment(Segment* segment) {
-  return !segment || !segment->HasTag("copilot");
+  // librime calls this immediately before Apply() for the same segment
+  // (engine.cc:225-226 -> menu.cc:22-24), and Apply() is handed only a
+  // Translation. This is therefore the one point where the segment's own extent
+  // — the span the commit-side lookup will search for — can be captured.
+  if (!segment) {
+    pending_trace_span_.reset();
+    return true;
+  }
+  if (segment->HasTag("copilot")) {
+    // Declined: this segment's Apply() will never run, so nothing may be left
+    // behind for the next segment's Apply() to misattribute it to.
+    pending_trace_span_.reset();
+    return false;
+  }
+  pending_trace_span_ = TraceSpanOf(*segment);
+  return true;
 }
 
 an<RerankContinuations> CopilotRerankFilter::LookupContinuations(const std::string& context) {
@@ -134,13 +201,22 @@ an<RerankContinuations> CopilotRerankFilter::LookupContinuations(const std::stri
       }
     }
     if (!entries.empty()) {
-      cached_continuations_->push_back(std::move(entries));
+      ContinuationSet set;
+      set.key = *it;
+      set.key_len = static_cast<int>(::copilot::UTF8(*it).size());
+      set.entries = std::move(entries);
+      cached_continuations_->push_back(std::move(set));
     }
   }
   return cached_continuations_;
 }
 
 an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, CandidateList* candidates) {
+  // Taken before any early return, so a span left by a segment this filter
+  // declined can never be picked up by a later segment's translation.
+  const std::optional<TraceSpan> span = pending_trace_span_;
+  pending_trace_span_.reset();
+
   if (!options_.enable || !db_ || !translation) {
     return translation;
   }
@@ -159,7 +235,13 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
     return translation;
   }
   DLOG(INFO) << "[copilot] rerank context: '" << context << "' keys=" << continuations->size();
-  return New<RerankTranslation>(translation, continuations, options_);
+  // With no span there is nothing a trace could safely be keyed on, so this
+  // translation records none rather than guessing. Re-ranking itself runs
+  // exactly the same either way.
+  return New<RerankTranslation>(
+      translation, continuations, options_, span ? traces_ : an<RerankTraceStore>(),
+      engine_->context()->input(), context, SurroundingSourceName(surrounding->source),
+      span.value_or(TraceSpan{}));
 }
 
 CopilotRerankFilterComponent::CopilotRerankFilterComponent(
@@ -184,13 +266,16 @@ CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) 
   options.window = std::clamp(options.window, 1, 200);
   options.max_rank = std::clamp(options.max_rank, 1, 100000);
   an<CopilotDb> db;
+  an<RerankTraceStore> traces;
   if (options.enable && engine_factory_) {
     db = engine_factory_->GetDb(db_name);
     if (!db) {
       LOG(ERROR) << "[copilot] rerank: failed to load db " << db_name;
     }
+    traces =
+        engine_factory_->GetRerankTraces(ticket.schema ? ticket.schema->schema_id() : string());
   }
-  return new CopilotRerankFilter(ticket, db, options);
+  return new CopilotRerankFilter(ticket, db, options, traces);
 }
 
 }  // namespace rime

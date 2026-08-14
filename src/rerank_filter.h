@@ -16,24 +16,34 @@
 // text: with only commit history we cannot tell that the caret was moved by a
 // mouse click, and a wrong promotion is worse than none.
 
+#include <rime/context.h>
 #include <rime/filter.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "copilot_db.h"
 #include "provider.h"
+#include "rerank_trace.h"
 
 namespace rime {
 
 class CopilotEngineComponent;
 struct Segment;
 
+// One context key and the db's successors for it.
+struct ContinuationSet {
+  std::string key;
+  int key_len = 0;  // in characters, not bytes
+  std::vector<::copilot::Entry> entries;
+};
+
 // The db's successors for each key of one context, longest key first. Shared
 // with the translations that use it: a later keystroke replaces the filter's
 // cache, and a menu that is still paging must keep reading the context it was
 // built for.
-using RerankContinuations = std::vector<std::vector<::copilot::Entry>>;
+using RerankContinuations = std::vector<ContinuationSet>;
 
 struct RerankOptions {
   bool enable = true;
@@ -49,12 +59,24 @@ struct RerankOptions {
 
 class CopilotRerankFilter : public Filter {
  public:
-  CopilotRerankFilter(const Ticket& ticket, const an<CopilotDb>& db, const RerankOptions& options);
+  CopilotRerankFilter(const Ticket& ticket, const an<CopilotDb>& db, const RerankOptions& options,
+                      an<RerankTraceStore> traces);
 
   an<Translation> Apply(an<Translation> translation, CandidateList* candidates) override;
 
   // Skip the prediction placeholder: those candidates are already db-ordered.
+  //
+  // Also the one place the Segment is reachable. librime calls this immediately
+  // before Menu::AddFilter(), which calls Apply() synchronously for the same
+  // segment (engine.cc:225-226 -> menu.cc:22-24, the only call sites of
+  // either), and Apply() itself receives only a Translation. So the segment's
+  // extent is stashed here and consumed by the next Apply().
   bool AppliesToSegment(Segment* segment) override;
+
+  // The span the next Apply() will key its trace on, exposed only so a test can
+  // pin the writer's convention: constructing the filter needs no engine, but
+  // reaching its Translation does.
+  const std::optional<TraceSpan>& pending_trace_span() const { return pending_trace_span_; }
 
  private:
   // Continuations for each key of `context`, longest key first. Cached because
@@ -64,6 +86,17 @@ class CopilotRerankFilter : public Filter {
 
   an<CopilotDb> db_;
   RerankOptions options_;
+  an<RerankTraceStore> traces_;
+
+  // Set by AppliesToSegment, consumed by Apply. Consumed rather than merely
+  // read: an Apply() that somehow arrived without a preceding
+  // AppliesToSegment() must record no trace at all rather than key one on the
+  // previous segment's span. Dropping an event is acceptable; misattributing
+  // one is not. This is unconditional: AppliesToSegment also resets the span
+  // on the path where it declines the segment (the "copilot" placeholder tag),
+  // since that segment's Apply() never runs and would otherwise leave a stale
+  // span for the next segment's Apply() to pick up.
+  std::optional<TraceSpan> pending_trace_span_;
 
   std::string cached_context_;
   an<RerankContinuations> cached_continuations_;

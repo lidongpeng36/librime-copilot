@@ -60,6 +60,10 @@ inline std::string TrailingCjkRun(const std::string& text, int max_chars) {
 struct Promotion {
   int index = -1;  // index into the candidate texts; -1 = leave the order alone
   int rank = 0;    // 1-based position among the key's continuations, by weight
+  int level = 0;   // match quality: 3 exact, 2 candidate-prefixes-continuation,
+                   // 1 continuation-prefixes-candidate, 0 no match. Reported so
+                   // the telemetry can test whether level 3 dominating is
+                   // harmful; PickPromotion's own logic is unchanged.
 };
 
 // Pick the candidate best supported by `continuations` (the db's successors for
@@ -124,7 +128,7 @@ inline Promotion PickPromotion(const std::vector<std::string>& candidate_texts,
   if (rank > max_rank) {
     return {};
   }
-  return Promotion{best_index, rank};
+  return Promotion{best_index, rank, best_level};
 }
 
 }  // namespace rime

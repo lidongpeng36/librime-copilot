@@ -12,7 +12,12 @@ set(copilot_test_src
   ime_bridge_state_test.cc
   prediction_context_test.cc
   rerank_test.cc
+  rerank_trace_test.cc
   spacing_matrix_test.cc
+  surrounding_source_test.cc
+  telemetry_commit_test.cc
+  telemetry_event_test.cc
+  telemetry_test.cc
   tmux_source_test.cc
   tmux_source_util_test.cc)
 
@@ -39,7 +44,12 @@ if(BUILD_MERGED_PLUGINS)
   target_link_libraries(copilot_test
     ${rime_library}
     ${rime_dict_library}
-    ${GTEST_LIBRARIES})
+    ${GTEST_LIBRARIES}
+    # Header-only INTERFACE target: contributes include directories only, no
+    # object code, so it cannot reintroduce the duplicate-globals problem the
+    # comment above describes. Needed because telemetry_event.h includes
+    # nlohmann/json.hpp and this branch does not otherwise see its includes.
+    nlohmann_json::nlohmann_json)
 else()
   add_executable(copilot_test
     ${copilot_test_src}

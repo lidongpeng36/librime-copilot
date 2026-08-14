@@ -12,6 +12,25 @@
 
 namespace rime {
 
+// Which subsystem answered "what text surrounds the caret?". Lives here rather
+// than in surrounding_source.h because that header already includes this one
+// for SurroundingText, and the reverse include would be a cycle.
+enum class SurroundingSource { kNone, kIMK, kBridge, kTmux };
+
+inline const char* SurroundingSourceName(SurroundingSource source) {
+  switch (source) {
+    case SurroundingSource::kIMK:
+      return "imk";
+    case SurroundingSource::kBridge:
+      return "bridge";
+    case SurroundingSource::kTmux:
+      return "tmux";
+    case SurroundingSource::kNone:
+      break;
+  }
+  return "none";
+}
+
 // Text surrounding the cursor position
 struct SurroundingText {
   // UTF-8 text immediately before the cursor. At least the boundary character
@@ -22,6 +41,9 @@ struct SurroundingText {
   // Client/app identity for per-app state isolation.
   // For ImeBridge, this is "app:instance". For IMK, this is a client pointer key.
   std::string client_key;
+  // Which source in the priority chain produced this snapshot. Set by
+  // GetSurroundingContext(); AutoSpacer ignores it, the telemetry records it.
+  SurroundingSource source = SurroundingSource::kNone;
 };
 
 // Get surrounding text from the most recent IMK client interaction.
