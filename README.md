@@ -211,6 +211,103 @@ component: grammar` in Rime's WARNING log). Owning the filter avoids that
 fight, and lets the context come from the real text before the caret rather
 than librime's "last commit only".
 
+### Telemetry
+
+Records contextual re-ranking decisions and non-first candidate selections, so
+ranking changes can be driven by data rather than impressions. Defaults on.
+
+```yaml
+copilot:
+  telemetry:
+    enable: true
+    top_n: 5                  # candidates recorded per event, 1-20
+    max_file_bytes: 8388608   # rotate past this size
+    keep_generations: 2       # counts the live file, so 2 = live + one archive
+```
+
+One file per machine at
+`<rime user dir>/private/copilot_telemetry/<installation_id>.jsonl`, created `0600`.
+Because no two machines write the same file, merging several machines' data is
+concatenation — no deduplication and no conflict resolution. These settings are
+process-wide, taken from whichever schema loads first: setting them differently
+per schema does not work, and a later schema whose settings are ignored gets a
+one-time `WARNING` in the log rather than a silently empty file.
+
+Telemetry is governed only by `telemetry/enable`, not by the `copilot` switch:
+turning the plugin off in the switch bar stops prediction but recording
+continues, because the re-ranking filter and the commit hook do not consult that
+switch. Set `enable: false` to stop recording.
+
+**What is in it.** Each line records the segment's input code, the selected
+candidate, the first `top_n` candidates, and — when re-ranking fired — which
+context key it used, what it promoted, from which position, and at what rank and
+match level. Field-by-field meaning is in
+`docs/superpowers/specs/2026-08-14-prediction-telemetry-design.md`.
+
+**Privacy.** The `ctx` field is Han characters only, by construction:
+`TrailingCjkRun` stops at the first non-Han character, so an ASCII secret on
+screen yields an empty context and re-ranking does not even run. But the
+selected and candidate texts are the user's own Chinese input, which makes this
+file a chronological transcript of it — unlike Rime's `*.userdb`, which is a
+frequency table with no timeline. The plugin makes no network connections;
+copying the file anywhere is an explicit, separate step
+(`tools/sync_telemetry.sh`). Be clear about what that step does, though: it puts
+the transcript into the iCloud sync directory, from where it is uploaded and
+lands on every machine signed into the account — so run it only when you accept
+that, and only for as long as you are analysing. Set `enable: false` to stop
+recording, and delete the directory to discard what was already recorded.
+
+The local file lives under `private/` because a Rime user directory is
+commonly a git repo of the user's own config layered on top of upstream, and
+`private/` is the conventional gitignore line for such a repo — keeping the
+transcript there means it cannot be committed by accident. The sync
+directory is not a git repo, so `sync_telemetry.sh` copies it out flat.
+
+**Analysing it.** On a single machine, read the live directory directly:
+
+```sh
+tools/analyze_telemetry.py ~/Library/Rime/private/copilot_telemetry/*.jsonl
+```
+
+Across machines, copy each machine's file into the shared directory first.
+`sync_telemetry.sh` resolves `sync_dir` from `installation.yaml` and prints the
+report command for it, path already filled in:
+
+```sh
+tools/sync_telemetry.sh                       # on each machine; prints the next command
+```
+
+The report is organised by the claim each section tests, from the design spec.
+A rejection rate that is flat across a section's buckets refutes that section's
+claim — which is the point. Python 3 standard library only; no dependencies.
+
+**Filters after `copilot_rerank_filter` invalidate events.** What re-ranking
+promoted is captured inside the filter; what the user selected is read at
+commit, from the candidate list as displayed. Any filter listed after
+`copilot_rerank_filter` in `engine/filters` sits between those two moments, and
+if it rewrites candidate text or reorders the list, the two are no longer
+comparable — the event looks like a rejected promotion whether or not the user
+rejected anything. Three common ones do exactly this:
+
+| Filter | What it does to an event |
+| --- | --- |
+| `simplifier@traditionalize` | Rewrites every candidate while the 繁 switch is on, so *every* event looks rejected |
+| `pin_cand_filter` | Reorders candidates, so `rr.from` and `sel_idx` index different lists |
+| `uniquifier` | Removes candidates, shifting the indices below |
+
+`analyze_telemetry.py` detects this without knowing any of their names: if
+re-ranking put a candidate first, the displayed list must start with it, so
+`top[0] != rr.text` means the head was altered downstream. Those events are
+excluded from every claim table and counted in the OVERALL section as
+`EXCLUDED, head altered downstream`, with a warning when they are more than 10%
+of the data. Check that number before trusting a rejection rate — if it is
+large, the tables rest on a small remainder of your typing.
+
+Note that the filter order is a deliberate choice, not a mistake: re-ranking is
+placed ahead of pinning so that pinned candidates win. To collect a clean
+sample, turn the offending filters off for the duration rather than reordering
+the chain.
+
 ### Auto Spacer Notes
 
 - Right-side spacing can be disabled with `copilot/auto_spacer/enable_right_space: false`.
