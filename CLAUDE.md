@@ -156,17 +156,36 @@ of a real weight silently inverts every ordering in the plugin. `Entry.weight`
 Third-party imports (`pypinyin`, `requests`, `bs4`) are lazy, at the
 point of use, so every module imports on a stock interpreter. `pypinyin` is
 required at runtime for any dictionary with no pinyin column (e.g.
-`tencent.dict.yaml`, which is `word⇥weight` only) — from a checkout, whether
-`build`/`update` finds it depends on the ambient interpreter (pyenv's
-per-directory `.python-version` resolves from the *caller's* current working
-directory, not the script's location, so this is easy to get wrong; a bare
-`#!/usr/bin/env python3` does not fix it, since that resolution happens
-regardless of the shebang). `install` (`tools/rime_copilot/install.py`)
-avoids this for the installed copy by rewriting the entry point's shebang to
-`sys.executable` — the absolute path of the interpreter that ran `install`
-— instead of copying the source's shebang through, and warns at install
-time (without refusing) if that interpreter cannot import `pypinyin`. Tests
-are stdlib `unittest` and never touch `~/Library/Rime`:
+`tencent.dict.yaml`, which is `word⇥weight` only); `requests`/`bs4` for
+`fetch`. From a checkout, whether they are found depends on the ambient
+interpreter (pyenv's per-directory `.python-version` resolves from the
+*caller's* current working directory, not the script's location, so this is
+easy to get wrong; a bare `#!/usr/bin/env python3` does not fix it, since
+that resolution happens regardless of the shebang). `install`
+(`tools/rime_copilot/install.py`) avoids this for the installed copy by
+rewriting the entry point's shebang to an absolute interpreter path instead
+of copying the source's shebang through. That path is chosen in order:
+`--python`, then the **destination's own `.python-version`**
+(`declared_interpreter()` — the nearest one at or above `private/bin`,
+resolved by `pyenv which python3`), then `sys.executable`. The last is the
+one that must not be first: it inherits the same pyenv-cwd trap, so running
+`install` from the checkout pinned whatever env a parent of the *checkout*
+named. The interpreter and the file it came from are printed as part of the
+plan (visible under `--dry-run`, before anything is written). Two invariants
+here are easy to break: (1) interpreter paths are taken **as given, never
+`resolve()`d** — a virtualenv's `bin/python3` is a symlink to its base
+interpreter, i.e. the one without the env's packages; (2) `PYENV_DIR` must
+be set explicitly on the `pyenv which` call — pyenv searches from
+`${PYENV_DIR:-$PWD}` and `$PWD` comes from the inherited env var, which
+subprocess `cwd=` does not update, so cwd alone silently resolved against
+the caller's directory while reporting the destination's version. The fake
+`pyenv` in `install_test.py` is deliberately faithful to that (it reads
+`${PYENV_DIR:-$PWD}/.python-version`); a stub echoing a fixed answer passed
+while the code was wrong. Dependency checking covers **all** of `RUNTIME_REQUIREMENTS`
+(`install.py`), not just `pypinyin` — an interpreter that had `pypinyin` and
+no `bs4` once installed without a word — and both `install` and every
+`status` name what is missing, what it breaks, and the `pip` command for it.
+Tests are stdlib `unittest` and never touch `~/Library/Rime`:
 
 ```sh
 python3 -m unittest discover -s tools/test -p '*_test.py'

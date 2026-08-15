@@ -13,6 +13,7 @@ repo it came from (which has since moved on).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -106,19 +107,176 @@ def _payload_matches(rel: str, a: Path, b: Path) -> bool:
     return sha256_file(a) == sha256_file(b)
 
 
-def interpreter_has_pypinyin(interpreter: str) -> bool:
-    """Whether `interpreter` -- an absolute path, not necessarily this
-    process -- can import `pypinyin`.
+def installed_interpreter(dest: Path) -> "str | None":
+    """The interpreter the installed entry point at `dest` actually runs
+    under, read from its shebang. `None` when nothing is installed there, or
+    its first line is not a shebang.
 
-    Runs it as a subprocess rather than `import pypinyin` here: this process
-    and the interpreter being pinned happen to be the same binary at install
-    time, but the question is about the pinned interpreter, and phrasing it
-    as a subprocess check keeps that true even if the two are ever
-    different.
+    Read from disk rather than recorded in the manifest because the shebang
+    is what the kernel obeys: a hand-edited one must be reported as the
+    truth it is, not papered over by a record of what `install` once
+    intended.
     """
-    result = subprocess.run([interpreter, "-c", "import pypinyin"],
-                            capture_output=True)
-    return result.returncode == 0
+    try:
+        with (dest / ENTRY_POINT).open("rb") as handle:
+            first_line = handle.readline()
+    except OSError:
+        return None
+    if not first_line.startswith(b"#!"):
+        return None
+    return first_line[2:].decode("utf-8", "replace").strip() or None
+
+
+PYTHON_VERSION_FILE = ".python-version"
+
+
+@dataclass(frozen=True)
+class Declared:
+    """The interpreter the install destination itself asks for."""
+    version_file: Path
+    version: str
+    interpreter: "str | None"  # None when `version` could not be resolved to a path
+    problem: "str | None"      # why, when it could not
+
+
+def find_python_version_file(dest: Path) -> "Path | None":
+    """The nearest `.python-version` at or above `dest`, as pyenv would find
+    it -- nearest first, walking up to the filesystem root.
+
+    Deliberately our own search rather than letting `pyenv which` do the
+    walking: pyenv always answers, falling back to the global version when
+    no file exists anywhere, and "the destination declared an interpreter"
+    and "pyenv has a global default" are not remotely the same statement.
+    Only the first is a reason to override the interpreter running install.
+    """
+    for directory in [dest, *dest.parents]:
+        candidate = directory / PYTHON_VERSION_FILE
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def declared_interpreter(dest: Path) -> "Declared | None":
+    """The interpreter `dest` declares for itself via `.python-version`, or
+    `None` when it declares nothing.
+
+    `~/Library/Rime/private/.python-version` already said `rime` while
+    `install` was pinning whatever the caller's shell resolved from some
+    unrelated parent directory. The declaration sits next to the thing that
+    needs it and survives being installed from anywhere, which is exactly
+    what `sys.executable` does not do.
+
+    Never raises: a declaration naming a version pyenv cannot resolve is a
+    thing to report and fall back from, not a reason `install` should fail.
+    """
+    version_file = find_python_version_file(dest)
+    if version_file is None:
+        return None
+    try:
+        content = version_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        return Declared(version_file, "", None, f"cannot be read: {exc}")
+    # pyenv accepts several versions in one file; the first is the one that
+    # provides `python3`, and the only one worth naming in a plan line.
+    names = [line.strip() for line in content.splitlines() if line.strip()]
+    if not names:
+        return None
+    version = names[0]
+
+    # `pyenv which python3` rather than guessing `$PYENV_ROOT/versions/<v>/
+    # bin/python3`: pyenv owns the mapping from a name to a path -- plain
+    # versions, named virtualenvs, `system` -- and reimplementing it here
+    # would be a second, quietly diverging copy of it.
+    #
+    # PYENV_DIR, not just cwd: pyenv searches from `${PYENV_DIR:-$PWD}`, and
+    # `$PWD` in the child comes from the *inherited environment variable*,
+    # which subprocess's `cwd=` does not update. Passing cwd alone therefore
+    # resolved against wherever `install` was invoked from -- reporting the
+    # destination's `rime` while handing back the checkout's `llama`, which
+    # is the whole bug wearing a correct-looking label. PYENV_VERSION is
+    # dropped so an ambient `pyenv shell` cannot outrank the file either.
+    directory = str(version_file.parent)
+    environment = {k: v for k, v in os.environ.items() if k != "PYENV_VERSION"}
+    environment["PYENV_DIR"] = directory
+    environment["PWD"] = directory
+    try:
+        result = subprocess.run(["pyenv", "which", "python3"], cwd=directory,
+                                capture_output=True, text=True, env=environment, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return Declared(version_file, version, None,
+                        "pyenv is not on PATH, so the name cannot be resolved to a path")
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()
+        return Declared(version_file, version, None,
+                        detail[-1] if detail else "pyenv could not resolve it")
+    # Taken as given, not resolved: a virtualenv's bin/python3 is a symlink
+    # to its base interpreter, the one interpreter without its packages.
+    path = result.stdout.strip()
+    if not path or not os.access(path, os.X_OK):
+        return Declared(version_file, version, None,
+                        f"pyenv named {path or '(nothing)'}, which is not an executable")
+    return Declared(version_file, version, path, None)
+
+
+@dataclass(frozen=True)
+class Requirement:
+    module: str   # what the code imports
+    package: str  # what pip installs to provide it -- not always the same
+    breaks: str   # what stops working without it
+
+
+# Every third-party module this package imports, and what its absence costs.
+# The imports are lazy by design, so that the CLI starts on a stock
+# interpreter -- which also means a missing one surfaces as an ImportError
+# partway through a subcommand, on a machine whose whole point is to have no
+# checkout to read. Install time is the one moment the whole set is cheap to
+# check at once, so it checks the whole set: `pypinyin` alone was not enough
+# once, on an interpreter that had it and had no `bs4`.
+RUNTIME_REQUIREMENTS = (
+    Requirement("pypinyin", "pypinyin",
+                "`build` and `update` on any dictionary without a pinyin column "
+                "(e.g. tencent.dict.yaml)"),
+    Requirement("requests", "requests", "`fetch` (downloading .scel cell dictionaries)"),
+    Requirement("bs4", "beautifulsoup4", "`fetch` (finding the .scel download links)"),
+)
+
+# One subprocess for the whole set: an interpreter start costs far more than
+# the imports do, and a check that scales its cost with the number of
+# dependencies is a check someone eventually moves out of `status`.
+_PROBE = """
+import sys
+for name in sys.argv[1:]:
+    try:
+        __import__(name)
+    except Exception:
+        print(name)
+"""
+
+
+def missing_requirements(interpreter: str,
+                         requirements: "tuple[Requirement, ...] | None" = None
+                         ) -> list[Requirement]:
+    """Which of `requirements` `interpreter` cannot import.
+
+    Runs it as a subprocess rather than importing here: the two are the same
+    binary when `install` runs without `--python`, but the question is always
+    about the *pinned* interpreter, and a subprocess keeps the answer true
+    when they differ.
+
+    An interpreter that cannot be run at all counts as missing everything --
+    a pinned virtualenv that has since been deleted is the loudest form of
+    this problem, not an exemption from reporting it.
+    """
+    requirements = RUNTIME_REQUIREMENTS if requirements is None else requirements
+    try:
+        result = subprocess.run([interpreter, "-c", _PROBE, *(r.module for r in requirements)],
+                                capture_output=True, text=True)
+    except OSError:
+        return list(requirements)
+    if result.returncode != 0:
+        return list(requirements)
+    missing = set(result.stdout.split())
+    return [r for r in requirements if r.module in missing]
 
 
 def plan_install(source_root: Path, dest: Path, builder: Path) -> list[Action]:

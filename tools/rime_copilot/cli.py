@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -52,6 +54,26 @@ def _stamp_path(rime_dir: Path, output: Path) -> Path:
     return output.parent / (output.name + ".stamp.json")
 
 
+def _print_missing_requirements(interpreter: str) -> None:
+    """Name every dependency `interpreter` lacks, and the exact command that
+    would install them.
+
+    Printed by both `install` and `status` for the same reason drift is: an
+    interpreter is a thing that rots after you pin it -- a virtualenv gets
+    rebuilt, a package gets pruned -- and the failure it causes surfaces
+    somewhere far away, in the middle of a subcommand, as an ImportError.
+    """
+    missing = install.missing_requirements(interpreter)
+    if not missing:
+        return
+    print(f"warning: {interpreter} is missing {len(missing)} of the pipeline's "
+          f"dependencies:")
+    for requirement in missing:
+        print(f"  {requirement.module:<10} needed by {requirement.breaks}")
+    packages = " ".join(r.package for r in missing)
+    print(f"  install with: {interpreter} -m pip install {packages}")
+
+
 def _print_installed_status(rime_dir: Path) -> None:
     dest = _install_dest(rime_dir)
     installed = install.read_install_manifest(dest)
@@ -59,16 +81,28 @@ def _print_installed_status(rime_dir: Path) -> None:
         print("installed: not installed")
         return
     commit7 = installed.source_commit[:7] if installed.source_commit else "unknown"
+    interpreter = install.installed_interpreter(dest)
     if not Path(installed.source_root).is_dir():
         print(f"installed: {dest} @ {commit7} (source repo not present; cannot compare)")
+    else:
+        lines = install.drift(dest)
+        if not lines:
+            print(f"installed: {dest} @ {commit7} (in sync)")
+        else:
+            names = [line.split(":", 1)[0] for line in lines]
+            print(f"installed: {dest} @ {commit7} — {len(lines)} file(s) differ from the "
+                 f"repo: {', '.join(names)}")
+    if interpreter is None:
         return
-    lines = install.drift(dest)
-    if not lines:
-        print(f"installed: {dest} @ {commit7} (in sync)")
-        return
-    names = [line.split(":", 1)[0] for line in lines]
-    print(f"installed: {dest} @ {commit7} — {len(lines)} file(s) differ from the "
-         f"repo: {', '.join(names)}")
+    print(f"python:    {interpreter}")
+    # Same family as file drift, and just as invisible: editing
+    # `private/.python-version` looks like it should take effect, but the
+    # shebang was frozen at install time and nothing re-reads it.
+    declared = install.declared_interpreter(dest)
+    if declared is not None and declared.interpreter not in (None, interpreter):
+        print(f"           {declared.version_file} now names `{declared.version}` "
+              f"({declared.interpreter}); re-run install to pin it")
+    _print_missing_requirements(interpreter)
 
 
 def _vault_dir_or_error(rime_dir: Path) -> "tuple[Path | None, str | None]":
@@ -295,6 +329,56 @@ def _git_commit(source_root: Path) -> "str | None":
     return result.stdout.strip() or None
 
 
+def _interpreter_from_spec(spec: str) -> "tuple[str | None, str | None]":
+    """`--python`'s value as an absolute interpreter path, or why it is not one."""
+    # A bare name is resolved on PATH, so `--python python3.11` works without
+    # anyone having to look up where pyenv put it.
+    found = str(Path(spec).expanduser()) if os.sep in spec else shutil.which(spec)
+    if not found or not Path(found).is_file() or not os.access(found, os.X_OK):
+        return None, f"--python: no executable interpreter at {spec}"
+    # abspath, deliberately not resolve(): a virtualenv's `bin/python3` is a
+    # symlink to the base interpreter, and pinning the resolved target would
+    # pin the one interpreter that does *not* have the environment's
+    # packages -- the exact failure --python exists to fix.
+    return os.path.abspath(found), None
+
+
+def _choose_interpreter(spec: "str | None", dest: Path
+                        ) -> "tuple[str | None, str, str | None]":
+    """The interpreter to pin, where that choice came from, and any error.
+
+    In order: `--python`, then the `.python-version` the destination itself
+    declares, then the interpreter running `install`.
+
+    The last is the one that must not be first. Under pyenv, `python3` is a
+    shim resolving `.python-version` from the *caller's* current directory,
+    so `install` run from the checkout pins whatever environment some parent
+    of the *checkout* names -- one chosen for an unrelated project, with no
+    reason to have this pipeline's dependencies. The destination's own
+    `.python-version` is the declaration that is actually about this
+    installation, and it lives next to it, so it says the same thing however
+    `install` was invoked.
+    """
+    if spec is not None:
+        interpreter, error = _interpreter_from_spec(spec)
+        return interpreter, "--python", error
+
+    declared = install.declared_interpreter(dest)
+    if declared is None:
+        return (sys.executable,
+                f"the interpreter running install; no {install.PYTHON_VERSION_FILE} "
+                f"at or above {dest}", None)
+    if declared.interpreter is None:
+        # An unresolvable declaration is worth saying out loud and then
+        # working around: refusing to install over it would strand the very
+        # machine that is trying to get set up.
+        print(f"warning: {declared.version_file} names `{declared.version}`, but "
+              f"{declared.problem}")
+        return (sys.executable,
+                "the interpreter running install; pass --python to choose another", None)
+    return declared.interpreter, f"{declared.version_file} (`{declared.version}`)", None
+
+
 def cmd_install(args) -> int:
     rime_dir = args.rime_dir
     source_root = Path(__file__).resolve().parent.parent
@@ -305,26 +389,31 @@ def cmd_install(args) -> int:
              f"checkout -- installing from an installed copy would launder drift")
         return 1
 
+    # Resolved before anything is written, and reported as part of the plan:
+    # which interpreter gets pinned is the single most consequential thing
+    # `install` decides, and the one a `--dry-run` most needs to reveal.
+    interpreter, provenance, error = _choose_interpreter(args.python, dest)
+    if interpreter is None:
+        print(error)
+        return 1
+
     builder = paths.find_builder(args.builder)
     actions = install.plan_install(source_root, dest, builder)
     for action in actions:
         print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
+    print(f"  {'python':<17} {interpreter}")
+    print(f"  {'':<17} from {provenance}")
+    _print_missing_requirements(interpreter)
     if args.dry_run:
         return 0
 
     commit = _git_commit(source_root)
-    # Pinned explicitly (not left to apply_install's own default) so the same
-    # value drives both the entry point's shebang and the pypinyin check
-    # below -- this is the interpreter running `install`, which is the one
-    # piece of information the repo itself cannot supply (see install.py's
+    # Pinned explicitly rather than left to apply_install's own default, so
+    # one value drives the entry point's shebang and the dependency check
+    # alike -- and so `--python` has somewhere to reach (see install.py's
     # module docstring and README "Keeping the installed copy honest").
-    interpreter = sys.executable
     install.apply_install(source_root, dest, builder, commit, _now(), interpreter=interpreter)
     print(f"installed to {dest} @ {commit[:7] if commit else 'unknown'}")
-    if not install.interpreter_has_pypinyin(interpreter):
-        print(f"warning: {interpreter} cannot import pypinyin -- `status`, `restore`, and "
-             f"`backup` will work, but `build` and `update` will fail on any dictionary "
-             f"without a pinyin column (e.g. tencent.dict.yaml)")
     return 0
 
 
@@ -405,6 +494,11 @@ def build_parser() -> argparse.ArgumentParser:
     install_cmd = sub.add_parser("install")
     install_cmd.add_argument("--dest", help="where to install (default: <rime-dir>/private/bin)")
     install_cmd.add_argument("--builder", help=f"path to {paths.BUILDER_NAME}")
+    install_cmd.add_argument(
+        "--python",
+        help="interpreter to pin in the installed entry point's shebang "
+             "(default: whatever the destination's own .python-version "
+             "declares, else the interpreter running install)")
     install_cmd.set_defaults(func=cmd_install)
     return parser
 

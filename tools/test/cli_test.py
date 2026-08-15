@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -401,6 +402,205 @@ class Install(CliBase):
         _, out = self.run_cli("status")
         self.assertIn("paths.py", out)
         self.assertIn("differ", out)
+
+
+class InstallInterpreter(CliBase):
+    """`install` defaults to `sys.executable`, which under pyenv is whatever
+    a parent directory's `.python-version` names -- resolved from the
+    *caller's* cwd, not the checkout's. `--python` is how you say which
+    interpreter you actually meant, and both the plan and `status` name the
+    one in force so a wrong pick is visible before it costs a subcommand.
+    """
+
+    def other_interpreter(self) -> Path:
+        # A real, runnable interpreter at a path distinguishable from
+        # sys.executable, so "the flag was honoured" is an observable fact
+        # and not just "the default happened to be the same binary".
+        #
+        # A symlink specifically, which also pins down that the given path is
+        # *not* resolved through to its target: a virtualenv's `bin/python3`
+        # is exactly this shape, and resolving it would pin the base
+        # interpreter -- the one without the environment's packages, i.e.
+        # the very failure --python exists to fix.
+        link = Path(self.tmp.name) / "other-python3"
+        link.symlink_to(sys.executable)
+        return link
+
+    def shebang(self) -> str:
+        entry_point = self.rime / "private" / "bin" / "rime-copilot"
+        return entry_point.read_text(encoding="utf-8").splitlines()[0]
+
+    def test_python_flag_pins_the_named_interpreter(self):
+        other = self.other_interpreter()
+        code, _ = self.run_cli("install", "--builder", str(self.fake_builder()),
+                               "--python", str(other))
+        self.assertEqual(0, code)
+        self.assertEqual(f"#!{other}", self.shebang())
+
+    def test_with_nothing_declared_the_running_interpreter_is_pinned(self):
+        # The fixture Rime dir has no .python-version above it, so this is
+        # the last-resort branch, not the declared one.
+        self.run_cli("install", "--builder", str(self.fake_builder()))
+        self.assertEqual(f"#!{sys.executable}", self.shebang())
+
+    def test_the_plan_names_the_interpreter_it_would_pin(self):
+        other = self.other_interpreter()
+        code, out = self.run_cli("--dry-run", "install", "--builder",
+                                 str(self.fake_builder()), "--python", str(other))
+        self.assertEqual(0, code)
+        self.assertIn(str(other), out)
+
+    def test_a_nonexistent_interpreter_is_refused_and_installs_nothing(self):
+        missing = Path(self.tmp.name) / "no-such-python3"
+        code, out = self.run_cli("install", "--builder", str(self.fake_builder()),
+                                 "--python", str(missing))
+        self.assertEqual(1, code)
+        self.assertIn(str(missing), out)
+        self.assertIsNone(I.read_install_manifest(self.rime / "private" / "bin"))
+
+    def test_status_names_the_pinned_interpreter(self):
+        other = self.other_interpreter()
+        self.run_cli("install", "--builder", str(self.fake_builder()),
+                     "--python", str(other))
+        _, out = self.run_cli("status")
+        self.assertIn(str(other), out)
+
+
+class InstallDeclaredInterpreter(CliBase):
+    """`~/Library/Rime/private/.python-version` already named the right
+    environment while `install` was pinning whatever the caller's shell
+    resolved. The destination's declaration is about *this* installation and
+    travels with it, so it beats the interpreter that happens to be running.
+    """
+
+    def declare(self, version: str = "rime") -> Path:
+        version_file = self.rime / "private" / ".python-version"
+        version_file.write_text(f"{version}\n", encoding="utf-8")
+        return version_file
+
+    def fake_pyenv(self, answer: "Path | None" = None, fails: bool = False) -> Path:
+        """A `pyenv` on PATH answering `which python3` with `answer`.
+
+        A stub, so these tests say the same thing on a machine with no pyenv
+        installed and can stage the "version is not installed" failure.
+        """
+        bin_dir = Path(self.tmp.name) / "fakebin"
+        bin_dir.mkdir(exist_ok=True)
+        script = bin_dir / "pyenv"
+        if fails:
+            script.write_text("#!/bin/sh\necho \"pyenv: version \\`rime' is not "
+                              "installed\" >&2\nexit 1\n", encoding="utf-8")
+        else:
+            script.write_text(f'#!/bin/sh\n[ "$1" = which ] || exit 1\necho "{answer}"\n',
+                              encoding="utf-8")
+        script.chmod(0o755)
+        self.enterContext(mock.patch.dict(
+            os.environ, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}))
+        return script
+
+    def declared_python(self) -> Path:
+        link = Path(self.tmp.name) / "declared-python3"
+        link.symlink_to(sys.executable)
+        return link
+
+    def shebang(self) -> str:
+        entry_point = self.rime / "private" / "bin" / "rime-copilot"
+        return entry_point.read_text(encoding="utf-8").splitlines()[0]
+
+    def test_the_declaration_is_used_without_being_asked(self):
+        self.declare()
+        declared = self.declared_python()
+        self.fake_pyenv(answer=declared)
+        code, _ = self.run_cli("install", "--builder", str(self.fake_builder()))
+        self.assertEqual(0, code)
+        self.assertEqual(f"#!{declared}", self.shebang())
+
+    def test_the_plan_names_the_file_the_choice_came_from(self):
+        version_file = self.declare()
+        self.fake_pyenv(answer=self.declared_python())
+        _, out = self.run_cli("--dry-run", "install", "--builder", str(self.fake_builder()))
+        self.assertIn(str(version_file), out)
+        self.assertIn("rime", out)
+
+    def test_an_explicit_python_flag_still_wins(self):
+        self.declare()
+        self.fake_pyenv(answer=self.declared_python())
+        override = Path(self.tmp.name) / "override-python3"
+        override.symlink_to(sys.executable)
+        self.run_cli("install", "--builder", str(self.fake_builder()),
+                     "--python", str(override))
+        self.assertEqual(f"#!{override}", self.shebang())
+
+    def test_an_unresolvable_declaration_warns_and_still_installs(self):
+        version_file = self.declare()
+        self.fake_pyenv(fails=True)
+        code, out = self.run_cli("install", "--builder", str(self.fake_builder()))
+        self.assertEqual(0, code, "a broken declaration must not strand the machine")
+        self.assertIn(str(version_file), out)
+        self.assertIn("not installed", out)
+        self.assertEqual(f"#!{sys.executable}", self.shebang())
+
+    def test_status_reports_a_declaration_changed_after_install(self):
+        # Editing .python-version looks like it should take effect; the
+        # shebang was frozen at install time and nothing re-reads it.
+        self.run_cli("install", "--builder", str(self.fake_builder()))
+        self.declare()
+        declared = self.declared_python()
+        self.fake_pyenv(answer=declared)
+        _, out = self.run_cli("status")
+        self.assertIn(str(declared), out)
+        self.assertIn("re-run install", out)
+
+    def test_status_is_quiet_when_the_declaration_matches(self):
+        self.declare()
+        self.fake_pyenv(answer=self.declared_python())
+        self.run_cli("install", "--builder", str(self.fake_builder()))
+        _, out = self.run_cli("status")
+        self.assertNotIn("re-run install", out)
+
+
+class InstallDependencies(CliBase):
+    """A dependency the pinned interpreter lacks must be reported at install
+    time and at every `status` -- all of them, not just `pypinyin`. Checking
+    one of three is how an interpreter with `pypinyin` and no `bs4` installed
+    clean and then failed in `fetch`.
+    """
+
+    ABSENT = I.Requirement("no_such_module_pqxz", "no-such-pkg", "`fetch` (the download step)")
+
+    def install_missing_one(self, *args) -> "tuple[int, str]":
+        with mock.patch.object(I, "RUNTIME_REQUIREMENTS", (self.ABSENT,)):
+            return self.run_cli("install", "--builder", str(self.fake_builder()), *args)
+
+    def test_install_names_the_missing_module_and_what_it_breaks(self):
+        code, out = self.install_missing_one()
+        self.assertEqual(0, code, "a missing dependency warns, it does not refuse")
+        self.assertIn("no_such_module_pqxz", out)
+        self.assertIn("fetch", out)
+
+    def test_install_prints_a_pip_command_naming_the_pinned_interpreter(self):
+        _, out = self.install_missing_one()
+        self.assertIn("no-such-pkg", out)
+        self.assertIn(f"{sys.executable} -m pip install", out)
+
+    def test_the_dry_run_plan_warns_before_anything_is_installed(self):
+        with mock.patch.object(I, "RUNTIME_REQUIREMENTS", (self.ABSENT,)):
+            code, out = self.run_cli("--dry-run", "install", "--builder",
+                                     str(self.fake_builder()))
+        self.assertEqual(0, code)
+        self.assertIn("no_such_module_pqxz", out)
+
+    def test_status_reports_it_again_on_an_installed_copy(self):
+        self.run_cli("install", "--builder", str(self.fake_builder()))
+        with mock.patch.object(I, "RUNTIME_REQUIREMENTS", (self.ABSENT,)):
+            _, out = self.run_cli("status")
+        self.assertIn("no_such_module_pqxz", out)
+
+    def test_a_satisfied_interpreter_gets_no_warning(self):
+        present = I.Requirement("json", "json", "nothing")
+        with mock.patch.object(I, "RUNTIME_REQUIREMENTS", (present,)):
+            _, out = self.run_cli("install", "--builder", str(self.fake_builder()))
+        self.assertNotIn("warning", out)
 
 
 if __name__ == "__main__":

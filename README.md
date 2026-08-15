@@ -573,6 +573,12 @@ Then, from the checkout, install the CLI once:
 tools/rime-copilot install   # copies the CLI + build_copilot into private/bin
 ```
 
+It pins an interpreter into the installed entry point's shebang, taking it
+from `private/.python-version` if that names a pyenv environment. Check the
+`python …` line it prints against the environment that actually has
+`pypinyin`, `requests`, and `beautifulsoup4`; pass `--python` to override it.
+See "Which interpreter the installed copy runs under" below.
+
 After that, `~/Library/Rime/private/bin/rime-copilot` works on its own —
 `restore` and `update` no longer need the librime checkout at all:
 
@@ -609,20 +615,66 @@ from the checkout to bring the installed copy back in sync; `install` itself
 refuses to run from anything that is not a checkout, so an installed copy can
 never become the source for another install.
 
-`update` needs `pypinyin` if any configured dictionary has no pinyin column
-(`tencent.dict.yaml` is the common case — it's `word⇥weight` only, so every
-entry needs a generated pinyin). Third-party imports are lazy, so a stock
-interpreter is fine until that point. `install` pins the interpreter for
-this: it rewrites `private/bin/rime-copilot`'s shebang to the absolute path
-of the interpreter that ran `install` (`sys.executable`), instead of copying
-the checkout's `#!/usr/bin/env python3` through verbatim. That rewrite is
-what makes the installed copy work standalone — a bare `#!/usr/bin/env
-python3` would *not* have been enough even with `private/.python-version`
-pinning a pyenv environment that has `pypinyin`: pyenv resolves
-`.python-version` from the *caller's* current working directory, not the
-script's location, so `rime-copilot` run from anywhere other than
-`private/` would silently fall back to the global interpreter and lose
-`pypinyin`. `install` also checks, at install time, whether the interpreter
-it is pinning can import `pypinyin`, and warns (without refusing to install)
-if it cannot — `status`, `restore`, and `backup` do not need it; only
-`build` and `update` do, and only for dictionaries without a pinyin column.
+### Which interpreter the installed copy runs under
+
+The pipeline has three third-party dependencies, all imported lazily so that
+the CLI starts on a stock interpreter: `pypinyin` (needed by `build` and
+`update` for any dictionary with no pinyin column — `tencent.dict.yaml` is
+the common case, `word⇥weight` only, so every entry needs a generated
+pinyin), and `requests` + `beautifulsoup4` (needed by `fetch`). Lazy imports
+are why `status`, `restore`, and `backup` work on anything; they are also why
+a missing dependency shows up as an `ImportError` halfway through a
+subcommand, on the machine whose whole point is to have no checkout to read.
+
+`install` pins one interpreter for all of that: it rewrites
+`private/bin/rime-copilot`'s shebang to an absolute interpreter path instead
+of copying the checkout's `#!/usr/bin/env python3` through verbatim. That
+rewrite is what makes the installed copy work standalone — a bare
+`#!/usr/bin/env python3` would *not* have been enough even with
+`private/.python-version` pinning a pyenv environment that has the
+dependencies: pyenv resolves `.python-version` from the *caller's* current
+working directory, not the script's location, so `rime-copilot` run from
+anywhere other than `private/` would silently fall back to the global
+interpreter and lose them.
+
+Which interpreter it pins is decided in this order:
+
+1. `--python`, when you pass it.
+2. **The destination's own `.python-version`** — `install` reads the nearest
+   one at or above `private/bin` (so `private/.python-version` is the natural
+   place) and asks `pyenv which python3` to turn the name into a path.
+3. The interpreter that ran `install` (`sys.executable`).
+
+The third is the one that must not be first, and it used to be. Under pyenv,
+`python3` is a shim resolving `.python-version` from the *caller's* current
+directory — so running `install` from the checkout pinned whatever
+environment some parent of the *checkout* happened to name, an environment
+chosen for an unrelated project with no reason to have this pipeline's
+dependencies. `private/.python-version` is the declaration that is actually
+about this installation, it lives next to it, and it says the same thing no
+matter where `install` was invoked from.
+
+Two details that are easy to get backwards, both load-bearing:
+
+- The interpreter path is taken **as given, never `resolve()`d**. A
+  virtualenv's `bin/python3` is a symlink to its base interpreter — the one
+  interpreter that does *not* have the environment's packages.
+- pyenv searches from `${PYENV_DIR:-$PWD}`, and `$PWD` in a child process
+  comes from the inherited environment variable, which setting a subprocess
+  `cwd` does **not** update. `PYENV_DIR` is set explicitly for that call;
+  without it the answer came from wherever `install` was run while the
+  reported version came from the destination — a wrong interpreter wearing a
+  correct-looking label.
+
+A declaration naming a version pyenv cannot resolve warns and falls back to
+`sys.executable`; it never refuses, since refusing would strand the machine
+being set up.
+
+The interpreter in force, and the file it came from, are printed as part of
+the plan — so `--dry-run` shows a wrong choice *before* anything is written —
+along with every missing dependency, what it breaks, and the `pip` command
+that fixes it. `status` reprints all of it on every run, and says so when
+`.python-version` has since changed to name something other than what is
+pinned. An interpreter rots after you pin it — virtualenvs get rebuilt,
+packages get pruned — and that rot is exactly as invisible as the file drift
+above it.
