@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Sequence
 
-from . import dictdb, dictfile, freshness, paths, scel, vault
+from . import dictdb, dictfile, freshness, install, paths, scel, vault
 
 DEFAULT_SQUIRREL = Path("/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel")
 SOGOU_DICT_NAME = "sogou.dict.yaml"
@@ -28,6 +28,75 @@ def _now() -> str:
 
 def _private(rime_dir: Path) -> Path:
     return rime_dir / "private"
+
+
+def _install_dest(rime_dir: Path) -> Path:
+    return _private(rime_dir) / "bin"
+
+
+def _stamp_path(rime_dir: Path, output: Path) -> Path:
+    """The stamp file describing a build that wrote to `output`.
+
+    One stamp per described output, not one per Rime directory -- `--output`
+    lets `build` target a database other than the default, and a shared
+    stamp would let a build of one output overwrite the bookkeeping for
+    another (see `freshness.STAMP_NAME`'s neighbours in git history for the
+    incident this fixes). The default output keeps the long-lived
+    `STAMP_NAME` -- a real stamp already exists there on deployed machines,
+    describing a current, valid build, and there is no reason to orphan it.
+    Any other `--output` gets a stamp named after it, beside it.
+    """
+    default_output = (_private(rime_dir) / PREDICT_DB_NAME).resolve()
+    if output.resolve() == default_output:
+        return _private(rime_dir) / freshness.STAMP_NAME
+    return output.parent / (output.name + ".stamp.json")
+
+
+def _print_installed_status(rime_dir: Path) -> None:
+    dest = _install_dest(rime_dir)
+    installed = install.read_install_manifest(dest)
+    if installed is None:
+        print("installed: not installed")
+        return
+    commit7 = installed.source_commit[:7] if installed.source_commit else "unknown"
+    if not Path(installed.source_root).is_dir():
+        print(f"installed: {dest} @ {commit7} (source repo not present; cannot compare)")
+        return
+    lines = install.drift(dest)
+    if not lines:
+        print(f"installed: {dest} @ {commit7} (in sync)")
+        return
+    names = [line.split(":", 1)[0] for line in lines]
+    print(f"installed: {dest} @ {commit7} — {len(lines)} file(s) differ from the "
+         f"repo: {', '.join(names)}")
+
+
+def _vault_dir_or_error(rime_dir: Path) -> "tuple[Path | None, str | None]":
+    """`paths.vault_dir`, or an actionable message instead of a raw traceback.
+
+    `sync_dir` is not something Squirrel writes -- verified against
+    ~/repo/librime/src/rime/lever/deployment_tasks.cc: the write-back there
+    (lines 136-163) sets installation_id/install_time/update_time/
+    distribution_*/rime_version, and nothing else. A genuinely new Mac's
+    installation.yaml has no `sync_dir` until someone adds it by hand, so
+    this is not a rare misconfiguration -- it is the first-run state.
+    """
+    try:
+        return paths.vault_dir(rime_dir), None
+    except (FileNotFoundError, LookupError) as exc:
+        installation_yaml = rime_dir / "installation.yaml"
+        message = (
+            f"cannot find the vault: {exc}\n"
+            f"`sync_dir` is added to installation.yaml by hand -- Squirrel "
+            f"never writes it. Add a line like:\n"
+            f'  sync_dir: "/Users/you/Library/Mobile Documents/com~apple~CloudDocs/RimeSync"\n'
+            f"to {installation_yaml}, pointing at wherever you keep (or want "
+            f"to create) the iCloud-synced vault. Write that path down "
+            f"somewhere durable outside this repo: installation.yaml is "
+            f"deliberately never itself backed up, so this is the only "
+            f"record of where the vault lives."
+        )
+        return None, message
 
 
 def cmd_status(args) -> int:
@@ -46,22 +115,26 @@ def cmd_status(args) -> int:
     output = _private(rime_dir) / PREDICT_DB_NAME
     if not config.is_file():
         print(f"build:    no {config}")
-        return 0
-    try:
-        reason = freshness.rebuild_reason(
-            freshness.compute_stamp(rime_dir, config, output),
-            freshness.read_stamp(_private(rime_dir) / freshness.STAMP_NAME))
-    except FileNotFoundError as exc:
-        # status is what you run when something is already wrong; it reports.
-        print(f"build:    cannot tell ({exc})")
-        return 0
-    print(f"build:    {reason or 'up to date'}")
+    else:
+        try:
+            reason = freshness.rebuild_reason(
+                freshness.compute_stamp(rime_dir, config, output),
+                freshness.read_stamp(_stamp_path(rime_dir, output)))
+            print(f"build:    {reason or 'up to date'}")
+        except FileNotFoundError as exc:
+            # status is what you run when something is already wrong; it reports.
+            print(f"build:    cannot tell ({exc})")
+
+    _print_installed_status(rime_dir)
     return 0
 
 
 def cmd_backup(args) -> int:
     rime_dir = args.rime_dir
-    store = paths.vault_dir(rime_dir)
+    store, error = _vault_dir_or_error(rime_dir)
+    if store is None:
+        print(error)
+        return 1
     actions = vault.plan_backup(rime_dir, store)
     for action in actions:
         print(f"  {action.kind:<17} {action.rel}")
@@ -75,19 +148,35 @@ def cmd_backup(args) -> int:
 
 def cmd_restore(args) -> int:
     rime_dir = args.rime_dir
-    store = paths.vault_dir(rime_dir)
+    store, error = _vault_dir_or_error(rime_dir)
+    if store is None:
+        print(error)
+        return 1
     actions = vault.plan_restore(rime_dir, store, force=args.force)
     for action in actions:
         print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
-    blocked = [a for a in actions if a.kind in ("conflict", "missing-in-vault")]
+    conflicts = [a for a in actions if a.kind == "conflict"]
+    missing = [a for a in actions if a.kind == "missing-in-vault"]
+    if missing:
+        # Not a failure: plan_backup silently skips a file the user does not
+        # have (kind "missing-locally"), so the vault legitimately never
+        # gets it -- that round trip must not read as blocked. It is also
+        # the state before iCloud has pulled a shared vault down onto a new
+        # Mac: an unmaterialized file has no name on disk yet, so
+        # plan_restore sees the same "not a file" it would for a file that
+        # was simply never backed up. Name both causes; there is no way to
+        # tell them apart from here.
+        print(f"{len(missing)} file(s) not in the vault -- either never backed up "
+             f"from this machine, or iCloud has not materialized {store} yet "
+             f"(wait a moment and re-run)")
     if args.dry_run:
-        return 1 if blocked else 0
+        return 1 if conflicts else 0
     vault.apply_restore(rime_dir, store, actions)
-    if blocked:
-        # Non-zero so a scripted restore cannot mistake a partial one for
-        # success. --force resolves conflicts; a missing file needs a backup
-        # from the machine that has it.
-        print(f"{len(blocked)} file(s) not restored", file=sys.stdout)
+    if conflicts:
+        # Non-zero so a scripted restore cannot mistake a real conflict for
+        # success. --force resolves it. missing-in-vault does not block --
+        # see above.
+        print(f"{len(conflicts)} file(s) not restored (conflict)", file=sys.stdout)
         return 1
     return 0
 
@@ -100,7 +189,15 @@ def cmd_fetch(args) -> int:
         print(f"would download {len(scel.DICT_URLS)} dictionaries into {scel_dir}")
         return 0
 
-    scel.download_all(scel.DICT_URLS, scel_dir)
+    try:
+        scel.download_all(scel.DICT_URLS, scel_dir)
+    except RuntimeError as exc:
+        # An unreachable Sogou, or a drift in the scraped HTML selectors --
+        # third-party HTML, so it will drift eventually. cmd_update decides
+        # whether this is fatal; here it is just reported, not raised.
+        print(f"fetch failed: {exc}")
+        return 1
+
     entries, names = scel.merge_scel_dir(scel_dir)
     staged = target.with_name(target.name + ".new")
     written = dictfile.write_dict(
@@ -115,9 +212,10 @@ def cmd_fetch(args) -> int:
     if target.is_file():
         before = sum(1 for _ in open(target, encoding="utf-8"))
         after = sum(1 for _ in open(staged, encoding="utf-8"))
-        if after * 10 < before * 9:
+        if after < before * SHRINK_FLOOR:
             staged.unlink()
-            print(f"refusing to overwrite: {after} lines is under 90% of {before}")
+            print(f"refusing to overwrite: {after} lines is under "
+                 f"{SHRINK_FLOOR:.0%} of {before}")
             return 1
     staged.replace(target)
     print(f"{written} entries -> {target}")
@@ -126,9 +224,9 @@ def cmd_fetch(args) -> int:
 
 def cmd_build(args) -> int:
     rime_dir = args.rime_dir
-    config = _private(rime_dir) / CONFIG_NAME
-    output = _private(rime_dir) / PREDICT_DB_NAME
-    stamp_path = _private(rime_dir) / freshness.STAMP_NAME
+    config = Path(args.config).expanduser() if args.config else _private(rime_dir) / CONFIG_NAME
+    output = Path(args.output).expanduser() if args.output else _private(rime_dir) / PREDICT_DB_NAME
+    stamp_path = _stamp_path(rime_dir, output)
 
     # `build` needs the config to do anything at all -- fail loud rather than
     # let a missing file surface as a raw traceback out of compute_stamp.
@@ -184,6 +282,52 @@ def cmd_build(args) -> int:
     return 0
 
 
+def _git_commit(source_root: Path) -> "str | None":
+    # Best-effort only: install must still work when git is unavailable or
+    # source_root is not a git repo (e.g. a tarball checkout).
+    try:
+        result = subprocess.run(["git", "-C", str(source_root), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def cmd_install(args) -> int:
+    rime_dir = args.rime_dir
+    source_root = Path(__file__).resolve().parent.parent
+    dest = Path(args.dest).expanduser() if args.dest else _install_dest(rime_dir)
+
+    if not install.is_source_checkout(source_root):
+        print(f"refusing to install: {source_root} does not look like a rime-copilot "
+             f"checkout -- installing from an installed copy would launder drift")
+        return 1
+
+    builder = paths.find_builder(args.builder)
+    actions = install.plan_install(source_root, dest, builder)
+    for action in actions:
+        print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
+    if args.dry_run:
+        return 0
+
+    commit = _git_commit(source_root)
+    # Pinned explicitly (not left to apply_install's own default) so the same
+    # value drives both the entry point's shebang and the pypinyin check
+    # below -- this is the interpreter running `install`, which is the one
+    # piece of information the repo itself cannot supply (see install.py's
+    # module docstring and README "Keeping the installed copy honest").
+    interpreter = sys.executable
+    install.apply_install(source_root, dest, builder, commit, _now(), interpreter=interpreter)
+    print(f"installed to {dest} @ {commit[:7] if commit else 'unknown'}")
+    if not install.interpreter_has_pypinyin(interpreter):
+        print(f"warning: {interpreter} cannot import pypinyin -- `status`, `restore`, and "
+             f"`backup` will work, but `build` and `update` will fail on any dictionary "
+             f"without a pinyin column (e.g. tencent.dict.yaml)")
+    return 0
+
+
 def cmd_deploy(args) -> int:
     squirrel = args.squirrel or DEFAULT_SQUIRREL
     if args.dry_run:
@@ -198,7 +342,22 @@ def cmd_deploy(args) -> int:
 
 
 def cmd_update(args) -> int:
-    for step in (cmd_fetch, cmd_build, cmd_deploy):
+    fetch_code = cmd_fetch(args)
+    if fetch_code != 0:
+        # A fetch failure (unreachable Sogou, or a scraper-selector drift --
+        # both third-party HTML this pipeline does not control) must not
+        # kill `update` outright when a perfectly good sogou.dict.yaml from
+        # a previous fetch is already sitting there: warn and fall through
+        # to `build`, which will just rebuild from what is on disk. Only
+        # fatal when there is no dictionary at all to fall back on.
+        existing = _private(args.rime_dir) / SOGOU_DICT_NAME
+        if existing.is_file():
+            print(f"fetch failed; continuing with the existing {existing}")
+        else:
+            print(f"fetch failed and no existing {existing} to fall back on")
+            return fetch_code
+
+    for step in (cmd_build, cmd_deploy):
         code = step(args)
         if code != 0:
             return code
@@ -211,7 +370,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rime-dir", type=paths.resolve_rime_dir,
                         default=paths.resolve_rime_dir(None))
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status").set_defaults(func=cmd_status)
@@ -231,11 +389,23 @@ def build_parser() -> argparse.ArgumentParser:
                              help="cap continuations per key (<=0 means unlimited)")
         command.add_argument("--force-build", action="store_true")
         command.add_argument("--squirrel", help="path to the Squirrel binary")
+        if name == "build":
+            command.add_argument("--config",
+                                 help="dictionary-list JSON (default: <rime-dir>/private/"
+                                      f"{CONFIG_NAME})")
+            command.add_argument("--output",
+                                 help="where to write the built db (default: <rime-dir>/"
+                                      f"private/{PREDICT_DB_NAME})")
         command.set_defaults(func=func)
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("--squirrel")
     deploy.set_defaults(func=cmd_deploy)
+
+    install_cmd = sub.add_parser("install")
+    install_cmd.add_argument("--dest", help="where to install (default: <rime-dir>/private/bin)")
+    install_cmd.add_argument("--builder", help=f"path to {paths.BUILDER_NAME}")
+    install_cmd.set_defaults(func=cmd_install)
     return parser
 
 
@@ -243,7 +413,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     args = build_parser().parse_args(argv)
     for attribute, default in (("builder", None), ("max_per_key", -1),
                                ("force_build", False), ("force", False),
-                               ("squirrel", None)):
+                               ("squirrel", None), ("config", None), ("output", None)):
         if not hasattr(args, attribute):
             setattr(args, attribute, default)
     return args.func(args)

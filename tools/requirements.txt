@@ -1,4 +1,3 @@
-opencc
 pypinyin
 bs4
 requests

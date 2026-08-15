@@ -132,10 +132,20 @@ package in `tools/rime_copilot/`:
 | `scel.py` | Sogou `.scel` unpacking and downloading |
 | `vault.py` | backup/restore of the unversioned files, to the iCloud sync dir |
 | `freshness.py` | the content-hash rebuild decision |
+| `install.py` | copying the CLI + `build_copilot` into `<rime_dir>/private/bin` so it runs standalone, and detecting drift in that copy |
 | `cli.py` | orchestration |
 
 Subcommands: `status`, `restore`, `backup`, `fetch`, `build`, `deploy`,
-`update`. A new machine runs `restore` then `update`.
+`update`, `install`. A new machine builds `build_copilot` from a librime
+checkout, runs `install` once, then `restore` and `update` from the installed
+`private/bin/rime-copilot` — no checkout needed after that.
+
+**Drift-detection contract:** `install` records a manifest
+(`private/bin/.installed.json`: source commit, source path, content hash per
+installed file) so `status` can report, every run, whether the installed copy
+has been edited in place, is missing a file, or has fallen behind the repo it
+came from — without that, an installed copy is just a second, unversioned
+`private/bin/` waiting to rot the same way the original one did.
 
 **The weight convention lives in `dictdb.py` and in `src/db_provider.h` /
 `src/rerank.h`, and must match: larger = more likely.** Writing a rank instead
@@ -143,15 +153,20 @@ of a real weight silently inverts every ordering in the plugin. `Entry.weight`
 (`dictfile.py`) is a `float`, not an `int` — it becomes fractional once a
 `scale` is applied.
 
-Third-party imports (`pypinyin`, `opencc`, `requests`, `bs4`) are lazy, at the
+Third-party imports (`pypinyin`, `requests`, `bs4`) are lazy, at the
 point of use, so every module imports on a stock interpreter. `pypinyin` is
 required at runtime for any dictionary with no pinyin column (e.g.
-`tencent.dict.yaml`, which is `word⇥weight` only) — on a machine where the
-interpreter that runs `rime-copilot` doesn't have it installed (a pyenv
-per-directory `.python-version` is a common cause, since the shebang resolves
-relative to the current directory), `build`/`update` fail with an error naming
-the missing package. Tests are stdlib `unittest` and never touch
-`~/Library/Rime`:
+`tencent.dict.yaml`, which is `word⇥weight` only) — from a checkout, whether
+`build`/`update` finds it depends on the ambient interpreter (pyenv's
+per-directory `.python-version` resolves from the *caller's* current working
+directory, not the script's location, so this is easy to get wrong; a bare
+`#!/usr/bin/env python3` does not fix it, since that resolution happens
+regardless of the shebang). `install` (`tools/rime_copilot/install.py`)
+avoids this for the installed copy by rewriting the entry point's shebang to
+`sys.executable` — the absolute path of the interpreter that ran `install`
+— instead of copying the source's shebang through, and warns at install
+time (without refusing) if that interpreter cannot import `pypinyin`. Tests
+are stdlib `unittest` and never touch `~/Library/Rime`:
 
 ```sh
 python3 -m unittest discover -s tools/test -p '*_test.py'

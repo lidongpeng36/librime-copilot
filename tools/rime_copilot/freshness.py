@@ -46,7 +46,6 @@ def compute_stamp(rime_dir: Path, config_path: Path, output: Path) -> dict:
         inputs[_key(rime_dir, path)] = sha256_file(path)
     return {
         "recipe_version": RECIPE_VERSION,
-        "output": _key(rime_dir, output),
         "output_sha256": sha256_file(output) if output.is_file() else None,
         "inputs": inputs,
     }

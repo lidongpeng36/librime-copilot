@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -61,9 +62,40 @@ class ReadEntries(unittest.TestCase):
         self.assertEqual(1, len(entries))
 
     def test_two_columns_numeric_second_is_a_weight(self):
+        # word+weight (tencent.dict.yaml's shape) has no pinyin column, so
+        # this exercises _auto_pinyin -> pypinyin. Stub the real package
+        # (per test_missing_pypinyin_raises_an_actionable_error below) so
+        # this test does not require pypinyin to actually be installed --
+        # the suite must pass on a stock interpreter, not just one CI
+        # happens to `pip install pypinyin` into.
+        calls = []
+
+        def lazy_pinyin(word):
+            calls.append(word)
+            return ["FAKE", "PY"]
+
+        fake_pypinyin = types.ModuleType("pypinyin")
+        fake_pypinyin.lazy_pinyin = lazy_pinyin
+
+        had_module = "pypinyin" in sys.modules
+        original = sys.modules.get("pypinyin")
+
+        def restore():
+            if had_module:
+                sys.modules["pypinyin"] = original
+            else:
+                sys.modules.pop("pypinyin", None)
+
+        self.addCleanup(restore)
+        sys.modules["pypinyin"] = fake_pypinyin
+
         entries = read_entries(self.write("建议\t500\n"))
         self.assertEqual("建议", entries[0].word)
         self.assertEqual(500, entries[0].weight)
+        # The two-column-numeric branch must actually call pypinyin and use
+        # its result, not merely tolerate it being importable.
+        self.assertEqual(["建议"], calls)
+        self.assertEqual("FAKE PY", entries[0].pinyin)
 
     def test_two_columns_non_numeric_second_is_a_pinyin(self):
         entries = read_entries(self.write("建议\tjian yi\n"))

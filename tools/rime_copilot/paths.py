@@ -75,6 +75,15 @@ def find_builder(explicit: str | None = None, start: Path | None = None) -> Path
         if candidate.is_file():
             return candidate
 
+    # A standalone install (install.py) copies build_copilot to sit next to
+    # this package, so an installed deployment finds its own binary rather
+    # than reaching into a build tree that may be stale or absent. In a repo
+    # checkout this looks for tools/build_copilot, which does not exist, so
+    # the walk-up below still runs as before.
+    installed_alongside = Path(__file__).resolve().parent.parent / BUILDER_NAME
+    if installed_alongside.is_file():
+        return installed_alongside
+
     here = (start or Path(__file__).resolve().parent).resolve()
     for parent in [here, *here.parents]:
         candidate = parent / _BUILD_TREE_BUILDER

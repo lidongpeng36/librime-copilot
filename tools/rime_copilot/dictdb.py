@@ -64,7 +64,7 @@ def merge(loaded: Sequence["tuple[Source, list[Entry]]"]) -> list[Entry]:
     every ordinary entry while its own frequency order survives inside the
     boost. Replacing outright was measured to invert real frequencies.
     """
-    merged: dict[tuple[str, str], int] = {}
+    merged: dict[tuple[str, str], float] = {}
 
     for source, entries in loaded:
         if source.top:
@@ -107,7 +107,7 @@ def write_pairs(entries: Sequence[Entry], out_path: Path, max_per_key: float) ->
     total = 0
     with open(out_path, "w", encoding="utf-8") as out:
         block_first: str | None = None
-        block: dict[tuple[str, str], int] = {}
+        block: dict[tuple[str, str], float] = {}
 
         def flush() -> int:
             written = 0

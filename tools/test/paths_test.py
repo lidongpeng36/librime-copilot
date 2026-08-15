@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -131,6 +132,44 @@ class FindBuilder(unittest.TestCase):
         os.environ.pop("COPILOT_BUILD_DIR", None)
         with self.assertRaises(FileNotFoundError):
             paths.find_builder(None, start=start)
+
+    def test_installed_alongside_the_package_wins_over_the_build_tree(self):
+        # Simulates a standalone install: paths.py itself lives at
+        # <dest>/rime_copilot/paths.py, with build_copilot copied to <dest>/
+        # right next to it (task-9-brief.md, "install"). A stale or absent
+        # build tree must not win over the installed copy's own binary, so
+        # plant both and check the installed one is the one returned.
+        installed_builder = self._make("installed/build_copilot")
+        fake_module_file = self.root / "installed" / "rime_copilot" / "paths.py"
+        stale_tree_builder = self._make(
+            "librime/build/plugins/copilot/bin/build_copilot")
+        start = self.root / "librime/plugins/copilot/tools/rime_copilot"
+        start.mkdir(parents=True)
+        with mock.patch.object(paths, "__file__", str(fake_module_file)):
+            found = paths.find_builder(None, start=start)
+        self.assertEqual(installed_builder.resolve(), found)
+        self.assertNotEqual(stale_tree_builder.resolve(), found)
+
+    def test_explicit_path_still_wins_over_installed_alongside(self):
+        installed_builder = self._make("installed/build_copilot")
+        fake_module_file = self.root / "installed" / "rime_copilot" / "paths.py"
+        explicit = self._make("elsewhere/build_copilot")
+        with mock.patch.object(paths, "__file__", str(fake_module_file)):
+            found = paths.find_builder(str(explicit))
+        self.assertEqual(explicit, found)
+        self.assertNotEqual(installed_builder, found)
+
+    def test_no_installed_binary_alongside_falls_back_to_the_build_tree(self):
+        # A repo checkout: paths.py's own parent.parent (tools/) never has a
+        # build_copilot next to it, so the walk-up must still run.
+        exe = self._make("librime/build/plugins/copilot/bin/build_copilot")
+        fake_module_file = (self.root /
+                            "librime/plugins/copilot/tools/rime_copilot/paths.py")
+        start = fake_module_file.parent
+        start.mkdir(parents=True)
+        with mock.patch.object(paths, "__file__", str(fake_module_file)):
+            found = paths.find_builder(None, start=start)
+        self.assertEqual(exe.resolve(), found)
 
 
 class Sha256File(unittest.TestCase):

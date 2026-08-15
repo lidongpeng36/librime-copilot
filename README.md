@@ -13,19 +13,31 @@ librime plugin. Copilot next word prediction with LLM support.
 ## Building the db
 
 `tools/rime-copilot build` turns Rime dictionaries into the prediction db. It
-reads `private/dict.json` under your Rime directory — a JSON config listing
-the dictionaries to merge (start from `tools/dict.example.json`) — and writes
-`private/private.predict.db`:
+reads a JSON config listing the dictionaries to merge (start from
+`tools/dict.example.json`) and writes the built db to a single output file.
+Point it at your own paths with `--config` and `--output`:
 
 ```sh
-tools/rime-copilot build --force-build
+tools/rime-copilot build --config path/to/dict.json --output copilot.db --force-build
 ```
+
+The Configuration section below documents the plugin's own default —
+`db: copilot.db` in your Rime *user* directory (not `private/`) — so
+`--output` should generally point there, or wherever your schema's `db:`
+setting names, or the plugin will not open what you just built.
+
+Without `--config`/`--output`, `build` defaults to `<rime-dir>/private/dict.json`
+→ `<rime-dir>/private/private.predict.db` — this repository author's own
+layout, kept as the default because `fetch`, `update`, and "Restoring on a
+new Mac" below all assume it. If you are only building the db by hand, the
+explicit form above is the one to use.
 
 `build` is one step of the full pipeline — `fetch` downloads dictionaries,
 `build` compiles them, `deploy` reloads Squirrel, and `update` chains all
-three. See "Restoring on a new Mac" below for what a fresh machine needs
-before any of that runs, and for the `pypinyin` dependency `build` picks up
-when a dictionary has no pinyin column.
+three (using the default paths, not the overrides above). See "Restoring on a
+new Mac" below for what a fresh machine needs before any of that runs, and
+for the `pypinyin` dependency `build` picks up when a dictionary has no
+pinyin column.
 
 Each word is split at every boundary into `prefix → suffix`, which is exactly
 how the plugin queries it: the last 1..N characters before the caret are the
@@ -525,35 +537,92 @@ The wire protocol is unchanged; the client just dials a forwarded socket.
 
 ## Restoring on a new Mac
 
-`rime-copilot` covers the data pipeline. Three steps come first, once per
-machine:
+`rime-copilot install` makes the pipeline run from `~/Library/Rime` alone,
+with no librime checkout present — that is a hard requirement, not a
+convenience: restoring a machine must not require cloning and building
+librime first just to run `restore`. Three steps still come first, once per
+machine, because `build_copilot` is a compiled, per-architecture artifact and
+can only come from a build tree — it is deliberately *not* in the vault:
 
 1. Install Squirrel.
 2. Clone librime, put this repository at `plugins/copilot`, and build it —
-   this produces `build/plugins/copilot/bin/build_copilot`, which the CLI
-   finds by walking up from its own location.
+   this produces `build/plugins/copilot/bin/build_copilot`.
 3. Clone your Rime configuration into `~/Library/Rime` and let Squirrel deploy
-   once, so `installation.yaml` exists with its `sync_dir`.
+   once, so `installation.yaml` exists. Then **add `sync_dir` to it by
+   hand** — Squirrel never writes that key itself, it only ever reads one if
+   present (verified against librime's `deployment_tasks.cc`: the write-back
+   after deploy sets `installation_id`/`install_time`/`update_time`/
+   `distribution_*`/`rime_version`, never `sync_dir`). Add a line such as:
+   ```yaml
+   sync_dir: "/Users/you/Library/Mobile Documents/com~apple~CloudDocs/RimeSync"
+   ```
+   pointing at wherever you keep, or want to create, the iCloud-synced vault
+   parent directory. **Write that path down somewhere durable outside this
+   repo** — a password manager note, a text file in your dotfiles, anything
+   that survives a wiped disk. `installation.yaml` is deliberately never
+   itself vaulted (it carries machine identity, `installation_id`), so
+   nothing else records where the vault lives; if you lose this path on a
+   fresh Mac there is nothing to grep for it. If you forget, `backup` and
+   `restore` fail with a message that reprints this same instruction — but
+   only once you already know the vault's *contents* are still sitting in
+   iCloud somewhere.
 
-Then:
+Then, from the checkout, install the CLI once:
 
 ```sh
-tools/rime-copilot restore   # iCloud vault -> ~/Library/Rime
-tools/rime-copilot update    # fetch dictionaries, rebuild the db, reload
+tools/rime-copilot install   # copies the CLI + build_copilot into private/bin
+```
+
+After that, `~/Library/Rime/private/bin/rime-copilot` works on its own —
+`restore` and `update` no longer need the librime checkout at all:
+
+```sh
+~/Library/Rime/private/bin/rime-copilot restore   # iCloud vault -> ~/Library/Rime
+~/Library/Rime/private/bin/rime-copilot update     # fetch dictionaries, rebuild the db, reload
 ```
 
 `restore` never overwrites a local file whose content the vault does not know
-about; it exits non-zero and names what it skipped. `--force` resolves that in
-the vault's favour.
+about — that is a `conflict`, and it is the only thing that exits non-zero;
+`--force` resolves it in the vault's favour. A file the vault does not have at
+all (`missing-in-vault`) is reported but does not block: `backup` silently
+skips a file you don't have locally, so the vault legitimately never getting
+it is not an error, and — on a new Mac — it is also what an unmaterialized
+iCloud file looks like before it has been pulled down; either way there is
+nothing `--force` could fix, so `restore` says so and moves on rather than
+failing forever.
 
 What is *not* in the vault, deliberately: `installation.yaml` and `user.yaml`
 (machine identity — Rime's sync keys on `installation_id`), the userdb
-directories (Rime syncs those itself), and anything the pipeline rebuilds.
+directories (Rime syncs those itself), `build_copilot` (per-architecture,
+see above), and anything the pipeline rebuilds.
+
+### Keeping the installed copy honest
+
+An installed copy is a second copy of `tools/rime_copilot/`, and copies are
+exactly what rotted the original, unversioned `private/bin/` this replaced —
+a hand-copied script, a year-old binary, a rewrite nobody remembered made.
+`install` cannot make people careful instead; it records what it installed
+(`private/bin/.installed.json`: source commit, source path, content hash per
+file) so `rime-copilot status` can report drift every time it runs — a file
+edited in place, deleted, or one the repo has since changed. Re-run `install`
+from the checkout to bring the installed copy back in sync; `install` itself
+refuses to run from anything that is not a checkout, so an installed copy can
+never become the source for another install.
 
 `update` needs `pypinyin` if any configured dictionary has no pinyin column
 (`tencent.dict.yaml` is the common case — it's `word⇥weight` only, so every
 entry needs a generated pinyin). Third-party imports are lazy, so a stock
-interpreter is fine until that point; if `pypinyin` isn't importable by
-whichever interpreter runs `rime-copilot`, install it there, or point the
-invocation at an interpreter that already has it — a per-directory pyenv
-version pin is a common reason the two differ.
+interpreter is fine until that point. `install` pins the interpreter for
+this: it rewrites `private/bin/rime-copilot`'s shebang to the absolute path
+of the interpreter that ran `install` (`sys.executable`), instead of copying
+the checkout's `#!/usr/bin/env python3` through verbatim. That rewrite is
+what makes the installed copy work standalone — a bare `#!/usr/bin/env
+python3` would *not* have been enough even with `private/.python-version`
+pinning a pyenv environment that has `pypinyin`: pyenv resolves
+`.python-version` from the *caller's* current working directory, not the
+script's location, so `rime-copilot` run from anywhere other than
+`private/` would silently fall back to the global interpreter and lose
+`pypinyin`. `install` also checks, at install time, whether the interpreter
+it is pinning can import `pypinyin`, and warns (without refusing to install)
+if it cannot — `status`, `restore`, and `backup` do not need it; only
+`build` and `update` do, and only for dictionaries without a pinyin column.

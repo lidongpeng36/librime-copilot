@@ -144,16 +144,15 @@ def apply_backup(rime_dir: Path, vault: Path, actions: Sequence[Action],
                  machine: str, now: str) -> None:
     records = read_manifest(vault)
     for action in actions:
-        if action.kind not in ("backup", "identical"):
+        if action.kind != "backup":
             continue
         local = safe_join(rime_dir, action.rel)
         stored = safe_join(vault / FILES_DIR, action.rel)
         stored.parent.mkdir(parents=True, exist_ok=True)
-        if action.kind == "backup":
-            temporary = stored.with_name(stored.name + ".new")
-            shutil.copy2(local, temporary)
-            temporary.replace(stored)
-            records[action.rel] = Record(sha256=sha256_file(local),
-                                         size=local.stat().st_size,
-                                         backed_up_at=now, machine=machine)
+        temporary = stored.with_name(stored.name + ".new")
+        shutil.copy2(local, temporary)
+        temporary.replace(stored)
+        records[action.rel] = Record(sha256=sha256_file(local),
+                                     size=local.stat().st_size,
+                                     backed_up_at=now, machine=machine)
     write_manifest(vault, records)

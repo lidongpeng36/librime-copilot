@@ -47,12 +47,7 @@ def iter_body_lines(lines: Iterable[str], source: str) -> Iterator[str]:
         raise ValueError(f"{source}: YAML header opened with `---` and never closed with `...`")
 
 
-def read_entries(path: Path, *, traditional: bool = False) -> list[Entry]:
-    convert = None
-    if traditional:
-        from opencc import OpenCC  # lazy: pure parsing must not need it
-        convert = OpenCC("s2t").convert
-
+def read_entries(path: Path) -> list[Entry]:
     entries: list[Entry] = []
     unusable: list[str] = []
     with open(path, "r", encoding="utf-8") as handle:
@@ -76,8 +71,6 @@ def read_entries(path: Path, *, traditional: bool = False) -> list[Entry]:
             else:
                 continue
 
-            if convert:
-                word = convert(word)
             try:
                 numeric = int(weight)
             except ValueError:

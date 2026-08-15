@@ -20,8 +20,6 @@ jobs:
         run: nvim -l clients/neovim/test/endpoint_spec.lua
       - name: Lua connection tests
         run: nvim -l clients/neovim/test/verify_spec.lua
-      - name: Install Python tool dependencies
-        run: pip install pypinyin
       - name: Python tool tests
         run: python3 -m unittest discover -s tools/test -p '*_test.py' -v
 
