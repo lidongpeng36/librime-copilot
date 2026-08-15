@@ -12,13 +12,20 @@ librime plugin. Copilot next word prediction with LLM support.
 
 ## Building the db
 
-`tools/make_copilot_db.py` turns Rime dictionaries into `copilot.db`. Point it at
-a JSON config listing the dictionaries to merge (start from
-`tools/dict.example.json`):
+`tools/rime-copilot build` turns Rime dictionaries into the prediction db. It
+reads `private/dict.json` under your Rime directory — a JSON config listing
+the dictionaries to merge (start from `tools/dict.example.json`) — and writes
+`private/private.predict.db`:
 
 ```sh
-tools/make_copilot_db.py -c dict.json -o copilot.db
+tools/rime-copilot build --force-build
 ```
+
+`build` is one step of the full pipeline — `fetch` downloads dictionaries,
+`build` compiles them, `deploy` reloads Squirrel, and `update` chains all
+three. See "Restoring on a new Mac" below for what a fresh machine needs
+before any of that runs, and for the `pypinyin` dependency `build` picks up
+when a dictionary has no pinyin column.
 
 Each word is split at every boundary into `prefix → suffix`, which is exactly
 how the plugin queries it: the last 1..N characters before the caret are the
@@ -59,6 +66,8 @@ switches:
     states: [ 關閉預測, 開啓預測 ]
     reset: 1
 ```
+
+* Deploy and enjoy.
 
 ## Configuration
 
@@ -514,4 +523,37 @@ Neovim on a remote host can drive the local IME over an ssh reverse tunnel —
 see [clients/neovim/README.md](clients/neovim/README.md#remote-neovim-over-ssh).
 The wire protocol is unchanged; the client just dials a forwarded socket.
 
-* Deploy and enjoy.
+## Restoring on a new Mac
+
+`rime-copilot` covers the data pipeline. Three steps come first, once per
+machine:
+
+1. Install Squirrel.
+2. Clone librime, put this repository at `plugins/copilot`, and build it —
+   this produces `build/plugins/copilot/bin/build_copilot`, which the CLI
+   finds by walking up from its own location.
+3. Clone your Rime configuration into `~/Library/Rime` and let Squirrel deploy
+   once, so `installation.yaml` exists with its `sync_dir`.
+
+Then:
+
+```sh
+tools/rime-copilot restore   # iCloud vault -> ~/Library/Rime
+tools/rime-copilot update    # fetch dictionaries, rebuild the db, reload
+```
+
+`restore` never overwrites a local file whose content the vault does not know
+about; it exits non-zero and names what it skipped. `--force` resolves that in
+the vault's favour.
+
+What is *not* in the vault, deliberately: `installation.yaml` and `user.yaml`
+(machine identity — Rime's sync keys on `installation_id`), the userdb
+directories (Rime syncs those itself), and anything the pipeline rebuilds.
+
+`update` needs `pypinyin` if any configured dictionary has no pinyin column
+(`tencent.dict.yaml` is the common case — it's `word⇥weight` only, so every
+entry needs a generated pinyin). Third-party imports are lazy, so a stock
+interpreter is fine until that point; if `pypinyin` isn't importable by
+whichever interpreter runs `rime-copilot`, install it there, or point the
+invocation at an interpreter that already has it — a per-directory pyenv
+version pin is a common reason the two differ.

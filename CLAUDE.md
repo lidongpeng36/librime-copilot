@@ -110,19 +110,56 @@ so sub-plugins just define a `Process` method and don't touch the `Processor` bo
 
 All three can be turned off via `copilot/disabled_plugins` in the schema config.
 
-## Tools (`tools/`, built when `BUILD_TOOLS=ON`, default)
-- `build_copilot` — builds the `copilot.db` prediction DB. Reads stdin lines of
+## Tools (`tools/`)
+
+C++ tools, built when `BUILD_TOOLS=ON` (default):
+- `build_copilot` — builds the prediction DB. Reads stdin lines of
   `key text weight`, writes the DB file (arg 1, default `copilot.db`).
+  Lands at `<librime>/build/plugins/copilot/bin/build_copilot`.
 - `dump_copilot` — read-only probe: prints a key's continuations with weights,
   ranks and duplicate counts. First stop when candidates come out in a
   surprising order (`dump_copilot <db> --find 议 -- 建`).
-- `make_copilot_db.py` — the pipeline that feeds `build_copilot`: reads Rime
-  `*.dict.yaml` files listed in a JSON config (see `dict.example.json`), merges
-  and weights them, splits every word into `prefix → suffix` pairs.
-  **The weight convention lives here and in `src/db_provider.h` / `src/rerank.h`
-  and must match: larger = more likely.** Writing a rank instead of a real
-  weight silently inverts every ordering in the plugin.
 - `ax_poc.mm` — macOS Accessibility API proof-of-concept (Apple-only).
+
+`rime-copilot` — the data pipeline that feeds `build_copilot`. One CLI over the
+package in `tools/rime_copilot/`:
+
+| Module | Responsibility |
+| --- | --- |
+| `paths.py` | Rime dir, `sync_dir` from `installation.yaml`, builder resolution |
+| `dictfile.py` | reading and writing Rime `*.dict.yaml` |
+| `dictdb.py` | merging weights, `top` stacking, prefix/suffix splitting |
+| `scel.py` | Sogou `.scel` unpacking and downloading |
+| `vault.py` | backup/restore of the unversioned files, to the iCloud sync dir |
+| `freshness.py` | the content-hash rebuild decision |
+| `cli.py` | orchestration |
+
+Subcommands: `status`, `restore`, `backup`, `fetch`, `build`, `deploy`,
+`update`. A new machine runs `restore` then `update`.
+
+**The weight convention lives in `dictdb.py` and in `src/db_provider.h` /
+`src/rerank.h`, and must match: larger = more likely.** Writing a rank instead
+of a real weight silently inverts every ordering in the plugin. `Entry.weight`
+(`dictfile.py`) is a `float`, not an `int` — it becomes fractional once a
+`scale` is applied.
+
+Third-party imports (`pypinyin`, `opencc`, `requests`, `bs4`) are lazy, at the
+point of use, so every module imports on a stock interpreter. `pypinyin` is
+required at runtime for any dictionary with no pinyin column (e.g.
+`tencent.dict.yaml`, which is `word⇥weight` only) — on a machine where the
+interpreter that runs `rime-copilot` doesn't have it installed (a pyenv
+per-directory `.python-version` is a common cause, since the shebang resolves
+relative to the current directory), `build`/`update` fail with an error naming
+the missing package. Tests are stdlib `unittest` and never touch
+`~/Library/Rime`:
+
+```sh
+python3 -m unittest discover -s tools/test -p '*_test.py'
+```
+
+`RECIPE_VERSION` in `freshness.py` must be bumped by hand when a change to the
+build algorithm alters the output for unchanged inputs. No input hash catches
+that, and a stale database will otherwise be reported as fresh.
 
 ## Clients
 - `clients/neovim/lua/rime_ime/` — Neovim client for the IME Bridge, one
