@@ -256,6 +256,33 @@ def cmd_fetch(args) -> int:
     return 0
 
 
+def _missing_config_hint(rime_dir: Path, config: Path) -> str:
+    """A trailing clause naming where the missing `config` can be had, or ""
+    when there is nothing true to say.
+
+    `dict.json` is one of the vaulted files, so on a machine that has just
+    run `install` the overwhelmingly likely reason `build` cannot find it is
+    that `restore` has not run yet -- it is in the vault, one command away.
+    Saying only "no <path>" left that to be remembered rather than read, and
+    `build` is reached through `update`, where it is the first thing a fresh
+    machine stops on.
+
+    Silent when the vault has no copy either, or cannot be found at all: a
+    pointer to a `restore` that would restore nothing is worse than the bare
+    error, and looking for the hint must never turn one clear failure into a
+    different, noisier one.
+    """
+    try:
+        store = paths.vault_dir(rime_dir)
+        relative = config.resolve().relative_to(rime_dir.resolve())
+        stored = vault.safe_join(store / vault.FILES_DIR, str(relative))
+    except (FileNotFoundError, LookupError, OSError, ValueError):
+        return ""
+    if not stored.is_file():
+        return ""
+    return " -- it is in the vault; run `rime-copilot restore` first"
+
+
 def cmd_build(args) -> int:
     rime_dir = args.rime_dir
     config = Path(args.config).expanduser() if args.config else _private(rime_dir) / CONFIG_NAME
@@ -267,7 +294,7 @@ def cmd_build(args) -> int:
     # (status treats the same condition as informational and returns 0; build
     # cannot proceed at all, so it is a real failure.)
     if not config.is_file():
-        print(f"cannot build: no {config}")
+        print(f"cannot build: no {config}{_missing_config_hint(rime_dir, config)}")
         return 1
     try:
         current = freshness.compute_stamp(rime_dir, config, output)

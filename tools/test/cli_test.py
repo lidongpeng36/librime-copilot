@@ -466,6 +466,54 @@ class InstallInterpreter(CliBase):
         self.assertIn(str(other), out)
 
 
+class BuildWithoutConfig(CliBase):
+    """`dict.json` is vaulted, so on a machine that has just run `install`
+    the usual reason `build` cannot find it is that `restore` has not run
+    yet -- the file is sitting in the vault, one command away. The bare
+    "no <path>" left that to be remembered rather than read.
+    """
+
+    def remove_config(self) -> None:
+        (self.rime / "private" / "dict.json").unlink()
+
+    def test_points_at_the_vault_when_the_config_is_waiting_there(self):
+        self.run_cli("backup")
+        self.remove_config()
+        code, out = self.run_cli("build", "--builder", str(self.fake_builder()))
+        self.assertEqual(1, code)
+        self.assertIn("dict.json", out)
+        self.assertIn("restore", out)
+
+    def test_says_nothing_about_restore_when_the_vault_has_no_config(self):
+        # Pointing at a `restore` that would restore nothing is worse than
+        # saying only what is true.
+        self.remove_config()
+        code, out = self.run_cli("build", "--builder", str(self.fake_builder()))
+        self.assertEqual(1, code)
+        self.assertIn("dict.json", out)
+        self.assertNotIn("restore", out)
+
+    def test_still_reports_plainly_when_the_vault_cannot_be_found(self):
+        # No sync_dir in installation.yaml: the first-run state. Looking for
+        # a hint must not turn a clear error into a traceback.
+        (self.rime / "installation.yaml").write_text(
+            'installation_id: "TestMac"\n', encoding="utf-8")
+        self.remove_config()
+        code, out = self.run_cli("build", "--builder", str(self.fake_builder()))
+        self.assertEqual(1, code)
+        self.assertIn("dict.json", out)
+
+    def test_update_surfaces_the_same_hint(self):
+        # `update` chains fetch -> build -> deploy, and this is the error it
+        # actually stops on for a freshly installed machine.
+        self.run_cli("backup")
+        self.remove_config()
+        with mock.patch("rime_copilot.cli.cmd_fetch", return_value=0):
+            code, out = self.run_cli("update", "--builder", str(self.fake_builder()))
+        self.assertEqual(1, code)
+        self.assertIn("restore", out)
+
+
 class InstallDeclaredInterpreter(CliBase):
     """`~/Library/Rime/private/.python-version` already named the right
     environment while `install` was pinning whatever the caller's shell
