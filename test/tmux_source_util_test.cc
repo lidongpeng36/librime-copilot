@@ -8,24 +8,25 @@ namespace {
 
 // Mirrors the real one-exec output: client lines, then the cursor header,
 // then the pane dump verbatim.
-std::string Blob(const std::string& clients, const std::string& header,
-                 const std::string& rows) {
+std::string Blob(const std::string& clients, const std::string& header, const std::string& rows) {
   return clients + header + rows;
 }
 
 }  // namespace
 
 TEST(TmuxParse, ReadsHeaderAndRows) {
-  auto snap = ParseTmuxOutput(
-      Blob("CLI|1786506891\n", "CUR|%0|7|0|40\n",
-           "\xE4\xB8\xAD\xE6\x96\x87" "abc\nsecond\n"));
+  auto snap = ParseTmuxOutput(Blob("CLI|1786506891\n", "CUR|%0|7|0|40\n",
+                                   "\xE4\xB8\xAD\xE6\x96\x87"
+                                   "abc\nsecond\n"));
   ASSERT_TRUE(snap.has_value());
   EXPECT_EQ(snap->pane_id, "%0");
   EXPECT_EQ(snap->cursor_x, 7);
   EXPECT_EQ(snap->cursor_y, 0);
   EXPECT_EQ(snap->pane_width, 40);
   ASSERT_EQ(snap->rows.size(), 2u);
-  EXPECT_EQ(snap->rows[0], "\xE4\xB8\xAD\xE6\x96\x87" "abc");
+  EXPECT_EQ(snap->rows[0],
+            "\xE4\xB8\xAD\xE6\x96\x87"
+            "abc");
   EXPECT_EQ(snap->client_activity.size(), 1u);
 }
 
@@ -84,11 +85,15 @@ TEST(TmuxWidth, WideCharactersCountAsTwoColumns) {
   EXPECT_EQ(DisplayWidth(0xFF21), 2);  // fullwidth A
   EXPECT_EQ(DisplayWidth(0x0061), 1);  // a
   EXPECT_EQ(DisplayWidth(0x0301), 0);  // combining acute
-  EXPECT_EQ(DisplayWidthOf("\xE4\xB8\xAD\xE6\x96\x87" "abc"), 7);
+  EXPECT_EQ(DisplayWidthOf("\xE4\xB8\xAD\xE6\x96\x87"
+                           "abc"),
+            7);
 }
 
 TEST(TmuxSlice, SplitsOnDisplayColumnNotCharacterIndex) {
-  const std::string row = "\xE4\xB8\xAD\xE6\x96\x87" "abc";  // 中文abc, 7 cells
+  const std::string row =
+      "\xE4\xB8\xAD\xE6\x96\x87"
+      "abc";  // 中文abc, 7 cells
   EXPECT_EQ(SliceBeforeColumn(row, 7), row);
   EXPECT_EQ(SliceBeforeColumn(row, 4), "\xE4\xB8\xAD\xE6\x96\x87");  // 中文
   EXPECT_EQ(SliceAfterColumn(row, 4), "abc");
@@ -102,7 +107,9 @@ TEST(TmuxSlice, CaretInsideAWideGlyphStopsBeforeIt) {
 TEST(TmuxSlice, ColumnsPastTheTrimmedRowAreBlanks) {
   // Measured: tmux reports x=10 while the captured row is only 7 cells,
   // because it trims trailing blanks. Those columns really are spaces.
-  const std::string row = "\xE4\xB8\xAD\xE6\x96\x87" "abc";
+  const std::string row =
+      "\xE4\xB8\xAD\xE6\x96\x87"
+      "abc";
   EXPECT_EQ(SliceBeforeColumn(row, 10), row + "   ");
   EXPECT_EQ(SliceAfterColumn(row, 10), "");
 }
@@ -112,7 +119,9 @@ TEST(TmuxContext, PlainCaseTakesTheCharacterLeftOfTheCaret) {
   snap.cursor_x = 7;
   snap.cursor_y = 0;
   snap.pane_width = 40;
-  snap.rows = {"\xE4\xB8\xAD\xE6\x96\x87" "abc"};
+  snap.rows = {
+      "\xE4\xB8\xAD\xE6\x96\x87"
+      "abc"};
   auto ctx = ExtractContext(snap, 1);
   ASSERT_TRUE(ctx.has_value());
   EXPECT_EQ(ctx->before, "c");
@@ -124,10 +133,14 @@ TEST(TmuxContext, PrefixCharsReturnsMoreContextForPrediction) {
   snap.cursor_x = 7;
   snap.cursor_y = 0;
   snap.pane_width = 40;
-  snap.rows = {"\xE4\xB8\xAD\xE6\x96\x87" "abc"};
+  snap.rows = {
+      "\xE4\xB8\xAD\xE6\x96\x87"
+      "abc"};
   auto ctx = ExtractContext(snap, 8);
   ASSERT_TRUE(ctx.has_value());
-  EXPECT_EQ(ctx->before, "\xE4\xB8\xAD\xE6\x96\x87" "abc");
+  EXPECT_EQ(ctx->before,
+            "\xE4\xB8\xAD\xE6\x96\x87"
+            "abc");
 }
 
 TEST(TmuxContext, CaretAtColumnZeroFollowsAWrappedRowAbove) {
@@ -333,8 +346,8 @@ TEST(TmuxArgs, EveryMarkerIsEmittedBeforeThePaneDump) {
   auto args = BuildTmuxArgs("");
   auto cli = std::find(args.begin(), args.end(), "CLI|#{client_activity}");
   auto foc = std::find(args.begin(), args.end(), "FOC|#{focus-events}");
-  auto cur = std::find(args.begin(), args.end(),
-                       "CUR|#{pane_id}|#{cursor_x}|#{cursor_y}|#{pane_width}");
+  auto cur =
+      std::find(args.begin(), args.end(), "CUR|#{pane_id}|#{cursor_x}|#{cursor_y}|#{pane_width}");
   ASSERT_NE(cur, args.end());
   EXPECT_LT(cli, cur);
   EXPECT_LT(foc, cur);
@@ -371,4 +384,230 @@ TEST(TmuxClientKey, DifferentPaneIdsProduceDifferentKeys) {
   // The pane id must be load-bearing: AutoSpacer indexes per-client state by
   // this key, so two panes sharing a key would bleed spacing state together.
   EXPECT_NE(MakeClientKey("", "%1"), MakeClientKey("", "%2"));
+}
+
+// ---------------------------------------------------------------------------
+// Cell styling: telling the buffer apart from the app's own ghost text.
+//
+// The rows below are the real, measured `capture-pane -p -e` output of codex
+// running under tmux (v0.147.0, 2026-08-15). They are what the bug report
+// reduces to.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// codex with an EMPTY composer: the prompt marker is bold, then a dim
+// placeholder suggestion sits exactly where the caret is (cursor_x = 2).
+const std::string kCodexGhostRow = "\x1b[1m\xE2\x80\xBA\x1b[0m \x1b[2mExplain this codebase\x1b[0m";
+
+// codex with REAL text typed and the caret moved back into it (cursor_x = 8).
+// Nothing after the prompt marker is styled at all.
+const std::string kCodexTypedRow = "\x1b[1m\xE2\x80\xBA\x1b[0m  hello world";
+
+}  // namespace
+
+TEST(TmuxStyle, StripsSgrAndKeepsOneStylePerCharacter) {
+  auto row = SplitStyledRow(kCodexGhostRow);
+  EXPECT_EQ(row.plain, "\xE2\x80\xBA Explain this codebase");
+  // 1 (›) + 1 (space) + 21 ("Explain this codebase")
+  ASSERT_EQ(row.styles.size(), 23u);
+  EXPECT_EQ(row.styles[0].attrs, kAttrBold);
+  EXPECT_EQ(row.styles[1], CellStyle{});
+  EXPECT_EQ(row.styles[2].attrs, kAttrDim);
+}
+
+TEST(TmuxStyle, AnUnstyledRowIsAllDefaultAndUnchanged) {
+  auto row = SplitStyledRow("hello world");
+  EXPECT_EQ(row.plain, "hello world");
+  ASSERT_EQ(row.styles.size(), 11u);
+  for (const auto& s : row.styles) EXPECT_EQ(s, CellStyle{});
+}
+
+TEST(TmuxStyle, ReadsIndexedAndTrueColorForegrounds) {
+  auto indexed = SplitStyledRow("\x1b[38;5;6mA");
+  auto truecolor = SplitStyledRow("\x1b[38;2;246;226;183mA");
+  auto basic = SplitStyledRow("\x1b[31mA");
+  EXPECT_NE(indexed.styles[0], CellStyle{});
+  EXPECT_NE(truecolor.styles[0], CellStyle{});
+  EXPECT_NE(basic.styles[0], CellStyle{});
+  // Three different ways of saying "not the default colour" must not collide,
+  // or a style change would read as "no change" and the ghost text would pass.
+  EXPECT_NE(indexed.styles[0], truecolor.styles[0]);
+  EXPECT_NE(indexed.styles[0], basic.styles[0]);
+}
+
+TEST(TmuxStyle, AttributeAndColourResetsReturnToTheDefault) {
+  // A cell reached by "turn dim on, turn dim off" renders exactly like a cell
+  // that was never touched; comparing raw escape state instead of decoded
+  // state would call those two different and refuse for no reason.
+  auto row = SplitStyledRow("\x1b[2ma\x1b[22mb\x1b[31mc\x1b[39md");
+  ASSERT_EQ(row.styles.size(), 4u);
+  EXPECT_EQ(row.styles[0].attrs, kAttrDim);
+  EXPECT_EQ(row.styles[1], CellStyle{});
+  EXPECT_NE(row.styles[2], CellStyle{});
+  EXPECT_EQ(row.styles[3], CellStyle{});
+}
+
+TEST(TmuxStyle, StyleAtColumnCountsDisplayColumnsNotCharacters) {
+  auto row = SplitStyledRow("\x1b[1m\xE4\xB8\xAD\x1b[0mab");  // 中(bold, 2 cells) a b
+  EXPECT_EQ(StyleAtColumn(row.plain, row.styles, 0).attrs, kAttrBold);
+  EXPECT_EQ(StyleAtColumn(row.plain, row.styles, 1).attrs, kAttrBold);  // 中's 2nd cell
+  EXPECT_EQ(StyleAtColumn(row.plain, row.styles, 2), CellStyle{});
+}
+
+TEST(TmuxStyle, StyleAtColumnOutsideTheRowIsTheDefault) {
+  auto row = SplitStyledRow("\x1b[2mab");
+  EXPECT_EQ(StyleAtColumn(row.plain, row.styles, 9), CellStyle{});
+  EXPECT_EQ(StyleAtColumn(row.plain, row.styles, -1), CellStyle{});
+  // A snapshot carrying no style information at all (every hand-built one, and
+  // any tmux that answered without escapes) must decode as "all default".
+  EXPECT_EQ(StyleAtColumn("ab", {}, 0), CellStyle{});
+}
+
+TEST(TmuxParse, StripsEscapesFromRowsAndKeepsTheCaretRowStyles) {
+  auto snap = ParseTmuxOutput("CLI|1\nFOC|1\nCUR|%0|2|1|80\nfirst\n" + kCodexGhostRow + "\n");
+  ASSERT_TRUE(snap.has_value());
+  ASSERT_EQ(snap->rows.size(), 2u);
+  // Rows stay plain text, so every downstream slicing rule is unaffected.
+  EXPECT_EQ(snap->rows[1], "\xE2\x80\xBA Explain this codebase");
+  ASSERT_EQ(snap->caret_row_styles.size(), 23u);
+  EXPECT_EQ(snap->caret_row_styles[2].attrs, kAttrDim);
+  // The row above the caret is kept too: it is where `before` comes from when
+  // the caret sits at column 0 of a wrapped line.
+  ASSERT_EQ(snap->above_row_styles.size(), 5u);
+}
+
+TEST(TmuxContext, GhostTextRightOfTheCaretIsNotReportedAsAfter) {
+  // The bug: codex draws a dim placeholder at the caret while the composer is
+  // empty. capture-pane sees characters, so `after` became "E", NeedSpaceAfter
+  // saw an ASCII letter, and every first CJK commit grew a trailing space.
+  auto snap = ParseTmuxOutput("CLI|1\nFOC|1\nCUR|%0|2|0|80\n" + kCodexGhostRow + "\n");
+  ASSERT_TRUE(snap.has_value());
+  auto ctx = ExtractContext(*snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->after, "");
+  // Only `after` is dropped. The left boundary is still read normally.
+  EXPECT_EQ(ctx->before, " ");
+}
+
+TEST(TmuxContext, RealTextRightOfTheCaretIsStillReportedAsAfter) {
+  // Same app, same prompt marker -- but the caret was moved back into text the
+  // user actually typed, which renders in the same style as its neighbour.
+  // Refusing here would be the regression: no more right-hand auto-spacing.
+  auto snap = ParseTmuxOutput("CLI|1\nFOC|1\nCUR|%0|9|0|80\n" + kCodexTypedRow + "\n");
+  ASSERT_TRUE(snap.has_value());
+  ASSERT_EQ(snap->rows[0], "\xE2\x80\xBA  hello world");
+  auto ctx = ExtractContext(*snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->after, "w");   // committing CJK here does want a space after
+  EXPECT_EQ(ctx->before, " ");  // the caret sits between "hello" and "world"
+}
+
+TEST(TmuxContext, AGreyedRunAcrossTheCaretRefusesWithNoDimAnywhere) {
+  // Not every ghost text is faint: zsh-autosuggestions defaults to `fg=8` and
+  // fish to a 256-colour grey, which is SGR 90 here and carries no attribute.
+  auto snap = ParseTmuxOutput("CLI|1\nFOC|1\nCUR|%0|2|0|80\ngi\x1b[90mt status\n");
+  ASSERT_TRUE(snap.has_value());
+  auto ctx = ExtractContext(*snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->after, "");
+}
+
+TEST(TmuxContext, SyntaxHighlightingUnderTheCaretIsStillTrusted) {
+  // Measured from `vim -u NONE -c 'syntax on'` on this repo: the preprocessor
+  // directive is 35 and the header name after it is 31. A hue boundary is not
+  // evidence about whose text it is, and refusing here would cost a trailing
+  // space in an editor for nothing.
+  auto snap = ParseTmuxOutput(
+      "CLI|1\nFOC|1\nCUR|%0|9|0|80\n\x1b[35m#include \x1b[31m<algorithm>\x1b[39m\n");
+  ASSERT_TRUE(snap.has_value());
+  ASSERT_EQ(snap->rows[0], "#include <algorithm>");
+  auto ctx = ExtractContext(*snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->before, " ");
+  EXPECT_EQ(ctx->after, "<");
+}
+
+TEST(TmuxStyle, MutedForegroundsAreTheGreysAndNothingElse) {
+  EXPECT_TRUE(IsMutedColor(CellStyle::kBasic | 8));      // SGR 90, bright black
+  EXPECT_TRUE(IsMutedColor(CellStyle::kIndexed | 8));    // 38;5;8
+  EXPECT_TRUE(IsMutedColor(CellStyle::kIndexed | 240));  // greyscale ramp
+  EXPECT_TRUE(IsMutedColor(CellStyle::kTrueColor | 0x808080u));
+  EXPECT_FALSE(IsMutedColor(CellStyle::kDefault));
+  EXPECT_FALSE(IsMutedColor(CellStyle::kBasic | 5));      // SGR 35, magenta
+  EXPECT_FALSE(IsMutedColor(CellStyle::kIndexed | 130));  // 38;5;130, orange
+  EXPECT_FALSE(IsMutedColor(CellStyle::kTrueColor | 0xF6E2B7u));
+}
+
+TEST(TmuxStyle, DeEmphasisIsRelativeToTheCellBesideIt) {
+  CellStyle plain;
+  CellStyle dim;
+  dim.attrs = kAttrDim;
+  CellStyle grey;
+  grey.fg = CellStyle::kBasic | 8;
+  CellStyle magenta;
+  magenta.fg = CellStyle::kBasic | 5;
+
+  EXPECT_TRUE(IsDeEmphasized(dim, plain));
+  EXPECT_TRUE(IsDeEmphasized(grey, plain));
+  EXPECT_FALSE(IsDeEmphasized(magenta, plain));
+  EXPECT_FALSE(IsDeEmphasized(plain, dim));  // coming back OUT of a dim run
+  EXPECT_FALSE(IsDeEmphasized(dim, dim));    // a wholly dim line is not ghosted
+  EXPECT_FALSE(IsDeEmphasized(grey, grey));
+}
+
+TEST(TmuxContext, ASnapshotWithNoStyleInformationBehavesAsBefore) {
+  // Hand-built snapshots (and any answer that carried no escapes) decode as
+  // all-default, which is contiguous -- so this must not start refusing.
+  Snapshot snap;
+  snap.cursor_x = 2;
+  snap.cursor_y = 0;
+  snap.pane_width = 40;
+  snap.rows = {
+      "ab"
+      "\xE4\xB8\xAD"};
+  auto ctx = ExtractContext(snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->after, "\xE4\xB8\xAD");
+}
+
+TEST(TmuxContext, CaretAtColumnZeroComparesAgainstTheWrappedRowAbove) {
+  // `before` comes from the row above when the line wrapped, so the "cell to
+  // the left" the styles are compared against has to come from there too.
+  Snapshot snap;
+  snap.cursor_x = 0;
+  snap.cursor_y = 1;
+  snap.pane_width = 4;
+  snap.rows = {"abcd", "efgh"};
+  snap.above_row_styles = std::vector<CellStyle>(4, CellStyle{});
+  snap.caret_row_styles = std::vector<CellStyle>(4, CellStyle{});
+  snap.caret_row_styles[0].attrs = kAttrDim;
+  auto ctx = ExtractContext(snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->before, "d");
+  EXPECT_EQ(ctx->after, "");
+}
+
+TEST(TmuxContext, CaretAtColumnZeroOfAFreshLineHasNoLeftNeighbourToTrust) {
+  // No wrapped row above means nothing is adjacent to the caret on the left,
+  // so there is no evidence that what is drawn to the right continues it --
+  // which is exactly the shape of a composer placeholder starting at column 0.
+  Snapshot snap;
+  snap.cursor_x = 0;
+  snap.cursor_y = 1;
+  snap.pane_width = 40;
+  snap.rows = {"abcd", "efgh"};
+  auto ctx = ExtractContext(snap, 1);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(ctx->before, "");
+  EXPECT_EQ(ctx->after, "");
+}
+
+TEST(TmuxArgs, AsksCapturePaneForEscapeSequences) {
+  // Without -e the pane dump is characters only, and ghost text is
+  // indistinguishable from the buffer.
+  auto args = BuildTmuxArgs("");
+  auto cp = std::find(args.begin(), args.end(), "capture-pane");
+  ASSERT_NE(cp, args.end());
+  EXPECT_NE(std::find(cp, args.end(), "-e"), args.end());
 }

@@ -422,6 +422,52 @@ answer would be a guess:
   granularity;
 - tmux cannot be reached, times out, or answers something unparseable.
 
+#### Ghost text is not the buffer
+
+A TUI draws things at the caret that are not in its edit buffer at all: codex
+paints a dim suggestion into an empty composer, fish and zsh-autosuggestions
+paint an inline completion, and both vanish the moment you type. A screen
+scrape sees only characters, so those used to arrive as the `after` boundary —
+and every first CJK commit into an empty codex composer came out with a
+trailing space, because `after` was the placeholder's first letter.
+
+So the pane is captured with `capture-pane -e`, which keeps the SGR sequences,
+and `after` is dropped when the caret cell is drawn **dimmer** than the cell
+immediately left of it (on a wrapped line, the last cell of the row above — the
+same cell `before` ends with). Ghost text starts a new, muted run of styling at
+exactly the caret, and that is the one signal available that those characters
+are not the user's.
+
+"Dimmer" is measured, not guessed:
+
+| | at the caret |
+| --- | --- |
+| codex placeholder | `ESC[2m` — faint |
+| zsh-autosuggestions / fish | `fg=8`, a 256-colour grey |
+| vim syntax highlighting | `31`, `34`, `35`, `38;5;130` — saturated hues, never faint, never grey |
+
+Refusing on *any* style change would also refuse at every syntax-highlighting
+boundary that happened to fall under the caret, costing a trailing space in an
+editor for nothing. Refusing only on de-emphasis — the faint attribute, or a
+switch to bright black or a greyscale foreground — separates the two. It is a
+rendering rule, not an app list: nothing here knows about codex or about any
+particular shell.
+
+What is left is narrow: a colourscheme that renders comments grey, with the
+caret landing exactly on the comment's first character, loses one trailing
+space. (vim's own default does not — it colours comments blue.) That direction
+is the safe one; trusting instead would insert a space into text the user never
+wrote.
+
+It costs nothing measurable. `-e` makes tmux's answer about 40% larger (a few
+hundred bytes), and parsing a pane went from ~1.3µs to ~5.3µs worst case — a
+full screen of highlighted code. The `tmux` fork/exec around it is ~3ms, so the
+whole check is under 0.2% of one query, and the query runs once per key event.
+Getting there needed two things that are easy to undo, so: escapes are decoded
+only for the caret row and the row above it (`want_styles`), and a row with no
+escape byte at all skips the parse entirely. Without those the same parse takes
+~24µs, mostly in per-character allocation.
+
 #### Finding the log output
 
 Set `copilot/surrounding_debug: true` to see which source actually answered

@@ -18,14 +18,59 @@
 namespace rime {
 namespace tmux_detail {
 
+// SGR attributes we can tell apart. Only the ones a TUI actually uses to mark
+// text as "not yours" are here; anything unrecognized leaves the cell alone.
+enum CellAttr : uint16_t {
+  kAttrBold = 1 << 0,
+  kAttrDim = 1 << 1,
+  kAttrItalic = 1 << 2,
+  kAttrUnderline = 1 << 3,
+  kAttrReverse = 1 << 4,
+};
+
+// How one cell is rendered. Decoded, not raw escape bytes: a cell reached by
+// "dim on, dim off" renders exactly like an untouched one, and comparing raw
+// state would call those two different.
+//
+// Colours are packed rather than kept as strings so a whole row of these costs
+// nothing to build on the input thread. The three spellings of a colour must
+// not collide -- SGR 31, 38;5;1 and 38;2;.. are different renderings, and
+// folding them together would let a style change read as "no change".
+struct CellStyle {
+  static constexpr uint32_t kDefault = 0;
+  static constexpr uint32_t kIndexed = 0x01000000;
+  static constexpr uint32_t kTrueColor = 0x02000000;
+  static constexpr uint32_t kBasic = 0x03000000;
+
+  uint32_t fg = kDefault;
+  uint32_t bg = kDefault;
+  uint16_t attrs = 0;
+
+  bool operator==(const CellStyle& o) const { return fg == o.fg && bg == o.bg && attrs == o.attrs; }
+  bool operator!=(const CellStyle& o) const { return !(*this == o); }
+};
+
+// A `capture-pane -e` row split into the characters it draws and how each one
+// is drawn. `styles` has exactly one entry per UTF-8 character of `plain`.
+struct StyledRow {
+  std::string plain;
+  std::vector<CellStyle> styles;
+};
+
 // One query's worth of state, parsed out of the single exec's stdout.
 struct Snapshot {
   std::string pane_id;
   int cursor_x = 0;  // display column, 0-based
   int cursor_y = 0;  // row within the visible pane, 0-based
   int pane_width = 0;
-  std::vector<std::string> rows;           // capture-pane -p, one row per entry
+  std::vector<std::string> rows;           // capture-pane -p -e, escapes stripped
   std::vector<long long> client_activity;  // one per attached client
+  // Per-cell rendering of the caret row and the row above it -- the only two
+  // rows a cell adjacent to the caret can live in (the row above is where
+  // `before` comes from on a wrapped line). Keeping styles for the whole pane
+  // would be ~100KB of churn per keystroke for rows nobody looks at.
+  std::vector<CellStyle> caret_row_styles;
+  std::vector<CellStyle> above_row_styles;
   // tmux's global `focus-events`. Load-bearing whenever more than one client
   // is attached: it is what makes tmux's "current client" track macOS window
   // focus, and it is *off* by default. See JudgeClients.
@@ -121,6 +166,214 @@ inline std::string TailChars(const std::string& s, int n) {
   return std::string(u(-n, -1));
 }
 
+// The most SGR parameters one `ESC[...m` can carry before we stop reading.
+// `38;2;r;g;b;48;2;r;g;b` plus a handful of attributes is already past
+// anything real. Dropping the tail of an absurd sequence only ever costs a
+// refusal, and the cap is what keeps the parameter buffer off the heap --
+// this runs once per escape, per row, per keystroke.
+constexpr size_t kMaxSgrParams = 24;
+
+// Apply one `ESC[...m` parameter list to `style`. Params arrive already split
+// on ';' so the 38/48 extended forms can consume their own operands.
+inline void ApplySgr(const int* params, size_t count, CellStyle* style) {
+  for (size_t i = 0; i < count; ++i) {
+    const int p = params[i];
+    auto colour = [&](uint32_t* slot) {
+      // 38/48 ; 5 ; n   (indexed)   or   38/48 ; 2 ; r ; g ; b   (truecolor)
+      if (i + 2 < count && params[i + 1] == 5) {
+        *slot = CellStyle::kIndexed | static_cast<uint32_t>(params[i + 2] & 0xFF);
+        i += 2;
+      } else if (i + 4 < count && params[i + 1] == 2) {
+        *slot = CellStyle::kTrueColor | (static_cast<uint32_t>(params[i + 2] & 0xFF) << 16) |
+                (static_cast<uint32_t>(params[i + 3] & 0xFF) << 8) |
+                static_cast<uint32_t>(params[i + 4] & 0xFF);
+        i += 4;
+      }
+    };
+    if (p == 0) {
+      *style = CellStyle{};
+    } else if (p == 1) {
+      style->attrs |= kAttrBold;
+    } else if (p == 2) {
+      style->attrs |= kAttrDim;
+    } else if (p == 3) {
+      style->attrs |= kAttrItalic;
+    } else if (p == 4) {
+      style->attrs |= kAttrUnderline;
+    } else if (p == 7) {
+      style->attrs |= kAttrReverse;
+    } else if (p == 22) {
+      style->attrs &= static_cast<uint16_t>(~(kAttrBold | kAttrDim));
+    } else if (p == 23) {
+      style->attrs &= static_cast<uint16_t>(~kAttrItalic);
+    } else if (p == 24) {
+      style->attrs &= static_cast<uint16_t>(~kAttrUnderline);
+    } else if (p == 27) {
+      style->attrs &= static_cast<uint16_t>(~kAttrReverse);
+    } else if (p == 38) {
+      colour(&style->fg);
+    } else if (p == 48) {
+      colour(&style->bg);
+    } else if (p == 39) {
+      style->fg = CellStyle::kDefault;
+    } else if (p == 49) {
+      style->bg = CellStyle::kDefault;
+    } else if (p >= 30 && p <= 37) {
+      style->fg = CellStyle::kBasic | static_cast<uint32_t>(p - 30);
+    } else if (p >= 90 && p <= 97) {
+      style->fg = CellStyle::kBasic | static_cast<uint32_t>(p - 90 + 8);
+    } else if (p >= 40 && p <= 47) {
+      style->bg = CellStyle::kBasic | static_cast<uint32_t>(p - 40);
+    } else if (p >= 100 && p <= 107) {
+      style->bg = CellStyle::kBasic | static_cast<uint32_t>(p - 100 + 8);
+    }
+    // Anything else is an attribute we cannot tell apart; leaving the cell
+    // unchanged only ever costs a refusal, never a wrong space.
+  }
+}
+
+// Split a `capture-pane -e` row into its characters and their rendering.
+//
+// Escapes are removed, so `plain` is byte-identical to what plain
+// `capture-pane` would have produced and every slicing rule above is
+// unaffected by the switch to -e.
+//
+// `want_styles` is a real saving, not a micro-optimization: this runs on every
+// row of the pane on every keystroke, while only two rows' styles are ever
+// read. With it off the escapes are merely skipped -- no parameters decoded,
+// no per-character vector -- which is most of the cost of the whole parse.
+inline StyledRow SplitStyledRow(const std::string& raw, bool want_styles = true) {
+  StyledRow out;
+  out.plain.reserve(raw.size());
+  if (want_styles) out.styles.reserve(raw.size());
+  CellStyle style;
+  size_t i = 0;
+  while (i < raw.size()) {
+    if (raw[i] == '\x1b') {
+      if (i + 1 < raw.size() && raw[i + 1] == '[') {
+        // CSI: parameter bytes, then one final byte in 0x40..0x7E.
+        size_t j = i + 2;
+        while (j < raw.size() && (static_cast<unsigned char>(raw[j]) < 0x40 ||
+                                  static_cast<unsigned char>(raw[j]) > 0x7E)) {
+          ++j;
+        }
+        if (want_styles && j < raw.size() && raw[j] == 'm') {
+          int params[kMaxSgrParams];
+          size_t count = 0;
+          int value = 0;
+          bool any = false;
+          for (size_t k = i + 2; k <= j && count < kMaxSgrParams; ++k) {
+            if (k < j && raw[k] >= '0' && raw[k] <= '9') {
+              value = value * 10 + (raw[k] - '0');
+              any = true;
+              continue;
+            }
+            if (k == j || raw[k] == ';') {
+              // An empty field is a spelled-out zero: `ESC[m` means `ESC[0m`.
+              params[count++] = any ? value : 0;
+              value = 0;
+              any = false;
+            }
+          }
+          ApplySgr(params, count, &style);
+        }
+        i = (j < raw.size()) ? j + 1 : raw.size();
+        continue;
+      }
+      if (i + 1 < raw.size() && raw[i + 1] == ']') {
+        // OSC (a hyperlink, a title): runs to BEL or ST. Never carries style.
+        size_t j = i + 2;
+        while (j < raw.size() && raw[j] != '\x07' &&
+               !(raw[j] == '\x1b' && j + 1 < raw.size() && raw[j + 1] == '\\')) {
+          ++j;
+        }
+        i = (j < raw.size() && raw[j] == '\x1b') ? j + 2 : j + 1;
+        continue;
+      }
+      i += 2;  // two-byte escape
+      continue;
+    }
+    // A run of ordinary bytes, copied in one go. Appending per character
+    // instead cost more than everything else in the parse put together.
+    const size_t start = i;
+    while (i < raw.size() && raw[i] != '\x1b') ++i;
+    out.plain.append(raw, start, i - start);
+    if (!want_styles) continue;
+    for (size_t k = start; k < i;) {
+      const size_t len = auto_spacer_detail::Utf8SequenceLength(static_cast<unsigned char>(raw[k]));
+      if (len == 0 || k + len > i) break;
+      out.styles.push_back(style);
+      k += len;
+    }
+  }
+  return out;
+}
+
+// How the character occupying display column `col` is rendered.
+//
+// A column inside a wide glyph belongs to that glyph. A column the row never
+// reaches -- and a row we hold no style information for at all, which is every
+// hand-built snapshot -- decodes as the default, so "no information" compares
+// equal to "no information" and nothing starts refusing on its account.
+inline CellStyle StyleAtColumn(const std::string& row, const std::vector<CellStyle>& styles,
+                               int col) {
+  if (col < 0) return CellStyle{};
+  int w = 0;
+  size_t i = 0;
+  size_t index = 0;
+  while (i < row.size()) {
+    const size_t len = auto_spacer_detail::Utf8SequenceLength(static_cast<unsigned char>(row[i]));
+    if (len == 0 || i + len > row.size()) break;
+    const int cw = DisplayWidth(auto_spacer_detail::Utf8ToCodepoint(row.substr(i, len)));
+    if (col < w + std::max(cw, 1)) {
+      return index < styles.size() ? styles[index] : CellStyle{};
+    }
+    w += cw;
+    i += len;
+    ++index;
+  }
+  return CellStyle{};
+}
+
+// A foreground that reads as "greyed out" rather than as a colour choice.
+//
+// Measured, not guessed. Ghost text is drawn muted: codex uses SGR 2 (faint),
+// zsh-autosuggestions defaults to `fg=8`, fish to a 256-colour grey. Syntax
+// highlighting picks saturated hues instead -- `vim -u NONE -c 'syntax on'` on
+// this very header emits 31, 34, 35 and 38;5;130 and nothing muted at all.
+// That gap is what lets a de-emphasized run be told apart from a merely
+// differently-coloured one.
+inline bool IsMutedColor(uint32_t fg) {
+  const uint32_t kind = fg & 0xFF000000u;
+  const uint32_t value = fg & 0x00FFFFFFu;
+  if (kind == CellStyle::kBasic) {
+    return value == 8;  // bright black
+  }
+  if (kind == CellStyle::kIndexed) {
+    // 8 is bright black; 232..255 is the xterm greyscale ramp.
+    return value == 8 || (value >= 232 && value <= 255);
+  }
+  if (kind == CellStyle::kTrueColor) {
+    const int r = static_cast<int>((value >> 16) & 0xFF);
+    const int g = static_cast<int>((value >> 8) & 0xFF);
+    const int b = static_cast<int>(value & 0xFF);
+    return std::max({r, g, b}) - std::min({r, g, b}) <= 24;  // r ≈ g ≈ b
+  }
+  return false;  // kDefault
+}
+
+// Whether `caret` is drawn *dimmer* than `left`, not merely differently.
+//
+// The distinction is the whole point: refusing on any change at all would also
+// refuse at every syntax-highlighting boundary that happens to fall under the
+// caret, and cost a trailing space in an editor for no reason.
+inline bool IsDeEmphasized(const CellStyle& caret, const CellStyle& left) {
+  if ((caret.attrs & kAttrDim) && !(left.attrs & kAttrDim)) {
+    return true;
+  }
+  return caret.fg != left.fg && IsMutedColor(caret.fg);
+}
+
 // Prompt themes pad with exotic blanks (powerlevel10k uses U+00A0). They are
 // blanks to the eye, so they must be blanks to the spacing rules too.
 inline std::string NormalizeBlanks(const std::string& s) {
@@ -154,18 +407,39 @@ inline bool ParseTmuxFlag(const std::string& value) {
 inline std::optional<Snapshot> ParseTmuxOutput(const std::string& raw) {
   Snapshot snap;
   bool saw_header = false;
+  // The cursor header is emitted before the pane dump (see BuildTmuxArgs), so
+  // the caret's row index is already known while the rows stream past and only
+  // the two rows that can neighbour it need their styles kept.
+  auto take_row = [&snap](std::string line) {
+    const int index = static_cast<int>(snap.rows.size());
+    const bool is_caret = index == snap.cursor_y;
+    const bool is_above = index == snap.cursor_y - 1;
+    // Most rows are neither next to the caret nor styled at all -- blank rows,
+    // plain output. Those cost exactly what they cost before -e was asked for.
+    if (!is_caret && !is_above && line.find('\x1b') == std::string::npos) {
+      snap.rows.push_back(std::move(line));
+      return;
+    }
+    StyledRow styled = SplitStyledRow(line, is_caret || is_above);
+    if (is_caret) {
+      snap.caret_row_styles = std::move(styled.styles);
+    } else if (is_above) {
+      snap.above_row_styles = std::move(styled.styles);
+    }
+    snap.rows.push_back(std::move(styled.plain));
+  };
   size_t pos = 0;
   while (pos <= raw.size()) {
     const size_t nl = raw.find('\n', pos);
     if (nl == std::string::npos) {
-      if (pos < raw.size() && saw_header) snap.rows.push_back(raw.substr(pos));
+      if (pos < raw.size() && saw_header) take_row(raw.substr(pos));
       break;
     }
     std::string line = raw.substr(pos, nl - pos);
     pos = nl + 1;
 
     if (saw_header) {
-      snap.rows.push_back(std::move(line));
+      take_row(line);
       continue;
     }
     if (line.rfind("CLI|", 0) == 0) {
@@ -283,22 +557,48 @@ inline std::optional<Context> ExtractContext(const Snapshot& snap, int prefix_ch
   const std::string& row = snap.rows[snap.cursor_y];
 
   std::string before;
+  // Whether the cell immediately left of the caret exists, and how it is drawn.
+  // This is the same cell `before` ends with, so the two must be decided
+  // together -- on a wrapped line both come from the row above.
+  bool has_left_cell = false;
+  CellStyle left_style;
   if (snap.cursor_x == 0) {
     // Column 0 is either a fresh line or the continuation of a wrapped one.
     // Only a row above that fills the pane exactly is a wrap; treating a short
     // row as adjacent would glue two unrelated lines together.
     if (snap.cursor_y > 0) {
       const std::string& prev = snap.rows[snap.cursor_y - 1];
-      if (DisplayWidthOf(prev) == snap.pane_width) before = prev;
+      if (DisplayWidthOf(prev) == snap.pane_width) {
+        before = prev;
+        has_left_cell = true;
+        left_style = StyleAtColumn(prev, snap.above_row_styles, snap.pane_width - 1);
+      }
     }
   } else {
     before = SliceBeforeColumn(row, snap.cursor_x);
+    has_left_cell = true;
+    left_style = StyleAtColumn(row, snap.caret_row_styles, snap.cursor_x - 1);
   }
+
+  // What is drawn right of the caret is only the user's text if it continues
+  // the run the caret sits at the end of. A TUI's own ghost text -- codex's
+  // dim placeholder, a shell's inline autosuggestion, an inline completion --
+  // starts a NEW, *muted* run at exactly the caret, and that is the one signal
+  // a screen scrape gets that those characters are not in the buffer at all.
+  // Without it `after` was the placeholder's first letter, and AutoSpacer put
+  // a space after every first CJK commit into an empty codex composer.
+  //
+  // Only de-emphasis refuses, not any difference: an editor colours its buffer
+  // by syntax, and a hue boundary landing under the caret says nothing about
+  // whose text it is. See IsDeEmphasized for the measurements behind that.
+  const CellStyle caret_style = StyleAtColumn(row, snap.caret_row_styles, snap.cursor_x);
+  const bool after_continues_before = has_left_cell && !IsDeEmphasized(caret_style, left_style);
 
   Context ctx;
   ctx.before = NormalizeBlanks(TailChars(before, prefix_chars));
-  ctx.after =
-      NormalizeBlanks(auto_spacer_detail::GetFirstUtf8Char(SliceAfterColumn(row, snap.cursor_x)));
+  ctx.after = after_continues_before ? NormalizeBlanks(auto_spacer_detail::GetFirstUtf8Char(
+                                           SliceAfterColumn(row, snap.cursor_x)))
+                                     : "";
   return ctx;
 }
 
@@ -334,6 +634,10 @@ inline std::vector<std::string> BuildTmuxArgs(const std::string& socket) {
   args.push_back(";");
   args.push_back("capture-pane");
   args.push_back("-p");
+  // -e keeps the SGR sequences. Without them the dump is characters only, and
+  // an app's ghost text reads exactly like the user's own buffer -- see the
+  // rendering-continuity check in ExtractContext.
+  args.push_back("-e");
   return args;
 }
 
