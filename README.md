@@ -111,13 +111,55 @@ hatch that keeps real words like `好了` and `是的` that no dictionary-based
 rule alone can distinguish from a fragment; `--threshold-low` (default 3) is
 the point below which a pin carries no evidence at all.
 
+Measured on one real lexicon: 46,699 entries became 8,231, and the key `的`
+went from 1,326 continuations to 549 (`了`, from 486 to 249).
+
 `clean --apply` preserves the untouched export at
 `private/custom.dict.yaml.raw` the first time it runs — never again, since a
 second overwrite there would replace the true original with an
-already-cleaned copy — because nothing regenerates a Sogou export. `backup`
-carries that file to the vault alongside the live `custom.dict.yaml`, so a
-restore on a new machine gets both the cleaned dictionary and the pristine
-original it was cleaned from.
+already-cleaned copy — because nothing regenerates a Sogou export. Both
+writes are staged onto a sibling and renamed into place, so an interrupted
+run cannot leave a truncated `.raw` that the never-again guard would read as
+complete. `backup` carries that file to the vault alongside the live
+`custom.dict.yaml` **and `private/.copilot_clean_stamp.json`**, so a restore
+on a new machine gets the cleaned dictionary, the pristine original it was
+cleaned from, and the record that it was already cleaned.
+
+That stamp is not bookkeeping. Without it a second machine reports
+`lexicon: not cleaned`, and the obvious response — run `clean --apply` there
+— would copy the already-cleaned file to `.raw` and then `backup` would push
+that over the genuine export in the vault, losing it everywhere at once.
+
+Both commands refuse rather than guess:
+
+| Situation | What happens |
+| --- | --- |
+| `review.tsv` already exists | `clean` refuses; pass `--force` to regenerate and lose the annotations. `--dry-run` is exempt — it writes nothing |
+| thresholds differ from the ones `review.tsv` was generated with | `--apply` refuses, naming both sets; the header comment in `review.tsv` records them |
+| a clean stamp exists but `.raw` does not | `--apply` refuses — the pristine original has not arrived on this machine yet |
+| `.raw` disagrees with the stamp's `raw_sha256` | `--apply` refuses |
+| entry count disagrees with the file's vocabulary lines | `--apply` refuses rather than erase the rows `read_entries` skipped |
+| a word is given two conflicting decisions in `review.tsv` | `--apply` refuses, naming both line numbers |
+
+### On a second machine
+
+The lexicon, the pristine export, the stamp and `dict.json` all travel in the
+vault; the prediction database is rebuilt locally; the code and `jieba` do
+not travel at all. Order matters:
+
+```sh
+git pull                  # code first -- see the warning below
+rime-copilot install      # refresh private/bin
+rime-copilot status       # names any missing dependency and the pip command
+rime-copilot restore      # lexicon, .raw, stamp, dict.json from the vault
+rime-copilot update       # rebuild the db and deploy
+```
+
+**Update the code before running `update`.** A `dict.json` carrying
+`"boost": "log"` restored onto an older `load_sources` is silently ignored —
+unknown keys are not an error there — so that machine builds a database with
+different weights, reports it up to date, and nothing anywhere says the two
+machines disagree.
 
 To measure what a cleanup (or any lexicon/config change) actually did to
 prediction quality, use the `tools/rime_corpus/` harness (`rime-corpus` CLI)

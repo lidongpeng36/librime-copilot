@@ -970,6 +970,46 @@ class CleanThresholdGuard(CleanFixture):
         self.assertEqual(0, self.run_clean("--apply"))
 
 
+class CleanMalformedReviewGuard(CleanFixture):
+    """A hand-edited review.tsv must refuse as a message, not a traceback.
+
+    parse_review already refuses a malformed row and a word decided two
+    conflicting ways; this covers cmd_clean surfacing that the way every other
+    refusal in it surfaces. Reached by hand-editing a 1,500-row TSV, which is
+    when a stack trace is least useful.
+    """
+
+    def malformed_review(self, body):
+        self.run_clean()
+        review_path = self.rime / "private" / "clean_out" / "review.tsv"
+        review_path.write_text(body, encoding="utf-8")
+        return review_path
+
+    def test_a_conflicting_duplicate_refuses_without_a_traceback(self):
+        self.malformed_review("keep\t475\t识六\tR9\twhy\ndrop\t475\t识六\tR9\twhy\n")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = self.run_clean("--apply")
+        self.assertEqual(1, code)
+        self.assertIn("refusing", buffer.getvalue())
+        self.assertIn("识六", buffer.getvalue())
+
+    def test_an_unknown_action_refuses_without_a_traceback(self):
+        self.malformed_review("maybe\t475\t识六\tR9\twhy\n")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = self.run_clean("--apply")
+        self.assertEqual(1, code)
+        self.assertIn("refusing", buffer.getvalue())
+
+    def test_the_refusal_happens_before_anything_is_rewritten(self):
+        self.malformed_review("maybe\t475\t识六\tR9\twhy\n")
+        self.run_clean("--apply")
+        cleaned = (self.rime / "private" / "custom.dict.yaml").read_text(encoding="utf-8")
+        self.assertIn("的问题", cleaned)
+        self.assertFalse((self.rime / "private" / "custom.dict.yaml.raw").exists())
+
+
 class CleanForceGuard(CleanFixture):
     """I4: a bare re-run of `clean` must not silently destroy an annotated
     review.tsv -- 1,533 hand-annotated rows is real work, and the natural
@@ -988,6 +1028,16 @@ class CleanForceGuard(CleanFixture):
         self.review_path().write_text(annotated, encoding="utf-8")
         self.assertEqual(1, self.run_clean())
         self.assertEqual(annotated, self.review_path().read_text(encoding="utf-8"))
+
+    def test_dry_run_is_exempt_from_the_force_guard(self):
+        # A dry run writes nothing, so refusing it would protect annotations
+        # against a write that never happens -- and `clean --dry-run` is the
+        # documented first step of the sequence, which would then fail on
+        # every run after the first.
+        self.run_clean()
+        before = self.review_path().read_text(encoding="utf-8")
+        self.assertEqual(0, self.run_clean(dry_run=True))
+        self.assertEqual(before, self.review_path().read_text(encoding="utf-8"))
 
     def test_force_regenerates_and_the_new_default_wins_on_apply(self):
         self.run_clean()

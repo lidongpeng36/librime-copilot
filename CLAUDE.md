@@ -164,7 +164,31 @@ structural verdict — two earlier drafts of the chain lacked R9 and deleted
 `dict.json` gained `boost: "log"` for `top` sources (`dictdb.py`): without it
 a `top` entry's own commit count is swamped by the public weight it stacks on
 (`确定是 = ceiling + 14925 + 7`), so the personal band is ordered by public
-frequency and the copilot db's rank gate has nothing to measure.
+frequency and the copilot db's rank gate has nothing to measure. It gives the
+personal term the same `0..ceiling` range as the public one — it does **not**
+make personal frequency the primary sort key, and a near-ceiling public
+weight still wins. That limit is pinned by a test rather than left to be
+rediscovered.
+
+**`boost` is invisible to older code.** `load_sources` reads named keys and
+ignores the rest, so a `dict.json` carrying `"boost": "log"` restored onto a
+checkout that predates it builds a different database, reports itself up to
+date, and says nothing. On a second machine, `git pull` and `install` come
+before `restore` and `update`. The same applies to any future `dict.json`
+key: adding one is a silent-divergence hazard across machines until every
+machine has the code that reads it.
+
+**What travels where.** The lexicon, its pristine `.raw`, the clean stamp and
+`dict.json` are vaulted (`vault.py:VAULTED_FILES`) and move by iCloud;
+`private.predict.db` and `sogou.dict.yaml` are derived and rebuilt locally;
+the CLI moves by git plus `install`; `jieba` and `pypinyin` move by neither —
+`status` names any that are missing, what they break, and the `pip` command.
+`.copilot_clean_stamp.json` is vaulted while `.copilot_build_stamp.json` is
+not, and the asymmetry is deliberate: the build stamp describes a locally
+built database, the clean stamp describes a shared file. Without the clean
+stamp in the vault a second machine reports `lexicon: not cleaned`, and
+acting on that report replaces the pristine export with an already-cleaned
+copy and then pushes it over the genuine one.
 
 **The weight convention lives in `dictdb.py` and in `src/db_provider.h` /
 `src/rerank.h`, and must match: larger = more likely.** Writing a rank instead

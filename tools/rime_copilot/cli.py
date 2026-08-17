@@ -525,7 +525,16 @@ def cmd_clean(args) -> int:
              f"re-annotate it")
         return 1
 
-    decisions = cleanup.parse_review(review_text)
+    # parse_review refuses a malformed row, and a word decided two conflicting
+    # ways, rather than guessing -- its message already names the line numbers.
+    # Surface it the way every other refusal in this function surfaces, instead
+    # of as a traceback: this one is reached by hand-editing a 1,500-row TSV,
+    # which is exactly when a stack trace is least useful.
+    try:
+        decisions = cleanup.parse_review(review_text)
+    except ValueError as exc:
+        print(f"refusing: {review_path} — {exc}")
+        return 1
     survivors = cleanup.apply_review(part, decisions)
     print(f"  surviving {len(survivors)}")
     if args.dry_run:
