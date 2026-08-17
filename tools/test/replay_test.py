@@ -7,10 +7,13 @@ manufactures, and `run_arm`/`assert_deterministic` are exercised with
 """
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rime_corpus import replay, speller
 

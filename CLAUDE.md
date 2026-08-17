@@ -191,6 +191,20 @@ Tests are stdlib `unittest` and never touch `~/Library/Rime`:
 python3 -m unittest discover -s tools/test -p '*_test.py'
 ```
 
+Every test module puts `tools/` on `sys.path` itself, so each one also runs
+alone. That is not decoration: nine of them once relied on discovery's
+alphabetical order having already imported a module that patched the path, and
+the one that sorts first (`claude_adapter_test`) had nothing ahead of it and
+failed in CI. Keep the bootstrap when adding a module.
+
+`.python-version` pins a pyenv virtualenv holding the runtime deps, so the
+command above needs no activation. On a new machine:
+
+```sh
+pyenv virtualenv system rime-copilot
+~/.pyenv/versions/rime-copilot/bin/pip install pypinyin requests beautifulsoup4
+```
+
 `RECIPE_VERSION` in `freshness.py` must be bumped by hand when a change to the
 build algorithm alters the output for unchanged inputs. No input hash catches
 that, and a stale database will otherwise be reported as fresh.
