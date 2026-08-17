@@ -17,9 +17,10 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from rime_copilot import cli
 from rime_copilot import install as I
 from rime_copilot import vault as V
-from rime_copilot.cli import SOGOU_DICT_NAME, main
+from rime_copilot.cli import MIN_MODEL_SIZE, SOGOU_DICT_NAME, main
 from rime_copilot.freshness import STAMP_NAME
 
 # cmd_install always sources from this real repo's tools/ (it derives
@@ -229,6 +230,121 @@ class Fetch(CliBase):
         self.assertNotEqual(0, code)
         self.assertIn("fetch failed", out)
         self.assertFalse((self.rime / "private" / SOGOU_DICT_NAME).exists())
+
+
+class FetchModel(CliBase):
+    """`_fetch_model_write` is the sole network boundary (mirrors how Fetch
+    above patches around `scel.download_all` rather than mocking `requests`
+    internals) -- every test here replaces it, so none ever reaches the
+    network. `MIN_MODEL_SIZE` is patched down to a few bytes so a fake
+    "download" does not actually write hundreds of MB to a tempdir on every
+    test run; the real constant is exercised by the too-small test below,
+    which stays below whatever the patched floor is.
+    """
+
+    FAKE_FLOOR = 64
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(cli, "MIN_MODEL_SIZE", self.FAKE_FLOOR))
+
+    def fake_write(self, size: int = FAKE_FLOOR + 1):
+        def write(url, dest):
+            dest.write_bytes(b"\0" * size)
+            return size
+        return write
+
+    def test_downloads_to_private_and_prints_the_config_line(self):
+        with mock.patch("rime_copilot.cli._fetch_model_write",
+                        side_effect=self.fake_write()) as fake:
+            code, out = self.run_cli("fetch-model")
+        self.assertEqual(0, code)
+        fake.assert_called_once()
+        (url, dest_arg), _ = fake.call_args
+        self.assertEqual(cli.MODEL_URL, url)
+
+        target = self.rime / "private" / cli.MODEL_NAME
+        self.assertTrue(target.is_file())
+        # Written through a .part path and renamed, not written in place --
+        # a stray .part left behind would mean the atomic-rename step ran
+        # against the wrong path.
+        self.assertFalse(target.with_name(target.name + ".part").exists())
+        self.assertIn(str(target), out)
+        self.assertIn(f"model: private/{cli.MODEL_NAME}", out)
+
+    def test_already_present_is_skipped_without_touching_the_network(self):
+        target = self.rime / "private" / cli.MODEL_NAME
+        target.write_bytes(b"\0" * (self.FAKE_FLOOR + 1))
+        with mock.patch("rime_copilot.cli._fetch_model_write") as fake:
+            code, out = self.run_cli("fetch-model")
+        self.assertEqual(0, code)
+        fake.assert_not_called()
+        self.assertIn("already present, skipping", out)
+        self.assertIn(str(target), out)
+        # Skipping still tells the user the config line to paste -- that is
+        # the whole point of running the command on a machine that already
+        # has the file.
+        self.assertIn(f"model: private/{cli.MODEL_NAME}", out)
+
+    def test_dry_run_writes_nothing(self):
+        with mock.patch("rime_copilot.cli._fetch_model_write") as fake:
+            code, out = self.run_cli("--dry-run", "fetch-model")
+        self.assertEqual(0, code)
+        fake.assert_not_called()
+        self.assertFalse((self.rime / "private" / cli.MODEL_NAME).exists())
+
+    def test_force_redownloads_an_already_present_file(self):
+        target = self.rime / "private" / cli.MODEL_NAME
+        target.write_bytes(b"\0" * (self.FAKE_FLOOR + 1))
+        with mock.patch("rime_copilot.cli._fetch_model_write",
+                        side_effect=self.fake_write()) as fake:
+            code, _ = self.run_cli("fetch-model", "--force")
+        self.assertEqual(0, code)
+        fake.assert_called_once()
+
+    def test_a_download_far_short_of_a_real_model_is_refused(self):
+        # Sanity floor against an HTML error page or a truncated connection
+        # silently becoming the "model" copilot/rerank/llm/model points at.
+        with mock.patch("rime_copilot.cli._fetch_model_write",
+                        side_effect=self.fake_write(size=1)):
+            code, out = self.run_cli("fetch-model")
+        self.assertNotEqual(0, code)
+        self.assertIn("refusing to install", out)
+        self.assertFalse((self.rime / "private" / cli.MODEL_NAME).exists())
+
+    def test_download_failure_is_reported_not_raised(self):
+        with mock.patch("rime_copilot.cli._fetch_model_write",
+                        side_effect=RuntimeError("network unreachable")):
+            code, out = self.run_cli("fetch-model")
+        self.assertNotEqual(0, code)
+        self.assertIn("fetch-model failed", out)
+        self.assertFalse((self.rime / "private" / cli.MODEL_NAME).exists())
+        # No half-written file left behind for a later run to trip over.
+        self.assertFalse(
+            (self.rime / "private" / (cli.MODEL_NAME + ".part")).exists())
+
+    def test_name_and_url_overrides_are_honoured(self):
+        with mock.patch("rime_copilot.cli._fetch_model_write",
+                        side_effect=self.fake_write()) as fake:
+            code, out = self.run_cli("fetch-model", "--name", "other.gguf",
+                                     "--url", "https://example.invalid/other.gguf")
+        self.assertEqual(0, code)
+        (url, _), _ = fake.call_args
+        self.assertEqual("https://example.invalid/other.gguf", url)
+        self.assertTrue((self.rime / "private" / "other.gguf").is_file())
+        self.assertIn("model: private/other.gguf", out)
+
+    def test_the_real_min_model_size_rejects_a_far_undersized_download(self):
+        # The one test in this class that exercises the actual production
+        # constant rather than the patched-down FAKE_FLOOR -- without it,
+        # every other test in here could pass against a MIN_MODEL_SIZE of 0
+        # and nothing would notice.
+        with mock.patch.object(cli, "MIN_MODEL_SIZE", MIN_MODEL_SIZE), \
+             mock.patch("rime_copilot.cli._fetch_model_write",
+                        side_effect=self.fake_write(size=1024)):
+            code, out = self.run_cli("fetch-model")
+        self.assertNotEqual(0, code)
+        self.assertIn("refusing to install", out)
 
 
 class Update(CliBase):

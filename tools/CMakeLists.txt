@@ -18,6 +18,19 @@ target_link_libraries(dump_copilot
   ${rime_library}
   ${rime_dict_library})
 
+add_executable(replay_copilot
+  replay_copilot.cc
+  $<TARGET_OBJECTS:rime-copilot-objs>)
+target_link_libraries(replay_copilot
+  ${LINK_LIBS}
+  ${rime_library}
+  ${rime_dict_library})
+
+add_executable(score_candidates
+  score_candidates.cc)
+target_link_libraries(score_candidates
+  ${LINK_LIBS})
+
 if(APPLE)
   find_library(APPSERVICES_LIBRARY ApplicationServices REQUIRED)
   find_library(APPKIT_LIBRARY AppKit REQUIRED)

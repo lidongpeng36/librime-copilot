@@ -1,0 +1,32 @@
+# Verbatim copy of speller/algebra from double_pinyin_flypy.schema.yaml
+# (rime-ice). One rule per line; see speller.py for the interpreter.
+erase/^xx$/
+derive/^([jqxy])u$/$1v/
+derive/^([aoe])([ioun])$/$1$1$2/
+xform/^([aoe])(ng)?$/$1$1$2/
+xform/iu$/Ⓠ/
+xform/(.)ei$/$1Ⓦ/
+xform/uan$/Ⓡ/
+xform/[uv]e$/Ⓣ/
+xform/un$/Ⓨ/
+xform/^sh/Ⓤ/
+xform/^ch/Ⓘ/
+xform/^zh/Ⓥ/
+xform/uo$/Ⓞ/
+xform/ie$/Ⓟ/
+xform/(.)i?ong$/$1Ⓢ/
+xform/ing$|uai$/Ⓚ/
+xform/(.)ai$/$1Ⓓ/
+xform/(.)en$/$1Ⓕ/
+xform/(.)eng$/$1Ⓖ/
+xform/[iu]ang$/Ⓛ/
+xform/(.)ang$/$1Ⓗ/
+xform/ian$/Ⓜ/
+xform/(.)an$/$1Ⓙ/
+xform/(.)ou$/$1Ⓩ/
+xform/[iu]a$/Ⓧ/
+xform/iao$/Ⓝ/
+xform/(.)ao$/$1Ⓒ/
+xform/ui$/Ⓥ/
+xform/in$/Ⓑ/
+xlit/ⓆⓌⓇⓉⓎⓊⒾⓄⓅⓈⒹⒻⒼⒽⒿⓀⓁⓏⓍⒸⓋⒷⓃⓂ/qwrtyuiopsdfghjklzxcvbnm/
