@@ -20,6 +20,18 @@ jobs:
         run: nvim -l clients/neovim/test/endpoint_spec.lua
       - name: Lua connection tests
         run: nvim -l clients/neovim/test/verify_spec.lua
+      # Not the runner's system python: on ubuntu-24.04 that one is
+      # externally managed (PEP 668) and refuses a plain `pip install`.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The three RUNTIME_REQUIREMENTS from tools/rime_copilot/install.py. They
+      # are imported lazily so every module loads without them, but the tests
+      # that reach the imports are the ones worth having: speller.syllables is
+      # the Han-to-double-pinyin conversion the whole replay harness stands on.
+      # Skipping those in CI would leave it uncovered.
+      - name: Install Python tool dependencies
+        run: python3 -m pip install --quiet pypinyin requests beautifulsoup4
       - name: Python tool tests
         run: python3 -m unittest discover -s tools/test -p '*_test.py' -v
 
