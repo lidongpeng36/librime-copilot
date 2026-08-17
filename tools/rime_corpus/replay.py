@@ -121,6 +121,7 @@ def run(
     rime_dir: str,
     window: int | None = None,
     wait_for_warm: bool = False,
+    plugins: Sequence[str] = (),
 ) -> list[dict]:
     """Drive replay_copilot over `requests`, once.
 
@@ -135,6 +136,14 @@ def run(
     Harmless to pass on an arm with no `copilot/rerank/llm` scorer at all
     (every wait becomes a no-op there), so callers may pass it uniformly
     across arms rather than tracking which one has the model configured.
+
+    `plugins` forwards --plugin PATH:MODULE, each an extra librime plugin
+    dylib to load. The one that matters here is librime-octagram: Squirrel
+    ships it and this build tree does not link it, so without it the harness
+    reproduces neither of the two things the live IME does -- Poet picks
+    BeamSearch over DynamicProgramming purely on whether a grammar component
+    exists (poet.cc:248), and a grammar with a model loaded is a language
+    model in the loop where otherwise there is none.
     """
     payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in requests)
     argv = [str(replayer), "--rime-dir", str(rime_dir)]
@@ -142,6 +151,8 @@ def run(
         argv += ["--window", str(window)]
     if wait_for_warm:
         argv += ["--wait-for-warm"]
+    for plugin in plugins:
+        argv += ["--plugin", str(plugin)]
     result = subprocess.run(argv, input=payload, capture_output=True, text=True)
     if result.returncode != 0:
         sys.stderr.write(result.stderr)
@@ -156,6 +167,7 @@ def run_arm(
     pristine_dir: str,
     window: int | None = None,
     wait_for_warm: bool = False,
+    plugins: Sequence[str] = (),
 ) -> list[dict]:
     """restore -> run -> restore: one full, uncontaminated measurement pass.
 
@@ -167,7 +179,7 @@ def run_arm(
     """
     restore_pristine_userdb(rime_dir, pristine_dir)
     try:
-        return run(requests, replayer, rime_dir, window, wait_for_warm)
+        return run(requests, replayer, rime_dir, window, wait_for_warm, plugins)
     finally:
         restore_pristine_userdb(rime_dir, pristine_dir)
 

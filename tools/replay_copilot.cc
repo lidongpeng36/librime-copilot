@@ -11,6 +11,7 @@
 //
 #include <rime_api.h>
 
+#include <dlfcn.h>  // --plugin: load an extra librime plugin dylib by path
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -83,6 +84,24 @@ struct Options {
   // resp["wait_for_warm"] (see ProcessRequest/MakeErrorResponse) so a saved
   // result file can never be mistaken for an unforced, live-shaped measurement.
   bool wait_for_warm = false;
+  // Extra librime plugin dylibs to dlopen before setup, each followed by the
+  // module name it provides, so the module list below can load it.
+  //
+  // Explicit paths rather than librime's own "plugins" module, which scans the
+  // directory beside librime.dylib. That directory also holds
+  // librime-copilot.dylib, whose static initializer would register a SECOND
+  // copilot module -- a different RimeModule pointer from the one linked into
+  // this binary, so ModuleManager::LoadModule's idempotence (module.cc:26,
+  // keyed by pointer) does not catch it, and Registry::Register would then
+  // overwrite every copilot component with the dylib's copy. Measuring one
+  // copy of the plugin while a second is half-registered is not a measurement.
+  //
+  // Needed because the live IME is NOT what this harness reproduces by
+  // default: Squirrel ships librime-octagram.dylib, this build tree does not
+  // link it, and Poet switches search strategy on whether a grammar component
+  // exists at all (poet.cc:248 -- BeamSearch with one, DynamicProgramming
+  // without).
+  std::vector<std::pair<std::string, std::string>> plugins;
 };
 
 bool ParseArgs(int argc, char** argv, Options* opts) {
@@ -107,6 +126,15 @@ bool ParseArgs(int argc, char** argv, Options* opts) {
       opts->verify_speller = true;
     } else if (arg == "--wait-for-warm") {
       opts->wait_for_warm = true;
+    } else if (arg == "--plugin") {
+      // PATH:MODULE, e.g. .../librime-octagram.dylib:grammar
+      const std::string spec = next_value();
+      const size_t sep = spec.rfind(':');
+      if (sep == std::string::npos || sep == 0 || sep + 1 == spec.size()) {
+        std::cerr << "--plugin expects PATH:MODULE, got: " << spec << "\n";
+        return false;
+      }
+      opts->plugins.emplace_back(spec.substr(0, sep), spec.substr(sep + 1));
     } else {
       std::cerr << "unknown argument: " << arg << "\n";
       return false;
@@ -853,7 +881,7 @@ int main(int argc, char* argv[]) {
   if (!ParseArgs(argc, argv, &opts)) {
     std::cerr << "usage: " << argv[0]
               << " --rime-dir DIR [--window N] [--max-scan N] [--self-check] "
-                 "[--verify-speller] [--wait-for-warm]\n";
+                 "[--verify-speller] [--wait-for-warm] [--plugin PATH:MODULE]\n";
     return 64;
   }
 
@@ -876,8 +904,27 @@ int main(int argc, char* argv[]) {
   // loading. Without this array, double_pinyin_flypy's
   // `engine/processors/@0: copilot` finds no such component and replay
   // silently measures a plain pinyin engine with no re-ranking at all.
-  const char* modules[] = {"default", "copilot", nullptr};
-  traits.modules = modules;  // must outlive RimeInitialize, so it stays on main's stack.
+  //
+  // --plugin appends to this list, so a run with a grammar loads
+  // {"default", "copilot", "grammar"}. The dlopen must happen BEFORE
+  // rime->setup: LoadModules runs inside it and can only find modules whose
+  // static initializers have already executed.
+  std::vector<std::string> module_names = {"default", "copilot"};
+  for (const auto& [path, module] : opts.plugins) {
+    // RTLD_LOCAL would keep the module's registration invisible here.
+    if (!dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL)) {
+      std::cerr << "failed to load plugin " << path << ": " << dlerror() << "\n";
+      return 1;
+    }
+    std::cerr << "loaded plugin " << path << " providing module '" << module << "'\n";
+    module_names.push_back(module);
+  }
+  std::vector<const char*> modules;
+  for (const auto& name : module_names) {
+    modules.push_back(name.c_str());
+  }
+  modules.push_back(nullptr);
+  traits.modules = modules.data();  // outlives RimeInitialize: both live in main.
 
   rime->setup(&traits);
   rime->initialize(&traits);
