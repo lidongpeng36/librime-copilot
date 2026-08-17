@@ -143,6 +143,153 @@ def _build_requests(records: list[dict]) -> list[dict]:
     return replay.build_requests(records, sp)
 
 
+def _coverage_report(name: str, rows: list[tuple[str, "object"]]) -> None:
+    """One register's R1/R2/R3 block. `rows` is (unit_text, Coverage)."""
+    from . import lattice
+
+    total = len(rows)
+    if not total:
+        return
+    reachable = [c for _, c in rows if c.reachable]
+    chars = sum(len(t) for t, _ in rows)
+
+    print(f"\n=== {name} ===")
+    print(f"units (Han runs): {total}    characters: {chars}")
+
+    # R1
+    print(f"R1 reachable: {len(reachable)}/{total} ({100 * len(reachable) / total:.1f}%)")
+
+    # R2 -- only meaningful for what is NOT reachable
+    causes: Counter = Counter()
+    samples: dict[str, dict[tuple, "object"]] = {}
+    for _, cov in rows:
+        for gap in cov.gaps:
+            causes[gap.cause] += 1
+            # Keyed by (character, wanted reading): the same 多音字 read the
+            # same wrong way is one finding however many times it recurs, and
+            # eight copies of it would hide a second, rarer cause.
+            seen = samples.setdefault(gap.cause, {})
+            if len(seen) < 8:
+                seen.setdefault((gap.char, gap.want), gap)
+    if causes:
+        print("R2 why not reachable:")
+        for cause, count in causes.most_common():
+            print(f"    {cause}: {count} ({len(samples[cause])} distinct shown)")
+            for gap in samples[cause].values():
+                if cause == lattice.MISSING_READING:
+                    print(
+                        f"        {gap.char}  wanted {gap.want!r}, "
+                        f"lexicon has {', '.join(gap.have)}"
+                    )
+                elif cause == lattice.MISSING_CHAR:
+                    print(f"        {gap.char}  ({gap.want})")
+                else:
+                    print(f"        {gap.char!r}")
+    else:
+        print("R2 why not reachable: (nothing unreachable)")
+
+    # R3 -- the number this whole command exists for
+    if not reachable:
+        return
+    words = sum(c.min_words for c in reachable)
+    singles = sum(c.singles for c in reachable)
+    reach_chars = sum(len(t) for t, c in rows if c.reachable)
+    print(
+        f"R3 shortest path: {words / len(reachable):.2f} entries per run, "
+        f"{reach_chars / words:.2f} characters per entry"
+    )
+    print(
+        f"   single-character fallback: {singles}/{words} entries "
+        f"({100 * singles / words:.1f}%), "
+        f"{100 * singles / reach_chars:.1f}% of characters"
+    )
+    spelled_out = sum(1 for c in reachable if c.min_words == c.singles)
+    print(
+        f"   runs the lexicon can only spell one character at a time: "
+        f"{spelled_out}/{len(reachable)} ({100 * spelled_out / len(reachable):.1f}%)"
+    )
+
+
+def _coverage(args: argparse.Namespace) -> int:
+    """S0-a: can the lexicon produce what the user wrote, and in how few
+    pieces? The ceiling any lattice decoder is built under, measured before
+    any model exists. See lattice.py for why reachability alone is not the
+    question."""
+    from . import lattice, replay, speller as _speller
+
+    loaded = _load_corpus(args)
+    if loaded is None:
+        return 1
+    _, records = loaded
+
+    units: list[tuple[str, str]] = []  # (source, Han run)
+    for record in records:
+        for _, run in replay.han_runs(record["text"]):
+            units.append((record["src"], run))
+    print(f"{len(records)} utterances -> {len(units)} Han runs")
+
+    syllables = {run: _speller.syllables(run) for _, run in units}
+
+    # Only entries whose text occurs somewhere in the corpus can ever span
+    # gold. Filtering here rather than after loading is what keeps
+    # cn_dicts/tencent (981k entries, every one needing pypinyin) affordable.
+    wanted: set[str] = set()
+    for _, run in units:
+        wanted.update(lattice.substrings(run))
+    print(f"{len(wanted)} distinct substrings to match against")
+
+    dict_path = Path(args.rime_dir) / f"{args.dict}.dict.yaml"
+    tables = lattice.import_tables(dict_path)
+    print(f"\nlexicon: {dict_path}")
+    for table in tables:
+        print(f"    {table.relative_to(dict_path.parent)}")
+
+    def run_arm(paths: list[Path], label: str) -> None:
+        lex, per_source = lattice.load(paths, keep=lambda w: w in wanted)
+        print(f"\n### {label}")
+        print(
+            "entries kept: "
+            + ", ".join(f"{name} {count}" for name, count in per_source.items())
+        )
+        print(f"distinct (text, reading) spans: {len(lex)}    misaligned: {lex.misaligned}")
+        by_source: dict[str, list] = {}
+        for source, run in units:
+            cov = lattice.analyze(run, syllables[run], lex)
+            by_source.setdefault(source, []).append((run, cov))
+        for source in sorted(by_source):
+            _coverage_report(source, by_source[source])
+        _coverage_report("all", [row for rows in by_source.values() for row in rows])
+
+    run_arm(tables, "full lexicon")
+
+    # Two sources are worth measuring out, for opposite reasons.
+    #
+    # tencent carries no readings at all (`columns: [text, weight]`), so this
+    # harness gives it pypinyin's single guess where librime derives possibly
+    # several by re-encoding. The bias only ever understates coverage, but how
+    # much of the answer rests on the approximated source is invisible until
+    # it is removed.
+    #
+    # private/custom is 46,699 entries exported from the user's own Sogou
+    # Pinyin, i.e. a lexicon learned from years of this same person's writing
+    # (2026-08-14-rime-copilot-toolchain-design.md). Including it is correct
+    # for "can the deployed system spell this" -- it IS part of the deployed
+    # system. It is not correct for "what would a model have to learn", since
+    # that lexicon is exactly the personal knowledge a general model would
+    # not have. Both questions are real; only reporting both distinguishes
+    # them.
+    for stem, why in (
+        ("tencent", "reading-approximated source"),
+        ("custom", "the user's own Sogou export"),
+    ):
+        without = [p for p in tables if lattice.table_name(p) != stem]
+        if len(without) == len(tables):
+            raise SystemExit(f"{stem} is not one of {dict_path}'s import_tables")
+        run_arm(without, f"without {stem} ({why})")
+
+    return 0
+
+
 def _oracle(args: argparse.Namespace) -> int:
     """The four-way bucket split (metrics.bucket) and the oracle bound --
     the share of segments where re-ranking has a real, non-policy target
@@ -254,6 +401,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify.add_argument("--replayer", required=True)
     verify.add_argument("--rime-dir", required=True)
     verify.set_defaults(func=_verify_speller)
+
+    coverage = sub.add_parser(
+        "coverage", help="S0-a: can the lexicon spell what the user wrote, in how few pieces"
+    )
+    # No replayer and no Rime session: this asks only what the dictionary
+    # files contain, so it runs in seconds and needs nothing built.
+    coverage.add_argument("--rime-dir", required=True)
+    # Must match the schema's translator/dictionary -- `private` for
+    # double_pinyin_flypy (build/double_pinyin_flypy.schema.yaml). Measuring a
+    # dictionary the schema does not load would be a measurement of nothing.
+    coverage.add_argument("--dict", default="private")
+    coverage.set_defaults(func=_coverage)
 
     oracle = sub.add_parser("oracle", help="the four-way bucket split and the oracle bound")
     oracle.add_argument("--replayer", required=True)

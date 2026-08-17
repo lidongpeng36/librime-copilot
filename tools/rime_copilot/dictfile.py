@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 # Dictionaries with no weight column (others.dict.yaml) assert only that a word
 # exists. Give them a floor level with ext/sogou/tencent so they rank behind
@@ -47,7 +47,15 @@ def iter_body_lines(lines: Iterable[str], source: str) -> Iterator[str]:
         raise ValueError(f"{source}: YAML header opened with `---` and never closed with `...`")
 
 
-def read_entries(path: Path) -> list[Entry]:
+def read_entries(path: Path, *, keep: Callable[[str], bool] | None = None) -> list[Entry]:
+    """Every entry, or only those whose word satisfies `keep`.
+
+    The filter is applied to the word before anything else about the line is
+    decided, so a caller that needs part of a dictionary never pays
+    `_auto_pinyin`'s pypinyin call for the rest. On `cn_dicts/tencent` --
+    981k entries, no reading column, so every one of them would otherwise be
+    read by pypinyin -- that is essentially the entire cost of loading it.
+    """
     entries: list[Entry] = []
     unusable: list[str] = []
     with open(path, "r", encoding="utf-8") as handle:
@@ -56,6 +64,8 @@ def read_entries(path: Path) -> list[Entry]:
             if not line or line.startswith("#"):
                 continue
             parts = line.split("\t")
+            if keep is not None and not keep(parts[0]):
+                continue
             if len(parts) == 3:
                 word, pinyin, weight = parts
             elif len(parts) == 2:

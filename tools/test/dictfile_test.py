@@ -118,6 +118,30 @@ class ReadEntries(unittest.TestCase):
         entries = read_entries(self.write(HEADER + "\n# x\n建议\tjian yi\t1\n"))
         self.assertEqual(1, len(entries))
 
+    def test_keep_selects_by_word(self):
+        path = self.write(HEADER + "建议\tjian yi\t1\n瓴\tling\t2\n")
+        entries = read_entries(path, keep=lambda w: w == "瓴")
+        self.assertEqual([Entry("瓴", "ling", 2)], entries)
+
+    def test_keep_rejects_before_pypinyin_is_ever_reached(self):
+        # The point of the filter: on a dictionary with no reading column,
+        # a rejected word must not cost a pypinyin call. Leave pypinyin
+        # unimportable so a call would raise instead of quietly succeeding.
+        had_module = "pypinyin" in sys.modules
+        original = sys.modules.get("pypinyin")
+
+        def restore():
+            if had_module:
+                sys.modules["pypinyin"] = original
+            else:
+                sys.modules.pop("pypinyin", None)
+
+        self.addCleanup(restore)
+        sys.modules["pypinyin"] = None  # import pypinyin -> ImportError
+
+        entries = read_entries(self.write("建议\t500\n"), keep=lambda w: False)
+        self.assertEqual([], entries)
+
     def test_missing_pypinyin_raises_an_actionable_error(self):
         # Make `import pypinyin` genuinely fail for the duration of this
         # test (not merely "never called") by planting the sys.modules None
