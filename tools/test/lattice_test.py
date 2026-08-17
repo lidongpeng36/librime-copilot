@@ -133,6 +133,86 @@ class AnalyzeTest(unittest.TestCase):
         self.assertEqual((got.min_words, got.singles), (0, 0))
 
 
+def ranked(*entries: tuple[str, str, float]) -> lattice.Lexicon:
+    """(text, "space separated readings", log-weight) triples."""
+    lex = lattice.Lexicon(by_reading=True)
+    for text, reading, weight in entries:
+        lex.add(text, reading.split(), weight)
+    return lex
+
+
+class KBestTest(unittest.TestCase):
+    def test_orders_homophones_by_weight(self):
+        lex = ranked(("市", "shi", -2.0), ("是", "shi", -1.0), ("事", "shi", -3.0))
+        got = lattice.kbest(["shi"], lex, k=3)
+        self.assertEqual([text for text, _ in got], ["是", "市", "事"])
+
+    def test_a_phrase_beats_two_characters_of_equal_total_weight(self):
+        # One entry pays WORD_PENALTY once, two pay it twice. This is the
+        # whole reason the lexicon's own ordering prefers longer words, so a
+        # k-best that lost it would not be the baseline it claims to be.
+        lex = ranked(
+            ("北京", "bei jing", -6.0),
+            ("北", "bei", -3.0),
+            ("京", "jing", -3.0),
+        )
+        got = lattice.kbest(["bei", "jing"], lex, k=5)
+        self.assertEqual(got[0][0], "北京")
+
+    def test_two_segmentations_of_one_text_are_a_single_candidate(self):
+        # 北京 spelled as a phrase and as two characters is the same answer to
+        # a user and to a scorer; keeping both would spend the beam twice on
+        # it. The better-scoring segmentation is the one that survives.
+        lex = ranked(
+            ("北京", "bei jing", -6.0),
+            ("北", "bei", -3.0),
+            ("京", "jing", -3.0),
+            ("背", "bei", -3.5),
+        )
+        got = lattice.kbest(["bei", "jing"], lex, k=10)
+        texts = [text for text, _ in got]
+        self.assertEqual(len(texts), len(set(texts)))
+        self.assertEqual(texts[0], "北京")
+        # and it kept the phrase's score, not the two-character one
+        self.assertAlmostEqual(got[0][1], -6.0 + lattice.WORD_PENALTY)
+
+    def test_returns_at_most_k(self):
+        lex = ranked(*[(c, "shi", -float(i)) for i, c in enumerate("是市事式试")])
+        self.assertEqual(len(lattice.kbest(["shi"], lex, k=3)), 3)
+
+    def test_a_syllable_no_entry_reads_yields_nothing(self):
+        lex = ranked(("是", "shi", -1.0))
+        self.assertEqual(lattice.kbest(["shi", "zzz"], lex, k=5), [])
+
+    def test_scores_are_sums_of_weights_and_one_penalty_per_entry(self):
+        lex = ranked(("北", "bei", -3.0), ("京", "jing", -4.0))
+        (text, score), = lattice.kbest(["bei", "jing"], lex, k=5)
+        self.assertEqual(text, "北京")
+        self.assertAlmostEqual(score, -3.0 - 4.0 + 2 * lattice.WORD_PENALTY)
+
+    def test_entries_longer_than_max_word_are_not_used(self):
+        lex = ranked(
+            ("北京", "bei jing", -1.0),
+            ("北", "bei", -3.0),
+            ("京", "jing", -3.0),
+        )
+        got = lattice.kbest(["bei", "jing"], lex, k=5, max_word=1)
+        self.assertEqual([text for text, _ in got], ["北京"])
+        # reached as two entries, so it paid the penalty twice
+        self.assertAlmostEqual(got[0][1], -6.0 + 2 * lattice.WORD_PENALTY)
+
+    def test_words_at_requires_the_by_reading_index(self):
+        # Building it means a pypinyin call for every entry of a reading-less
+        # dictionary, so it is opt-in; asking without it must fail loudly
+        # rather than silently return no candidates.
+        with self.assertRaises(RuntimeError):
+            build(("是", "shi")).words_at(("shi",))
+
+    def test_the_same_word_from_two_tables_keeps_the_larger_weight(self):
+        lex = ranked(("是", "shi", -5.0), ("是", "shi", -1.0), ("是", "shi", -3.0))
+        self.assertEqual(lex.words_at(("shi",)), {"是": -1.0})
+
+
 class ImportTablesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

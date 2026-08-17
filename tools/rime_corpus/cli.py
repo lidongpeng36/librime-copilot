@@ -290,6 +290,85 @@ def _coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _kbest(args: argparse.Namespace) -> int:
+    """S0-b's free upper bound: does the lexicon's own ranking put gold in the
+    top k at all? Nothing a language model does downstream can recover a
+    candidate that was never generated, so this bounds the whole experiment --
+    and it costs no model, no API and no data leaving the machine."""
+    from . import lattice, replay, speller as _speller
+
+    loaded = _load_corpus(args)
+    if loaded is None:
+        return 1
+    _, records = loaded
+
+    units: list[tuple[str, str]] = []
+    for record in records:
+        for _, run in replay.han_runs(record["text"]):
+            units.append((record["src"], run))
+    syllables = {run: tuple(_speller.syllables(run)) for _, run in units}
+    units = [(src, run) for src, run in units if len(syllables[run]) == len(run)]
+    print(f"{len(records)} utterances -> {len(units)} Han runs with readable syllables")
+
+    # Every contiguous syllable span the corpus can ask about. Unlike the
+    # coverage command's text filter, this cannot be applied before an entry's
+    # reading is known, so loading reads every table in full.
+    wanted: set[tuple[str, ...]] = set()
+    for _, run in units:
+        syls = syllables[run]
+        for i in range(len(syls)):
+            for j in range(i + 1, min(len(syls), i + lattice.MAX_WORD) + 1):
+                wanted.add(syls[i:j])
+    print(f"{len(wanted)} distinct syllable spans to match against")
+
+    dict_path = Path(args.rime_dir) / f"{args.dict}.dict.yaml"
+    tables = lattice.import_tables(dict_path)
+    print(f"loading {len(tables)} tables in full (pypinyin included)...")
+    lex, per_source = lattice.load(tables, keep_readings=wanted)
+    print("entries kept: " + ", ".join(f"{n} {c}" for n, c in per_source.items()))
+
+    # Bucketed by characters in the run: longer runs are where sentence
+    # decoding is actually needed, and a recall averaged over short runs would
+    # hide a collapse there.
+    buckets = [(1, 2), (3, 4), (5, 8), (9, 12), (13, 999)]
+    tally: dict[tuple[int, int], Counter] = {b: Counter() for b in buckets}
+    overall: Counter = Counter()
+    for _, run in units:
+        found = lattice.kbest(syllables[run], lex, k=args.k)
+        texts = [text for text, _ in found]
+        rank = texts.index(run) if run in texts else None
+        band = next(b for b in buckets if b[0] <= len(run) <= b[1])
+        for counter in (tally[band], overall):
+            counter["runs"] += 1
+            if rank is None:
+                counter["miss"] += 1
+            else:
+                counter["hit"] += 1
+                if rank == 0:
+                    counter["top1"] += 1
+                if rank < 5:
+                    counter["top5"] += 1
+
+    def line(label: str, c: Counter) -> str:
+        n = c["runs"] or 1
+        return (
+            f"{label:>12}  runs {c['runs']:6}   "
+            f"top1 {c['top1'] / n:6.1%}   top5 {c['top5'] / n:6.1%}   "
+            f"in top{args.k} {c['hit'] / n:6.1%}"
+        )
+
+    print(f"\ngold's rank among the lexicon's own top {args.k}:")
+    for band in buckets:
+        if tally[band]["runs"]:
+            print(line(f"{band[0]}-{band[1]} chars", tally[band]))
+    print(line("all", overall))
+    print(
+        f"\nCEILING for S0-b: {overall['hit'] / (overall['runs'] or 1):.1%} -- a scorer "
+        f"can only ever pick from what this generated."
+    )
+    return 0
+
+
 def _oracle(args: argparse.Namespace) -> int:
     """The four-way bucket split (metrics.bucket) and the oracle bound --
     the share of segments where re-ranking has a real, non-policy target
@@ -446,6 +525,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     # dictionary the schema does not load would be a measurement of nothing.
     coverage.add_argument("--dict", default="private")
     coverage.set_defaults(func=_coverage)
+
+    kbest = sub.add_parser(
+        "kbest", help="S0-b's free bound: is gold in the lexicon's own top k at all"
+    )
+    kbest.add_argument("--rime-dir", required=True)
+    kbest.add_argument("--dict", default="private")
+    kbest.add_argument("--k", type=int, default=20)
+    kbest.set_defaults(func=_kbest)
 
     oracle = sub.add_parser("oracle", help="the four-way bucket split and the oracle bound")
     oracle.add_argument("--replayer", required=True)

@@ -57,6 +57,7 @@ tencent-free figure alongside to show how much rests on that source.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,21 +94,25 @@ class Coverage:
 
 
 class Lexicon:
-    """Dictionary entries indexed for "does this exact span exist" lookups.
+    """Dictionary entries indexed for the three questions asked of them.
 
-    Only two questions are ever asked of it, so only two things are stored:
-    the set of (text, readings) pairs, and the readings available for each
-    single character. Storing the entries themselves would multiply memory by
-    the number of homophones without answering anything extra -- weights play
-    no part in reachability.
+    `has` answers reachability (does this exact span exist). `readings_of`
+    attributes the failures. `words_at` drives k-best enumeration, and is the
+    only one that needs weights -- which is why weights are kept at all, and
+    why `by_reading` is optional: building it means every entry must carry a
+    reading, and for `cn_dicts/tencent` that means a pypinyin call per entry
+    rather than only for the entries whose text the corpus contains.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, by_reading: bool = False) -> None:
         self._spans: set[tuple[str, tuple[str, ...]]] = set()
         self._char_readings: dict[str, set[str]] = {}
+        # readings -> [(text, weight)], only populated when by_reading
+        self._by_reading: dict[tuple[str, ...], dict[str, float]] = {}
+        self._by_reading_enabled = by_reading
         self.misaligned = 0
 
-    def add(self, text: str, syllables: Sequence[str]) -> None:
+    def add(self, text: str, syllables: Sequence[str], weight: float = 0.0) -> None:
         syls = tuple(syllables)
         if not text or len(syls) != len(text):
             # One reading per character is what makes an entry alignable to a
@@ -120,12 +125,26 @@ class Lexicon:
         self._spans.add((text, syls))
         if len(text) == 1:
             self._char_readings.setdefault(text, set()).add(syls[0])
+        if self._by_reading_enabled:
+            bucket = self._by_reading.setdefault(syls, {})
+            # The same (text, reading) can arrive from several imported
+            # tables. Rime merges them into one entry; keeping the largest
+            # weight is the closest single-value stand-in, and keeping the
+            # last would make the result depend on import order.
+            if weight > bucket.get(text, float("-inf")):
+                bucket[text] = weight
 
     def has(self, text: str, syllables: tuple[str, ...]) -> bool:
         return (text, syllables) in self._spans
 
     def readings_of(self, char: str) -> tuple[str, ...]:
         return tuple(sorted(self._char_readings.get(char, ())))
+
+    def words_at(self, syllables: tuple[str, ...]) -> dict[str, float]:
+        """Every word readable as exactly `syllables`, with its weight."""
+        if not self._by_reading_enabled:
+            raise RuntimeError("Lexicon was not built with by_reading=True")
+        return self._by_reading.get(syllables, {})
 
     def __len__(self) -> int:
         return len(self._spans)
@@ -183,6 +202,59 @@ def analyze(
     return Coverage(True, cost[n][0], cost[n][1], ())
 
 
+# librime's own no-grammar penalty per word, log(1e-6) (src/rime/gear/grammar.h,
+# Grammar::Evaluate). Applied once per entry on a path, it is what makes a
+# two-word reading of a span beat a four-word one at equal weight -- i.e. the
+# whole reason the lexicon's own ranking prefers longer phrases.
+WORD_PENALTY = -13.815510557964274
+
+
+def kbest(
+    syllables: Sequence[str], lex: Lexicon, k: int = 20, max_word: int = MAX_WORD
+) -> list[tuple[str, float]]:
+    """The k best-scoring texts readable as `syllables`, best first.
+
+    The candidate generator S0-b ranks with a language model. It has to be
+    generous where the lexicon's own ordering is weak and still bounded, so
+    it is a beam over *texts*, not over paths: two segmentations spelling the
+    same characters are the same candidate to a user and to a scorer, and
+    keeping both would spend the beam on duplicates. Only the better-scoring
+    segmentation of a text survives.
+
+    Scoring mirrors librime with no grammar loaded -- summed entry weight plus
+    `WORD_PENALTY` per entry -- because that is what produces the ordering
+    this measurement is the baseline for. It is deliberately NOT a good
+    ranking; a good ranking is what S0-b is trying to buy.
+
+    Weights are log-scale already (see `load`), so they add.
+    """
+    n = len(syllables)
+    syls = tuple(syllables)
+    # beams[j]: text spelling syls[:j] -> best score reaching it
+    beams: list[dict[str, float]] = [{} for _ in range(n + 1)]
+    beams[0][""] = 0.0
+    for i in range(n):
+        if not beams[i]:
+            continue
+        # Prune to k before extending: an unbounded frontier makes this
+        # exponential on long runs, and anything outside the top k at
+        # position i cannot re-enter the top k later -- every extension adds
+        # the same kind of term to every path.
+        frontier = sorted(beams[i].items(), key=lambda kv: -kv[1])[:k]
+        for j in range(i + 1, min(n, i + max_word) + 1):
+            words = lex.words_at(syls[i:j])
+            if not words:
+                continue
+            target = beams[j]
+            for prefix, score in frontier:
+                for word, weight in words.items():
+                    total = score + weight + WORD_PENALTY
+                    text = prefix + word
+                    if total > target.get(text, float("-inf")):
+                        target[text] = total
+    return sorted(beams[n].items(), key=lambda kv: -kv[1])[:k]
+
+
 _LIST_ITEM = re.compile(r"^\s+-\s+(\S+)")
 
 DICT_SUFFIX = ".dict.yaml"
@@ -233,10 +305,29 @@ def import_tables(dict_path: Path) -> list[Path]:
     return [dict_path.parent / f"{name}.dict.yaml" for name in names]
 
 
-def load(paths: Iterable[Path], keep: Callable[[str], bool] | None = None) -> tuple[
-    "Lexicon", dict[str, int]
-]:
+def load(
+    paths: Iterable[Path],
+    keep: Callable[[str], bool] | None = None,
+    keep_readings: "set[tuple[str, ...]] | None" = None,
+) -> tuple["Lexicon", dict[str, int]]:
     """Build a Lexicon from `.dict.yaml` files, and report each one's share.
+
+    `keep` filters by word text and is what makes the coverage command cheap:
+    an entry whose text the corpus never contains cannot span any gold, so it
+    is skipped before `cn_dicts/tencent` costs a pypinyin call for it.
+
+    `keep_readings` asks the opposite question -- every word readable as one
+    of these syllable sequences, whatever its text -- which is what k-best
+    enumeration needs, and which cannot be answered before an entry's reading
+    is known. Passing it therefore reads every entry of every table, pypinyin
+    included, and takes about a minute rather than a second. It also switches
+    the Lexicon into `by_reading` mode and turns weights on.
+
+    Weights are converted to log(weight / total) over every entry read, which
+    is what librime stores. The total is a per-word constant, so it changes no
+    ranking on its own -- but it sets the scale that `WORD_PENALTY` is
+    calibrated against, and getting it wrong would silently change how much
+    the lexicon's own ordering prefers fewer, longer words.
 
     The per-source counts are not decoration. Coverage that rests mostly on
     one dictionary is a different result from coverage spread across all of
@@ -249,13 +340,36 @@ def load(paths: Iterable[Path], keep: Callable[[str], bool] | None = None) -> tu
     # for those to be got wrong.
     from rime_copilot.dictfile import read_entries
 
-    lex = Lexicon()
+    ranked = keep_readings is not None
+    lex = Lexicon(by_reading=ranked)
     per_source: dict[str, int] = {}
+    if not ranked:
+        for path in paths:
+            entries = read_entries(path, keep=keep)
+            for entry in entries:
+                lex.add(entry.word, entry.pinyin.split())
+            per_source[table_name(path)] = len(entries)
+        return lex, per_source
+
+    loaded: list[tuple[str, list[tuple[str, tuple[str, ...], float]]]] = []
+    total = 0.0
     for path in paths:
-        entries = read_entries(path, keep=keep)
-        for entry in entries:
-            lex.add(entry.word, entry.pinyin.split())
-        per_source[table_name(path)] = len(entries)
+        kept = []
+        for entry in read_entries(path, keep=keep):
+            total += max(entry.weight, 0.0)
+            syls = tuple(entry.pinyin.split())
+            if syls in keep_readings:
+                kept.append((entry.word, syls, entry.weight))
+        loaded.append((table_name(path), kept))
+    if total <= 0:
+        raise ValueError("every entry read had non-positive weight")
+    for name, kept in loaded:
+        for word, syls, weight in kept:
+            # A zero or negative weight cannot be logged. Rime's own tables do
+            # not contain them; floor rather than drop, so a malformed entry
+            # ranks last instead of vanishing from the search space.
+            lex.add(word, syls, math.log(max(weight, 1e-3) / total))
+        per_source[name] = len(kept)
     return lex, per_source
 
 
