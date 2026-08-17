@@ -1102,3 +1102,70 @@ class VaultedFiles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GrammarState(unittest.TestCase):
+    """A schema that names a grammar whose file is absent decodes exactly as
+    though no grammar were configured -- Octagram keeps a null db and Query
+    returns a constant (octagram.cc:110). librime logs nothing a user reads,
+    so `status` is the only place this can surface."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "build").mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write_custom(self, body: str) -> None:
+        (self.dir / "double_pinyin_flypy.custom.yaml").write_text(body, encoding="utf-8")
+
+    def write_built(self, body: str) -> None:
+        (self.dir / "build" / "double_pinyin_flypy.schema.yaml").write_text(body, encoding="utf-8")
+
+    def test_no_grammar_anywhere_is_unconfigured(self):
+        self.write_custom("patch:\n  melt_eng/enable_user_dict: true\n")
+        state, detail = cli.grammar_state(self.dir)
+        self.assertEqual(state, "unconfigured")
+        self.assertIn("no language model", detail)
+
+    def test_configured_with_the_file_present_is_ok(self):
+        self.write_custom("patch:\n  grammar/language: private/zh-hans-t-essay-bgw\n")
+        (self.dir / "private").mkdir()
+        (self.dir / "private" / "zh-hans-t-essay-bgw.gram").write_bytes(b"x" * 7)
+        state, detail = cli.grammar_state(self.dir)
+        self.assertEqual(state, "ok")
+        self.assertIn("7 bytes", detail)
+
+    def test_configured_with_the_file_absent_is_missing(self):
+        self.write_custom("patch:\n  grammar/language: private/zh-hans-t-essay-bgw\n")
+        state, detail = cli.grammar_state(self.dir)
+        self.assertEqual(state, "missing")
+        self.assertIn("MISSING", detail)
+        # naming the file that asked for it is the actionable half
+        self.assertIn("double_pinyin_flypy.custom.yaml", detail)
+
+    def test_the_suffix_is_appended_not_expected_in_the_name(self):
+        # octagram declares ResourceType{"gram_db", "", ".gram"} and appends
+        # it, so `language` carries no suffix. Looking for the name verbatim
+        # would report every correct configuration as missing.
+        self.write_custom("patch:\n  grammar/language: private/zh-hans-t-essay-bgw\n")
+        (self.dir / "private").mkdir()
+        (self.dir / "private" / "zh-hans-t-essay-bgw.gram").write_bytes(b"x")
+        self.assertEqual(cli.grammar_state(self.dir)[0], "ok")
+
+    def test_the_deployed_schema_form_is_read_too(self):
+        # The built schema writes a nested block, not the patch's flat key.
+        self.write_built('grammar:\n  language: "private/zh-hans-t-essay-bgw"\n')
+        self.assertEqual(cli.grammar_state(self.dir)[0], "missing")
+
+    def test_a_language_key_outside_a_grammar_block_is_ignored(self):
+        # `language:` is a common key; only the one under `grammar:` names a
+        # gram db, and mistaking another would report a phantom missing file.
+        self.write_built("translator:\n  language: pinyin\n")
+        self.assertEqual(cli.grammar_state(self.dir)[0], "unconfigured")
+
+    def test_quotes_and_trailing_comments_are_stripped(self):
+        self.write_custom('patch:\n  "grammar/language": private/zh  # why\n')
+        state, detail = cli.grammar_state(self.dir)
+        self.assertEqual(state, "missing")
+        self.assertIn("private/zh MISSING", detail)

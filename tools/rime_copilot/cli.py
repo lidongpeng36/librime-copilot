@@ -9,6 +9,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,25 @@ MODEL_NAME = "Qwen3-0.6B-q4_K_M.gguf"
 # connection catches both failure modes without pinning an exact byte count
 # a re-quantization upstream would break.
 MIN_MODEL_SIZE = 300_000_000
+
+# The octagram n-gram grammar that scores Poet's sentence paths. Squirrel
+# already ships librime-octagram.dylib; only this file is missing, and without
+# it sentence decoding runs on summed dictionary weights with no language
+# model at all.
+#
+# Measured on the 3287 corpus runs that produce a sentence candidate:
+# exact-match precision 59.4% -> 69.3%, 9.6% fewer commits over the corpus, at
+# no measurable keystroke cost. Use the WORD-level model: the character-level
+# one (zh-hans-t-essay-bgc, 10MB) measures 59.1%, indistinguishable from
+# having no grammar, so it is not a cheaper substitute.
+GRAMMAR_URL = ("https://raw.githubusercontent.com/lotem/rime-octagram-data/"
+              "hans/zh-hans-t-essay-bgw.gram")
+GRAMMAR_NAME = "zh-hans-t-essay-bgw.gram"
+# The real file is ~41 MB (lotem/rime-octagram-data@hans, checked 2026-08-17).
+# Same reasoning as MIN_MODEL_SIZE: far below the truth, far above an error
+# page. The bgc model is 10 MB, so this floor also refuses it if the URL is
+# edited to the wrong branch or filename.
+MIN_GRAMMAR_SIZE = 20_000_000
 
 
 def _now() -> str:
@@ -153,6 +173,75 @@ def _vault_dir_or_error(rime_dir: Path) -> "tuple[Path | None, str | None]":
         return None, message
 
 
+_GRAMMAR_LANGUAGE = re.compile(r"^\s*(?:[\"']?grammar/language[\"']?|language)\s*:\s*[\"']?([^\"'#\s]+)")
+
+
+def grammar_state(rime_dir: Path) -> tuple[str, str]:
+    """(state, detail) for the octagram model the schemas ask for.
+
+    Four states, and the third is the reason this exists at all:
+
+      unconfigured  no schema names a grammar -- sentence decoding runs on
+                    summed dictionary weights with no language model
+      ok            configured, and the file it names is present
+      missing       configured, but the file is NOT there. librime does not
+                    fail on this; Octagram simply has no db and Query returns
+                    a constant (octagram.cc:110), so the schema silently
+                    decodes as though unconfigured. Nothing else reports it.
+      unreadable    the schema files could not be read
+
+    Scans `*.custom.yaml` and `build/*.schema.yaml` because the patch lives in
+    the former and the deployed result in the latter, and the two disagreeing
+    is itself worth seeing -- a patch that was never redeployed reads as
+    configured while the running IME has no grammar.
+    """
+    names: dict[str, list[str]] = {}
+    try:
+        sources = sorted(rime_dir.glob("*.custom.yaml")) + sorted(
+            (rime_dir / "build").glob("*.schema.yaml"))
+        for path in sources:
+            in_grammar_block = False
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("grammar:"):
+                    in_grammar_block = True
+                    continue
+                match = _GRAMMAR_LANGUAGE.match(line)
+                # A bare `language:` counts only directly under `grammar:`;
+                # other blocks use the same key for unrelated things.
+                if match and ("grammar/language" in stripped or in_grammar_block):
+                    names.setdefault(match.group(1), []).append(path.name)
+                    in_grammar_block = False
+                elif stripped and not line.startswith((" ", "\t")):
+                    in_grammar_block = False
+    except OSError as exc:
+        return "unreadable", str(exc)
+
+    if not names:
+        return "unconfigured", "no schema names a grammar (no language model in sentence decoding)"
+
+    parts = []
+    worst = "ok"
+    for name, where in sorted(names.items()):
+        # octagram appends the suffix itself (ResourceType, octagram.cc:21).
+        path = rime_dir / f"{name}.gram"
+        if path.is_file():
+            parts.append(f"{name} ({path.stat().st_size} bytes)")
+        else:
+            worst = "missing"
+            parts.append(f"{name} MISSING at {path}, named by {', '.join(sorted(set(where)))}")
+    return worst, "; ".join(parts)
+
+
+def _print_grammar_status(rime_dir: Path) -> None:
+    state, detail = grammar_state(rime_dir)
+    print(f"grammar:  {state} -- {detail}")
+    if state == "unconfigured":
+        print("          `rime-copilot fetch-grammar` installs one and prints the patch")
+    elif state == "missing":
+        print("          `rime-copilot fetch-grammar` downloads it")
+
+
 def cmd_status(args) -> int:
     rime_dir = args.rime_dir
     print(f"rime dir: {rime_dir}")
@@ -191,6 +280,7 @@ def cmd_status(args) -> int:
     else:
         print("lexicon:  not cleaned")
 
+    _print_grammar_status(rime_dir)
     _print_installed_status(rime_dir)
     return 0
 
@@ -320,42 +410,80 @@ def _print_fetch_model_config(target: Path) -> None:
     print(f"        model: private/{target.name}")
 
 
-def cmd_fetch_model(args) -> int:
-    rime_dir = args.rime_dir
-    private = _private(rime_dir)
-    target = private / (args.name or MODEL_NAME)
-    url = args.url or MODEL_URL
+def _print_fetch_grammar_config(target: Path) -> None:
+    # Resolved by librime's ResourceResolver against the Rime user dir, the
+    # same rule the gguf follows -- verified, not assumed: the harness measured
+    # `private/<stem>` and a bare `<stem>` to the same 2277/3287.
+    #
+    # `language` takes the name WITHOUT the .gram suffix: octagram declares
+    # ResourceType{"gram_db", "", ".gram"} (octagram.cc:21) and appends it.
+    print("Paste into a schema patch:")
+    print(f"  grammar/language: private/{target.name[: -len('.gram')]}")
 
+
+def _fetch_artifact(args, *, target: Path, url: str, minimum: int,
+                    command: str, show_config) -> int:
+    """Download `url` to `target`, refusing anything implausibly small.
+
+    Shared by fetch-model and fetch-grammar: both install one large binary
+    under private/ that the schema then references by a relative path, and
+    both have the same two failure modes worth guarding -- a half-written file
+    a reader might mmap, and an HTML error page saved under the name of a
+    model.
+    """
     if target.is_file() and not args.force:
         print(f"already present, skipping: {target} ({target.stat().st_size} bytes)")
-        _print_fetch_model_config(target)
+        show_config(target)
         return 0
 
     if args.dry_run:
         print(f"would download {url} -> {target}")
         return 0
 
-    private.mkdir(parents=True, exist_ok=True)
-    # Never in place: a reader (llama.cpp mmaps the model at load) must never
-    # see a half-written file, the same reasoning as `build`'s staged rename.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Never in place: a reader (llama.cpp mmaps the gguf; octagram mmaps the
+    # .gram) must never see a half-written file -- same reasoning as `build`'s
+    # staged rename.
     partial = target.with_name(target.name + ".part")
     try:
         written = _fetch_model_write(url, partial)
     except Exception as exc:  # noqa: BLE001 -- report, don't traceback
         partial.unlink(missing_ok=True)
-        print(f"fetch-model failed: {exc}")
+        print(f"{command} failed: {exc}")
         return 1
 
-    if written < MIN_MODEL_SIZE:
+    if written < minimum:
         partial.unlink(missing_ok=True)
         print(f"refusing to install: only {written} bytes, expected at least "
-             f"{MIN_MODEL_SIZE} -- probably an error page, not a model")
+             f"{minimum} -- probably an error page, not a model")
         return 1
 
     partial.replace(target)
     print(f"{written} bytes -> {target}")
-    _print_fetch_model_config(target)
+    show_config(target)
     return 0
+
+
+def cmd_fetch_model(args) -> int:
+    return _fetch_artifact(
+        args,
+        target=_private(args.rime_dir) / (args.name or MODEL_NAME),
+        url=args.url or MODEL_URL,
+        minimum=MIN_MODEL_SIZE,
+        command="fetch-model",
+        show_config=_print_fetch_model_config,
+    )
+
+
+def cmd_fetch_grammar(args) -> int:
+    return _fetch_artifact(
+        args,
+        target=_private(args.rime_dir) / (args.name or GRAMMAR_NAME),
+        url=args.url or GRAMMAR_URL,
+        minimum=MIN_GRAMMAR_SIZE,
+        command="fetch-grammar",
+        show_config=_print_fetch_grammar_config,
+    )
 
 
 def _missing_config_hint(rime_dir: Path, config: Path) -> str:
@@ -779,6 +907,16 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_model.add_argument("--force", action="store_true",
                              help="re-download even if the file already exists")
     fetch_model.set_defaults(func=cmd_fetch_model)
+
+    fetch_grammar = sub.add_parser(
+        "fetch-grammar",
+        help="download the octagram n-gram that scores sentence candidates")
+    fetch_grammar.add_argument("--url", help=f"override the download URL (default: {GRAMMAR_URL})")
+    fetch_grammar.add_argument("--name",
+                               help=f"filename under private/ (default: {GRAMMAR_NAME})")
+    fetch_grammar.add_argument("--force", action="store_true",
+                               help="re-download even if the file already exists")
+    fetch_grammar.set_defaults(func=cmd_fetch_grammar)
 
     for name, func in (("build", cmd_build), ("update", cmd_update)):
         command = sub.add_parser(name)
