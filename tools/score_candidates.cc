@@ -209,6 +209,27 @@ int main(int argc, char** argv) {
     llama_memory_seq_rm(mem, kScratchSeq, -1, -1);
 
     std::vector<llama_token> ctx_tokens = Tokenize(vocab, context, /*add_special=*/true);
+    // An empty context tokenizes to nothing on a vocab with no BOS (Qwen3 is
+    // one), and then the prefill loop below never runs, llama_decode is never
+    // called, and llama_get_logits_ith(ctx, -1) returns a null pointer that
+    // the very next line reads n_vocab floats from -- a silent SIGSEGV with no
+    // output at all, which is how this was found. Every candidate needs SOME
+    // distribution to score its first token against; BOS is that distribution.
+    //
+    // Not a nicety: whole-sentence scoring sets have empty contexts by
+    // construction wherever the text starts a message (measured: 619 of 3287
+    // runs), so refusing them would drop a fifth of the population rather than
+    // a stray record.
+    if (ctx_tokens.empty()) {
+      const llama_token bos = llama_vocab_bos(vocab);
+      if (bos == LLAMA_TOKEN_NULL) {
+        std::cerr << "line " << (n_lines + 1) << " (" << id
+                  << "): empty context and no BOS token to stand in for it, skipping\n";
+        ++n_lines;
+        continue;
+      }
+      ctx_tokens.push_back(bos);
+    }
     if ((int)ctx_tokens.size() >= args.n_ctx - 32) {
       std::cerr << "line " << (n_lines + 1) << " (" << id << "): context too long ("
                 << ctx_tokens.size() << " tokens), skipping\n";
