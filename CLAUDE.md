@@ -24,7 +24,7 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_ASAN=ON
 cmake --build build
 ```
 
-- **llama.cpp** (tag `b7820`) and **nlohmann_json** are pulled via CMake `FetchContent` — the first configure downloads and builds llama.cpp, which is slow.
+- **llama.cpp** (tag `b10456`) and **nlohmann_json** are pulled via CMake `FetchContent` — the first configure downloads and builds llama.cpp, which is slow.
 - Lint (CI gates on this, `clang-format -Werror`):
   ```sh
   find src tools -name '*.cc' -o -name '*.h' | xargs clang-format -i

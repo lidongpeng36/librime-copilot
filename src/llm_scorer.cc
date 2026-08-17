@@ -86,7 +86,7 @@ constexpr int kMaxCandidates = 8;
 // kNCtx is the TOTAL physical KV cache size handed to llama_init_from_model,
 // shared across kNSeqMax sequences -- it is NOT the per-sequence budget.
 // llama.cpp derives the real per-sequence limit as
-// n_ctx_seq = pad_to_256(kNCtx / kNSeqMax) (llama-context.cpp:177-178), e.g.
+// n_ctx_seq = pad_to_256(kNCtx / kNSeqMax) (llama-context.cpp:293-294), e.g.
 // 4096/9 -> 512 here. Prefill's too-long guard must check that derived
 // value (cached as n_ctx_seq_, read back via llama_n_ctx_seq() once the
 // context exists), not kNCtx itself -- a guard against kNCtx admits contexts
@@ -258,6 +258,12 @@ struct LlmScorer::Impl {
       return false;
     }
 
+    // Silence llama.cpp's own logging, same as llm.cc does for the prediction
+    // provider. Without this every prefill writes graph/KV-buffer chatter to
+    // the IME process's stderr -- harmless but unbounded, and it grew
+    // substantially between llama.cpp b7820 and b10456.
+    llama_log_set([](ggml_log_level /*level*/, const char* /*text*/, void* /*user_data*/) {},
+                  nullptr);
     llama_backend_init();
     backend_inited_ = true;
 

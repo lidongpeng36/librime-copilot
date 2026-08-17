@@ -14,16 +14,19 @@
 #include "llm.h"
 
 namespace {
-llama_sampler* create_sampler(const ClientConfig& cfg) {
+// `vocab` is only needed by the penalties sampler, which sizes its frequency
+// table by the vocabulary; every other sampler in the chain is vocab-agnostic.
+llama_sampler* create_sampler(const ClientConfig& cfg, const llama_vocab* vocab) {
   llama_sampler_chain_params params = llama_sampler_chain_default_params();
   params.no_perf = cfg.no_perf;
   llama_sampler* sampler = llama_sampler_chain_init(params);
 
   // 添加 repetition / freq / presence penalty（非默认时）
   if (cfg.penalty_repeat != 1.0f || cfg.penalty_freq != 0.0f || cfg.penalty_present != 0.0f) {
-    llama_sampler_chain_add(sampler,
-                            llama_sampler_init_penalties(cfg.penalty_last_n, cfg.penalty_repeat,
-                                                         cfg.penalty_freq, cfg.penalty_present));
+    llama_sampler_chain_add(
+        sampler,
+        llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), cfg.penalty_last_n,
+                                     cfg.penalty_repeat, cfg.penalty_freq, cfg.penalty_present));
   }
 
   if (cfg.top_k > 0) {
@@ -675,7 +678,7 @@ inline std::unique_ptr<Client> LLMManager::Impl::CreateClient(const std::string&
   impl->callback = callback;
   impl->callback = callback ? callback : [](const std::string_view&) -> bool { return true; };
   impl->on_finish = on_finish ? on_finish : [](const std::string&) {};
-  impl->sampler = create_sampler(config);
+  impl->sampler = create_sampler(config, llama_model_get_vocab(backend->model()));
   // common_params_sampling param;
   // impl->smpl = common_sampler_init(backend->model(), param);
   impl->history = std::make_unique<History>();
@@ -743,7 +746,7 @@ ClientSimple::ClientSimple(ClientConfig config, const std::string& model,
     throw std::runtime_error("上下文初始化失败");
   }
   n_ctx_ = llama_n_ctx(ctx_);
-  sampler_ = create_sampler(config);
+  sampler_ = create_sampler(config, vocab_);
 
   worker_ = std::make_shared<std::thread>([this]() {
     while (true) {
