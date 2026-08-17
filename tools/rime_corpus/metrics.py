@@ -55,6 +55,97 @@ def bucket(hit: int, cands: list[str], window: int) -> str:
     return "D"
 
 
+def run_level(
+    responses: Iterable[dict], requests: Iterable[dict], window: int = 32
+) -> dict:
+    """S0-c: where the WHOLE run sits in Rime's own ranking, before any commit.
+
+    A different question from the A/B/C/D split above, which scores each
+    segment the replayer commits. `replay_copilot` feeds every key of a run
+    before it walks candidates at all (`tools/replay_copilot.cc:642-647`), so
+    the FIRST segment's candidate list is Rime's ranking for the entire run's
+    input. That list is what a whole-sentence decoder competes with, and it is
+    the floor S0-b's ceiling has to beat.
+
+    Four outcomes. The split between the middle two is the same one `bucket`
+    makes between B and C, and for the same reason: when `RawInputFilter`
+    puts the raw keystrokes ahead of a sentence candidate on purpose
+    (`src/filters.cc:139`), the correct answer sitting at rank 1 is policy,
+    not a ranking failure. Merging them is what turned a 27.5% bound into
+    67.1% for the segment-level measurement; at run level the same merge
+    inflates the re-ordering ceiling by roughly 40 points, because almost
+    every non-first gold sits at exactly rank 1 behind the raw input.
+
+      top1            the whole run is already the first candidate
+      ranked_real     in the list, not first, and the first candidate IS all
+                      Han -- a genuine ordering mistake a better language
+                      model can take
+      ranked_policy   in the list, not first, and the first candidate is not
+                      all Han -- RawInputFilter's deliberate choice, out of
+                      scope here exactly as bucket B is
+      absent          not in the first `window` candidates at all -- no
+                      re-ordering reaches it; only a decoder that enumerates
+                      differently would
+
+    `requests` is joined by `id`, not by position: it carries the run's gold
+    text, and nothing on the response does (`segments[0]["want"]` is only what
+    that first segment committed, which is a prefix of the run whenever Rime
+    needed more than one commit).
+
+    Responses with `status == "error"` are excluded on the same grounds as in
+    `summarize` -- their context could not be trusted, so their candidates are
+    not evidence. A response whose `segments` is empty is counted separately:
+    it produced no candidate list at all, which is neither a hit nor a miss of
+    ranking.
+    """
+    by_id = {request["id"]: request for request in requests}
+    counts: Counter = Counter()
+    ranks: Counter = Counter()
+    for response in responses:
+        if response.get("status") == "error":
+            counts["error"] += 1
+            continue
+        segments = response.get("segments", [])
+        if not segments:
+            counts["no_segments"] += 1
+            continue
+        request = by_id.get(response.get("id"))
+        if request is None:
+            # A response nothing asked for cannot be scored against a gold
+            # text. Counting it rather than skipping keeps the totals honest.
+            counts["unmatched"] += 1
+            continue
+        gold = request["text"]
+        cands = segments[0].get("cands", [])[:window]
+        first = cands[0] if cands else ""
+        if first == gold:
+            counts["top1"] += 1
+            ranks[0] += 1
+        elif gold in cands:
+            real = bool(_ALL_HAN.fullmatch(first))
+            counts["ranked_real" if real else "ranked_policy"] += 1
+            if real:
+                ranks[cands.index(gold)] += 1
+        else:
+            counts["absent"] += 1
+
+    scored = (
+        counts["top1"] + counts["ranked_real"] + counts["ranked_policy"] + counts["absent"]
+    )
+    return {
+        "counts": dict(counts),
+        "scored": scored,
+        "top1_rate": counts["top1"] / scored if scored else 0.0,
+        # Deliberately excludes ranked_policy: a decoder that "fixes" those is
+        # fighting RawInputFilter, which this project puts out of scope.
+        "reorder_ceiling": (
+            (counts["top1"] + counts["ranked_real"]) / scored if scored else 0.0
+        ),
+        "policy_rate": counts["ranked_policy"] / scored if scored else 0.0,
+        "rank_of_gold": dict(sorted(ranks.items())),
+    }
+
+
 def severity(picked: str, gold: str) -> str:
     """Classify a re-ranker's disagreement with gold as "correct", "prefix",
     "extension", or "wrong-word".
@@ -120,15 +211,13 @@ def summarize(responses: Iterable[dict], requests: Iterable[dict] | None = None,
     still contribute their completed segments plus their final `hit == -1`
     sentinel segment (bucket D).
 
-    `requests` is accepted for interface symmetry with the rest of the
-    harness -- a caller assembling a report typically has both the requests
-    and the responses in hand -- but nothing here currently needs to join
-    back to it; every value `summarize` computes already lives on each
-    response. Kept as a parameter rather than dropped so a future per-source
-    or per-context-length breakdown does not have to change every call site.
+    `requests` is now consulted: `run_level` needs each run's gold text to ask
+    where the whole run sits in Rime's own ranking, and only the request
+    carries it. Callers that have no requests to hand may still pass None, in
+    which case the run-level block is omitted rather than faked.
     """
-    del requests  # see docstring: accepted, not yet consulted
     responses = list(responses)
+    requests = list(requests) if requests is not None else None
     counts: Counter = Counter()
     total_responses = 0
     errors = 0
@@ -145,7 +234,7 @@ def summarize(responses: Iterable[dict], requests: Iterable[dict] | None = None,
             counts[bucket(segment["hit"], segment.get("cands", []), window)] += 1
 
     trustworthy = total_responses - errors
-    return {
+    summary = {
         "buckets": _tally(counts),
         "responses": total_responses,
         "errors": errors,
@@ -153,3 +242,6 @@ def summarize(responses: Iterable[dict], requests: Iterable[dict] | None = None,
         "divergence_rate": diverged / trustworthy if trustworthy else 0.0,
         "gold_rank_in_c": _gold_rank_breakdown(responses, window),
     }
+    if requests is not None:
+        summary["run_level"] = run_level(responses, requests, window)
+    return summary

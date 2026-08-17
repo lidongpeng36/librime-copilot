@@ -338,6 +338,39 @@ def _oracle(args: argparse.Namespace) -> int:
         print("\nrank of the correct answer within bucket C:")
         for rank, count in summary["gold_rank_in_c"].items():
             print(f"  rank {rank:3}: {count:6}  ({count/b['C']:.1%})")
+
+    # S0-c, and the ceiling S0-b's re-ordering half is bounded by. A different
+    # unit from everything above: the whole Han run, scored against Rime's
+    # ranking for the run's entire input, which is what a sentence decoder
+    # competes with. See metrics.run_level.
+    run = summary.get("run_level")
+    if run and run["scored"]:
+        scored = run["scored"]
+        counts = run["counts"]
+        print(f"\nWHOLE-RUN ranking (S0-c), {scored} runs scored:")
+        print(
+            f"  top1 (already first)           : {counts.get('top1', 0):6}"
+            f"  ({run['top1_rate']:.1%})   <- S0-c, the floor"
+        )
+        print(
+            f"  ranked_real (ordering mistake) : {counts.get('ranked_real', 0):6}"
+            "   behind an all-Han candidate"
+        )
+        print(
+            f"  ranked_policy (raw input first): {counts.get('ranked_policy', 0):6}"
+            f"  ({run['policy_rate']:.1%})   RawInputFilter, out of scope"
+        )
+        print(f"  absent (not in the window)     : {counts.get('absent', 0):6}")
+        print(
+            f"  re-ordering ceiling            : {run['reorder_ceiling']:.1%}"
+            "   <- all a pure re-ranker of this list could reach"
+        )
+        for key in ("error", "no_segments", "unmatched"):
+            if counts.get(key):
+                print(f"  ({key}: {counts[key]}, excluded from the {scored})")
+        head = list(run["rank_of_gold"].items())[:10]
+        if head:
+            print("  rank of the whole run: " + ", ".join(f"{r}:{c}" for r, c in head))
     print(
         "\nReconstruction bias: this replays text the user WROTE, not input "
         "the user PERFORMED. Treat as a go/no-go threshold, not a live rate."

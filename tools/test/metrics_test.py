@@ -115,3 +115,104 @@ class SummarizeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _resp(rid, cands, **extra):
+    return {"id": rid, "segments": [{"hit": 0, "cands": list(cands)}], **extra}
+
+
+def _req(rid, text):
+    return {"id": rid, "text": text}
+
+
+class RunLevelTest(unittest.TestCase):
+    """S0-c: where the whole run sits in Rime's own ranking.
+
+    `replay_copilot` feeds every key before walking candidates, so the first
+    segment's list is the ranking for the ENTIRE run -- which is what a
+    whole-sentence decoder competes against.
+    """
+
+    def test_gold_first_is_top1(self):
+        got = metrics.run_level([_resp("a", ["高屋建瓴", "高屋建令"])], [_req("a", "高屋建瓴")])
+        self.assertEqual(got["counts"]["top1"], 1)
+        self.assertEqual(got["top1_rate"], 1.0)
+        self.assertEqual(got["rank_of_gold"], {0: 1})
+
+    def test_gold_behind_an_all_han_first_candidate_is_a_real_ordering_mistake(self):
+        got = metrics.run_level([_resp("a", ["高屋建令", "刘", "高屋建瓴"])], [_req("a", "高屋建瓴")])
+        self.assertEqual(got["counts"]["ranked_real"], 1)
+        self.assertEqual(got["top1_rate"], 0.0)
+        # Reachable by re-ordering alone: a better LM can take this one.
+        self.assertEqual(got["reorder_ceiling"], 1.0)
+        self.assertEqual(got["rank_of_gold"], {2: 1})
+
+    def test_gold_behind_raw_input_is_policy_not_headroom(self):
+        """RawInputFilter puts the raw keystrokes first on purpose
+        (src/filters.cc:139). Counting that as re-ordering headroom is the
+        same error that turned a 27.5% bound into 67.1% at segment level; at
+        run level almost every non-first gold sits at exactly rank 1 behind
+        the raw input, so the merge would inflate the ceiling by ~40 points."""
+        got = metrics.run_level([_resp("a", ["gwjl", "高屋建瓴"])], [_req("a", "高屋建瓴")])
+        self.assertEqual(got["counts"]["ranked_policy"], 1)
+        self.assertEqual(got["reorder_ceiling"], 0.0)
+        self.assertEqual(got["policy_rate"], 1.0)
+        # Its rank is not recorded either: the distribution exists to show
+        # how far a re-ranker would have to reach, and this is not its reach.
+        self.assertEqual(got["rank_of_gold"], {})
+
+    def test_gold_missing_is_absent_and_not_reachable_by_reordering(self):
+        got = metrics.run_level([_resp("a", ["高屋建令"])], [_req("a", "高屋建瓴")])
+        self.assertEqual(got["counts"]["absent"], 1)
+        self.assertEqual(got["reorder_ceiling"], 0.0)
+
+    def test_gold_past_the_window_is_absent_not_ranked(self):
+        # The window is the list the user can actually reach; a candidate
+        # beyond it is out of reach exactly as bucket D is.
+        cands = ["x"] * 5 + ["高屋建瓴"]
+        got = metrics.run_level([_resp("a", cands)], [_req("a", "高屋建瓴")], window=5)
+        self.assertEqual(got["counts"]["absent"], 1)
+
+    def test_only_the_first_segment_is_consulted(self):
+        # Later segments are post-commit lists for the REST of the run, not a
+        # ranking of the run itself.
+        response = {
+            "id": "a",
+            "segments": [
+                {"hit": 0, "cands": ["高屋"]},
+                {"hit": 0, "cands": ["高屋建瓴"]},
+            ],
+        }
+        got = metrics.run_level([response], [_req("a", "高屋建瓴")])
+        self.assertEqual(got["counts"]["absent"], 1)
+
+    def test_error_responses_are_excluded_from_the_denominator(self):
+        got = metrics.run_level(
+            [_resp("a", ["高屋建瓴"]), {"id": "b", "status": "error"}],
+            [_req("a", "高屋建瓴"), _req("b", "别的")],
+        )
+        self.assertEqual(got["scored"], 1)
+        self.assertEqual(got["counts"]["error"], 1)
+        self.assertEqual(got["top1_rate"], 1.0)
+
+    def test_a_response_with_no_segments_is_counted_separately(self):
+        got = metrics.run_level([{"id": "a", "segments": []}], [_req("a", "高屋建瓴")])
+        self.assertEqual(got["counts"]["no_segments"], 1)
+        self.assertEqual(got["scored"], 0)
+
+    def test_requests_are_joined_by_id_not_by_position(self):
+        responses = [_resp("b", ["乙"]), _resp("a", ["甲"])]
+        got = metrics.run_level(responses, [_req("a", "甲"), _req("b", "乙")])
+        self.assertEqual(got["counts"]["top1"], 2)
+
+    def test_a_response_with_no_matching_request_is_counted_not_scored(self):
+        got = metrics.run_level([_resp("ghost", ["甲"])], [_req("a", "甲")])
+        self.assertEqual(got["counts"]["unmatched"], 1)
+        self.assertEqual(got["scored"], 0)
+
+    def test_summarize_omits_the_run_level_block_without_requests(self):
+        self.assertNotIn("run_level", metrics.summarize([_resp("a", ["甲"])], None))
+
+    def test_summarize_includes_it_when_requests_are_given(self):
+        got = metrics.summarize([_resp("a", ["甲"])], [_req("a", "甲")])
+        self.assertEqual(got["run_level"]["counts"]["top1"], 1)
