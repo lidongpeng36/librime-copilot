@@ -24,9 +24,11 @@
 #include <rime/segmentation.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <string>
 
+#include "rerank_llm.h"  // llm_rerank::SkipReason
 #include "telemetry_event.h"
 
 namespace rime {
@@ -65,6 +67,35 @@ struct RerankTrace {
   // `record.text` is empty when re-ranking ran but promoted nothing. The
   // context above is still meaningful in that case.
   telemetry::RerankRecord record;
+  // What Apply()'s fallback chain (rerank_filter.cc) decided for the LLM path
+  // on this segment -- kNone means eligible (the scorer was consulted; a
+  // subsequent kNoHan/kMargin from Decide() does not retroactively change
+  // this, "engaged" and "engaged but declined to promote" are both kNone
+  // here). Measurement consumer: replay_copilot.cc's --wait-for-warm reads
+  // this rather than re-deriving it, because every OTHER guard in the chain
+  // (llm.enable, battery, warm/loaded) is constant for the run and a
+  // re-derivation collapses to "is there a trailing Han context at all" --
+  // see task-6-report.md's review notes for how that was caught.
+  llm_rerank::SkipReason llm_skip = llm_rerank::SkipReason::kDisabled;
+  // Wall-clock microseconds of the Scorer::Score() call this trace's decision
+  // came from, or -1 when no Score() call was made (llm_skip != kNone, i.e.
+  // the db path decided instead). NOT the same thing as replay_copilot.cc's
+  // pre-existing `us.menu` timer: that wraps WalkCandidates(), which for a
+  // segment materialized inside a PRECEDING select_candidate() call (measured
+  // directly -- see task-6-report.md) reads an already-cached menu and times
+  // a cache hit, not the scoring. This field is the only place that measures
+  // the real thing.
+  int64_t score_us = -1;
+  // The LLM path's decision, in the shape telemetry needs. Populated only
+  // inside the `llm_scorer_` branch of RerankTranslation::Replenish(), i.e.
+  // exactly when llm_skip above is kNone -- `text` empty then still
+  // distinguishes "engaged but declined" (kNoHan/kMargin, telemetry_commit.cc
+  // reads `llm.skip` for which) from a real promotion, the same way
+  // `record.text` does for the db path. Left default (an absent-looking
+  // record) whenever llm_skip != kNone, so a commit-side reader must check
+  // llm_skip before trusting this rather than guessing from an empty `text`
+  // alone -- kNoModel and a genuine decline both leave `text` empty.
+  telemetry::LlmRecord llm;
 
   void Clear() { *this = RerankTrace{}; }
 };
@@ -98,6 +129,17 @@ class RerankTraceStore {
 
   // The decision recorded for exactly this segment, or null.
   const RerankTrace* Find(const std::string& input, size_t start, size_t end) const;
+
+  // The most recently recorded entry, or null. Measurement-only consumer:
+  // replay_copilot.cc reads this immediately after the one call (the first
+  // WalkCandidates() of a request, or a select_candidate()) it knows can
+  // record at most one new trace on this single-threaded input path --
+  // paired with a size() check before/after to tell "a fresh trace landed"
+  // from "nothing changed", this sidesteps reconstructing the exact
+  // (input, start, end) a segment was recorded under, which depends on
+  // segmentation internals the tool has no other reason to model (see
+  // TraceSpanOf's own comment on why `end` is not what a caller would guess).
+  const RerankTrace* Last() const { return entries_.empty() ? nullptr : &entries_.back(); }
 
   void Clear() { entries_.clear(); }
   size_t size() const { return entries_.size(); }

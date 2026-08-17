@@ -21,10 +21,12 @@
 #include "copilot_engine.h"
 #include "ime_bridge.h"
 #include "prediction_context.h"
+#include "rerank.h"  // TrailingCjkRun
 #include "select_character.h"
 #include "surrounding_source.h"
 #include "telemetry_commit.h"
 #include "tmux_source.h"
+#include "utils.h"  // copilot::IsACPowerConnected, RegisterPowerChange
 
 namespace rime {
 
@@ -99,8 +101,10 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
     int rerank_chars = 8;
     config->GetBool("copilot/rerank/enable", &rerank_enable);
     config->GetInt("copilot/rerank/max_context_chars", &rerank_chars);
+    rerank_max_context_chars_ = std::clamp(rerank_chars, 1, 64);
+    config->GetBool("copilot/rerank/llm/battery_active", &rerank_llm_battery_active_);
     if (rerank_enable) {
-      prefix_chars = std::max(prefix_chars, std::clamp(rerank_chars, 1, 64));
+      prefix_chars = std::max(prefix_chars, rerank_max_context_chars_);
     }
 #ifdef __APPLE__
     SetIMKSurroundingPrefixChars(prefix_chars);
@@ -152,12 +156,40 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
     }
   }
 
+  // Only worth tracking AC/battery state -- and paying for the monitor
+  // callback -- when there is a scorer to gate at all, and the config cares
+  // (battery_active already means "run regardless"). Same condition and same
+  // pattern CopilotRerankFilter uses for the identical reason.
+  if (copilot_engine_ && copilot_engine_->scorer() && !rerank_llm_battery_active_) {
+    is_on_ac_ = ::copilot::IsACPowerConnected();
+    power_token_ =
+        ::copilot::RegisterPowerChange([this](bool is_ac_power) { is_on_ac_ = is_ac_power; });
+  }
+
   // Register processors based on config
   if (disabled_plugins.find("ime_bridge") == disabled_plugins.end()) {
     processors_.emplace_back(std::make_shared<ImeBridge>(ticket));
   }
   if (disabled_plugins.find("auto_spacer") == disabled_plugins.end()) {
-    processors_.emplace_back(std::make_shared<AutoSpacer>(ticket));
+    // AutoSpacer's Space/Enter/number commits bypass Context::Commit()
+    // entirely (engine_->CommitText() + ctx->Clear(), never ctx->Commit()),
+    // so OnCommit's warm (hung off commit_notifier()) never sees them. This
+    // is how those commits reach WarmRerankContext instead -- see
+    // auto_spacer.h's constructor comment.
+    processors_.emplace_back(std::make_shared<AutoSpacer>(
+        ticket, [this](Context* ctx, const string& committed, bool selection_commit) {
+          WarmRerankContext(ctx, committed);
+          // Same reasoning as OnCommit: telemetry must see the commits that
+          // actually happen, and in this configuration these ARE the commits
+          // -- see EmitCommitTelemetry's comment (copilot.h). `selection_commit`
+          // is false on AutoSpacer's two bail-out paths (Enter, the number-key
+          // raw fallback): the user discarded every candidate, so the
+          // still-highlighted one must not be recorded as accepted --
+          // BuildCommitEvents' own comment (telemetry_commit.h) has the
+          // reasoning; WarmRerankContext above still runs unconditionally,
+          // since warming for the next input is unrelated to that accounting.
+          EmitCommitTelemetry(ctx, selection_commit);
+        }));
   }
   if (disabled_plugins.find("select_character") == disabled_plugins.end()) {
     processors_.emplace_back(std::make_shared<SelectCharacter>(ticket, [this](const string& text) {
@@ -172,6 +204,18 @@ Copilot::~Copilot() {
   select_connection_.disconnect();
   context_update_connection_.disconnect();
   commit_connection_.disconnect();
+  // Session end: this processor dies on schema redeploy or session teardown,
+  // either of which can arrive well inside the periodic window, and "no
+  // stats line beyond what is meaningful" (FlushStatsIfAny's own gate) means
+  // a short session that never crosses kStatsFlushIntervalSec would
+  // otherwise report nothing at all.
+  FlushStatsIfAny();
+  // The monitor is a process-wide singleton: leaving the `this`-capturing
+  // callback registered means the next plug/unplug writes into freed memory
+  // (this processor dies on every schema redeploy) -- same hazard and same
+  // fix as CopilotRerankFilter (rerank_filter.cc) and LLMProvider.
+  ::copilot::UnregisterPowerChange(power_token_);
+  power_token_ = 0;
 }
 
 ProcessResult Copilot::RunProcessors(const KeyEvent& key_event) {
@@ -312,6 +356,23 @@ void Copilot::OnContextUpdate(Context* ctx) {
     rerank_traces_->Clear();
   }
 
+  // Warm the re-ranking scorer the instant a composition begins: the
+  // surrounding text is definitely current here, unlike a commit-time warm,
+  // which can already be stale if the caret moved before the user typed again
+  // (task-5-brief.md). Sampled on the false->true edge of IsComposing() so
+  // this fires once per composition, not once per keystroke. Above the guard
+  // below on purpose, same reasoning as the trace-clear above: the re-ranking
+  // filter consults neither the `copilot` switch nor self_updating_, so
+  // gating the warm behind either would silently miss the inputs the filter
+  // still re-ranks. Any resulting WarmUp() call that lands on a context an
+  // OnCommit warm already queued is deduped inside the scorer itself
+  // (LlmScorer::WarmUp), not here.
+  const bool composing_now = ctx && ctx->IsComposing();
+  if (composing_now && !was_composing_) {
+    WarmRerankContext(ctx, {});
+  }
+  was_composing_ = composing_now;
+
   if (self_updating_ || !copilot_engine_ || !ctx || !ctx->get_option("copilot")) {
     return;
   }
@@ -404,12 +465,57 @@ void Copilot::CopilotAndUpdate(Context* ctx, const string& context_query) {
   }
 }
 
+void Copilot::WarmRerankContext(Context* ctx, const string& extra_committed) {
+  if (!copilot_engine_) {
+    return;
+  }
+  Scorer* scorer = copilot_engine_->scorer();
+  if (!scorer) {
+    return;  // rerank/llm disabled or unconfigured: no-op, same as before Task 5
+  }
+  // The same battery gate CopilotRerankFilter::Apply applies before it will
+  // even consult the warm cache (rerank_filter.cc) -- warming here must not
+  // load the ~1 GB model on battery power for a context Apply() would refuse
+  // to score against anyway.
+  if (!rerank_llm_battery_active_ && !is_on_ac_) {
+    DLOG(INFO) << "[copilot] rerank warm: skipped, on battery";
+    return;
+  }
+  auto surrounding = GetSurroundingContext();
+  if (!surrounding) {
+    return;  // no real surrounding text -- same guard the filter applies
+  }
+  const string context =
+      TrailingCjkRun(surrounding->before + extra_committed, rerank_max_context_chars_);
+  if (context.empty()) {
+    return;
+  }
+  scorer->WarmUp(context);
+}
+
 void Copilot::OnCommit(Context* ctx) {
   // Context::Commit() fires this notifier before Clear() (librime
   // src/rime/context.cc:18-26), so the composition, its menus and every
-  // selected_index are still readable here. That ordering is what this whole
-  // path depends on.
-  //
+  // selected_index are still readable here -- the same requirement
+  // EmitCommitTelemetry's own comment (copilot.h) states for its other call
+  // site, AutoSpacer's on_commit_.
+
+  // The context for the NEXT input is fully known the instant this commit
+  // lands -- GetCommitText() is the whole composition's confirmed text at
+  // once, the commit-time analogue of ConfirmedPrefix walking a still-
+  // composing one segment at a time (rerank_filter.cc). The user then takes
+  // on the order of a second to type again, comfortably more than the LLM
+  // prefill this hides. Deliberately above the telemetry early-return below:
+  // the two features are unrelated, and a user who has telemetry off must
+  // still get a warm scorer.
+  if (ctx) {
+    WarmRerankContext(ctx, ctx->GetCommitText());
+  }
+
+  EmitCommitTelemetry(ctx);
+}
+
+void Copilot::EmitCommitTelemetry(Context* ctx, bool selection_commit) {
   // Every decision lives in BuildCommitEvents, which is tested against
   // hand-built compositions. Keep this function a call plus a loop: a
   // condition added here would be a condition with no test.
@@ -419,17 +525,46 @@ void Copilot::OnCommit(Context* ctx) {
   // Same fallback as the filename in GetTelemetryWriter, so the `machine`
   // field and the file it lives in never disagree.
   const string& user_id = Service::instance().deployer().user_id;
+  // Only worth accumulating when there is an LLM path to report on -- same
+  // condition the constructor already uses for the AC/battery monitor.
+  // Without this, a schema with telemetry on but the LLM off would
+  // eventually flush an all-zero stats line, which is noise, not a "no LLM,
+  // no stats lines beyond what is meaningful" state.
+  telemetry::StatsAccumulator* stats =
+      (copilot_engine_ && copilot_engine_->scorer()) ? &stats_ : nullptr;
   const auto events = telemetry::BuildCommitEvents(
       ctx, rerank_traces_.get(), telemetry_options_, user_id.empty() ? string("unknown") : user_id,
       engine_->schema() ? engine_->schema()->schema_id() : string(),
-      telemetry::FormatTimestamp(std::time(nullptr)));
+      telemetry::FormatTimestamp(std::time(nullptr)), stats, selection_commit);
   for (const auto& e : events) {
     telemetry_->Write(telemetry::SerializeJsonl(e));
+  }
+
+  if (stats) {
+    const std::time_t now = std::time(nullptr);
+    if (last_stats_flush_ == 0) {
+      last_stats_flush_ = now;  // open the first window rather than firing immediately
+    } else if (now - last_stats_flush_ >= kStatsFlushIntervalSec) {
+      FlushStatsIfAny();
+      last_stats_flush_ = now;
+    }
   }
 
   if (rerank_traces_) {
     rerank_traces_->Clear();
   }
+}
+
+void Copilot::FlushStatsIfAny() {
+  if (!telemetry_ || !telemetry_options_.enable) {
+    return;
+  }
+  if (stats_.segments() == 0) {
+    return;  // nothing observed since construction or the last flush
+  }
+  telemetry_->Write(telemetry::SerializeStatsJsonl(
+      stats_.Snapshot(telemetry::FormatTimestamp(std::time(nullptr)))));
+  stats_.Reset();
 }
 
 CopilotComponent::CopilotComponent(an<CopilotEngineComponent> engine_factory)

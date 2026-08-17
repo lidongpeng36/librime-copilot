@@ -10,6 +10,7 @@
 #include "history.h"
 #include "provider.h"
 #include "rerank_trace.h"
+#include "scorer.h"
 #include "telemetry.h"
 
 namespace rime {
@@ -43,7 +44,8 @@ std::vector<::copilot::Entry> MergeProviderCandidates(std::vector<RankedCandidat
 class CopilotEngine : public Class<CopilotEngine, const Ticket&> {
  public:
   CopilotEngine(std::vector<std::shared_ptr<Provider>> providers,
-                std::shared_ptr<::copilot::History>& history, int max_iterations);
+                std::shared_ptr<::copilot::History>& history, int max_iterations,
+                std::unique_ptr<Scorer> scorer = nullptr);
   virtual ~CopilotEngine();
 
   // `context_query` is what gates the prediction (query() must stay non-empty
@@ -61,6 +63,13 @@ class CopilotEngine : public Class<CopilotEngine, const Ticket&> {
   std::shared_ptr<::copilot::History> history() const { return history_; }
   void BackSpace();
 
+  // The re-ranking filter's scorer, shared here (not owned by the filter)
+  // because the Copilot processor -- a separate component -- also needs to
+  // reach it to warm the context on commit and at composition start (Task 5).
+  // Null when rerank/llm is disabled or unconfigured: every caller must treat
+  // that as "nothing to warm or score against", not an error.
+  Scorer* scorer() const { return scorer_.get(); }
+
  private:
   int max_iterations_;  // copilot times limit
   string query_;        // cache last query
@@ -68,6 +77,7 @@ class CopilotEngine : public Class<CopilotEngine, const Ticket&> {
   std::vector<std::shared_ptr<Provider>> providers_;
   std::vector<::copilot::Entry> cands_;
   std::shared_ptr<::copilot::History> history_;
+  std::unique_ptr<Scorer> scorer_;
 };
 
 class CopilotEngineComponent : public CopilotEngine::Component {
@@ -108,6 +118,22 @@ class CopilotEngineComponent : public CopilotEngine::Component {
   // every time.
   std::set<string> telemetry_mismatches_logged_;
 };
+
+// Lets a measurement tool (replay_copilot's --wait-for-warm) reach the SAME
+// CopilotEngineComponent the schema's own processors were built from --
+// rime_copilot_initialize() (copilot_module.cc) creates exactly one and
+// shares it across CopilotComponent/CopilotTranslatorComponent/
+// CopilotRerankFilterComponent, so GetInstance(ticket) here resolves to the
+// identical, already-live CopilotEngine (and its Scorer) those components
+// are using, not a second one. That is what lets the tool force-warm the
+// re-ranking scorer and block until it reports hot, ahead of feeding the
+// keystrokes that will consult it -- replay has none of the 1-2 seconds of
+// real typing the fire-and-forget warm triggers (Copilot::WarmRerankContext)
+// depend on, so left alone every request measures the cold/db fallback path.
+// Not read by any runtime schema/processor code path; only replay_copilot.cc
+// calls the getter.
+void SetCopilotEngineComponentForTools(an<CopilotEngineComponent> component);
+an<CopilotEngineComponent> GetCopilotEngineComponentForTools();
 
 }  // namespace rime
 

@@ -59,7 +59,8 @@ Segment MakeSegment(size_t start, size_t end,
 // Needs no engine: Filter's constructor only stores ticket.engine and
 // ticket.name_space, and a null db makes Apply() a no-op.
 CopilotRerankFilter MakeFilter() {
-  return CopilotRerankFilter(Ticket{}, an<CopilotDb>(), RerankOptions{}, an<RerankTraceStore>());
+  return CopilotRerankFilter(Ticket{}, an<CopilotDb>(), RerankOptions{}, an<RerankTraceStore>(),
+                             an<CopilotEngine>());
 }
 
 }  // namespace

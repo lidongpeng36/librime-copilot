@@ -1,5 +1,6 @@
 #include "copilot_engine.h"
 
+#include <filesystem>
 #include <map>
 #include <sstream>
 
@@ -18,6 +19,7 @@
 
 #include "db_provider.h"
 #include "llm_provider.h"
+#include "llm_scorer.h"
 #include "utils.h"
 
 namespace rime {
@@ -25,8 +27,12 @@ namespace rime {
 static const ResourceType kCopilotDbResourceType = {"copilot_db", "", ""};
 
 CopilotEngine::CopilotEngine(std::vector<std::shared_ptr<Provider>> providers,
-                             std::shared_ptr<::copilot::History>& history, int max_iterations)
-    : providers_(std::move(providers)), history_(history), max_iterations_(max_iterations) {
+                             std::shared_ptr<::copilot::History>& history, int max_iterations,
+                             std::unique_ptr<Scorer> scorer)
+    : providers_(std::move(providers)),
+      history_(history),
+      max_iterations_(max_iterations),
+      scorer_(std::move(scorer)) {
   if (providers_.empty()) {
     LOG(ERROR) << "CopilotEngine: no providers";
   }
@@ -160,6 +166,13 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   DBProvider::Config db_config;
   LLMProvider::Config llm_config;
   string model_name = "";
+  // copilot/rerank/*: same three keys CopilotRerankFilterComponent::Create
+  // reads to decide whether to build a Scorer -- kept in lockstep with it so
+  // "off by default" holds here too and the filter's LOG line ("llm.model=ok"
+  // when a scorer exists) still matches reality.
+  bool rerank_enable = true;
+  bool rerank_llm_enable = false;
+  string rerank_llm_model;
   if (auto* schema = ticket.schema) {
     auto* config = schema->config();
     if (config->GetString("copilot/db", &db_name)) {
@@ -180,6 +193,9 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
       config->GetInt("copilot/llm/rank", &llm_config.rank);
       config->GetBool("copilot/llm/battery_active", &llm_config.battery_active);
     }
+    config->GetBool("copilot/rerank/enable", &rerank_enable);
+    config->GetBool("copilot/rerank/llm/enable", &rerank_llm_enable);
+    config->GetString("copilot/rerank/llm/model", &rerank_llm_model);
   }
   std::shared_ptr<::copilot::History> history = std::make_shared<::copilot::History>(100);
   if (!model_name.empty()) {
@@ -200,8 +216,38 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
       LOG(ERROR) << "failed to load copilot db: " << db_name;
     }
   }
-  if (!providers.empty()) {
-    return new CopilotEngine(providers, history, max_iterations);
+  // Lazy-loading (llm_scorer.h): the ~1 GB model is not touched until the
+  // first WarmUp(), so building this even when rerank ends up off at runtime
+  // for battery reasons costs nothing but the pointer.
+  //
+  // Resolved through the SAME ResourceResolver as copilot/llm/model above --
+  // `rerank_llm_model` is a config string like "private/Qwen3-0.6B-q4_K_M.gguf",
+  // relative to the user's Rime directory, not to whatever the process's cwd
+  // happens to be. Passing it to LlmScorer unresolved (as this did before)
+  // means llama_model_load_from_file() only succeeds if cwd happens to equal
+  // the Rime user dir -- true for no real deployment and for no offline
+  // harness run, so the LLM re-rank path silently never loads a model at all.
+  std::unique_ptr<Scorer> scorer;
+  if (rerank_enable && rerank_llm_enable && !rerank_llm_model.empty()) {
+    auto r =
+        the<ResourceResolver>(Service::instance().CreateResourceResolver(kCopilotLLMResourceType));
+    auto model_path = r->ResolvePath(rerank_llm_model);
+    if (std::filesystem::exists(model_path)) {
+      scorer = std::make_unique<LlmScorer>(model_path);
+    } else {
+      LOG(ERROR) << "[copilot] rerank llm: model not found at " << model_path
+                 << " (copilot/rerank/llm/model: " << rerank_llm_model << ")";
+    }
+  }
+  // A scorer with no db/predictor providers is a real, supported
+  // configuration -- Task 4 established that a null db must not disable the
+  // LLM re-ranking path, and this component is now the scorer's only source
+  // (moved off CopilotRerankFilter in Task 5). Returning null here whenever
+  // `providers` is empty would silently drop a successfully-built scorer
+  // along with it, turning LLM re-ranking off in exactly the configuration
+  // Task 4 protected.
+  if (!providers.empty() || scorer) {
+    return new CopilotEngine(providers, history, max_iterations, std::move(scorer));
   }
   return nullptr;
 }
@@ -302,5 +348,21 @@ an<CopilotEngine> CopilotEngineComponent::GetInstance(const Ticket& ticket) {
   }
   return nullptr;
 }
+
+namespace {
+// Function-local static: avoids static-initialization-order questions
+// between this translation unit and copilot_module.cc's rime_copilot_initialize
+// (which is the only writer, see SetCopilotEngineComponentForTools).
+an<CopilotEngineComponent>& ComponentForToolsSlot() {
+  static an<CopilotEngineComponent> instance;
+  return instance;
+}
+}  // namespace
+
+void SetCopilotEngineComponentForTools(an<CopilotEngineComponent> component) {
+  ComponentForToolsSlot() = std::move(component);
+}
+
+an<CopilotEngineComponent> GetCopilotEngineComponentForTools() { return ComponentForToolsSlot(); }
 
 }  // namespace rime

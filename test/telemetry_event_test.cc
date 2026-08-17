@@ -79,3 +79,65 @@ TEST(TelemetryEvent, ShouldRecordMatchesTheScope) {
   EXPECT_TRUE(ShouldRecord(3, true));    // promotion rejected
   EXPECT_TRUE(ShouldRecord(3, false));   // translator mis-ranking
 }
+
+TEST(SerializeJsonl, IncludesTheLlmRecordWhenPresent) {
+  Event e;
+  e.ts = "2026-08-17T10:00:00+08:00";
+  e.sel = "故意";
+  LlmRecord r;
+  r.text = "故意";
+  r.incumbent = "顾忌";
+  r.from = 2;
+  r.margin = 3.4f;
+  r.n_scored = 4;
+  r.us = 4100;
+  r.skip = "none";
+  e.llm = r;
+  const std::string line = SerializeJsonl(e);
+  EXPECT_NE(line.find("\"llm\""), std::string::npos);
+  EXPECT_NE(line.find("\"incumbent\":\"顾忌\""), std::string::npos);
+  EXPECT_NE(line.find("\"margin\":3.4"), std::string::npos);
+}
+
+TEST(SerializeJsonl, OmitsTheLlmRecordWhenAbsent) {
+  Event e;
+  e.ts = "t";
+  EXPECT_EQ(SerializeJsonl(e).find("\"llm\""), std::string::npos);
+}
+
+TEST(SerializeJsonl, SchemaVersionIsTwo) {
+  Event e;
+  e.ts = "t";
+  EXPECT_NE(SerializeJsonl(e).find("\"v\":2"), std::string::npos);
+}
+
+// The per-event stream only records hard cases (ShouldRecord), which is right
+// for judging quality and wrong for measuring warm-hit rate -- its denominator
+// is ordinary typing, which is never recorded. Hence a second line type.
+TEST(SerializeStatsJsonl, CarriesCountersAndItsOwnType) {
+  StatsLine s;
+  s.ts = "2026-08-17T10:00:00+08:00";
+  s.segments = 8421;
+  s.llm_acted = 5310;
+  s.skip_counts["cold"] = 519;
+  s.us_p50 = 4.1;
+  s.us_p95 = 11.8;
+  const std::string line = SerializeStatsJsonl(s);
+  EXPECT_NE(line.find("\"type\":\"stats\""), std::string::npos);
+  EXPECT_NE(line.find("\"llm_acted\":5310"), std::string::npos);
+  EXPECT_NE(line.find("\"cold\":519"), std::string::npos);
+  EXPECT_NE(line.find("\"v\":2"), std::string::npos);
+}
+
+// No stored `warm_hit`: under the fallback chain kCold and kNone are mutually
+// exclusive (rerank_filter.cc), so a segment is never scored while cold, and
+// a warm-hit counter would just be a second name for `llm_acted`. Warm-hit
+// rate is `llm_acted / (llm_acted + skip_counts["cold"])`, left to the
+// analyser rather than duplicated here.
+TEST(SerializeStatsJsonl, HasNoWarmHitField) {
+  StatsLine s;
+  s.ts = "t";
+  s.llm_acted = 1;
+  s.skip_counts["cold"] = 1;
+  EXPECT_EQ(SerializeStatsJsonl(s).find("warm_hit"), std::string::npos);
+}

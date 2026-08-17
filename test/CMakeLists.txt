@@ -11,15 +11,19 @@ set(copilot_test_src
   ime_bridge_socket_test.cc
   ime_bridge_state_test.cc
   prediction_context_test.cc
+  replay_align_test.cc
+  rerank_llm_test.cc
   rerank_test.cc
   rerank_trace_test.cc
   spacing_matrix_test.cc
   surrounding_source_test.cc
   telemetry_commit_test.cc
   telemetry_event_test.cc
+  telemetry_stats_test.cc
   telemetry_test.cc
   tmux_source_test.cc
-  tmux_source_util_test.cc)
+  tmux_source_util_test.cc
+  warm_cache_test.cc)
 
 # GTest include dirs are added globally by the librime root CMakeLists.
 #

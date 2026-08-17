@@ -194,7 +194,8 @@ inline bool NeedAddSpace(Context* ctx, const KeyEvent& key_event) {
 
 }  // namespace
 
-AutoSpacer::AutoSpacer(const Ticket& ticket) : CopilotPlugin<AutoSpacer>(ticket) {
+AutoSpacer::AutoSpacer(const Ticket& ticket, CommitCallback on_commit)
+    : CopilotPlugin<AutoSpacer>(ticket), on_commit_(std::move(on_commit)) {
   if (auto* config = engine_->schema()->config()) {
     config->GetBool("copilot/auto_spacer/enable_right_space", &enable_right_space_);
   }
@@ -378,6 +379,12 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     auto decorated_text = DecorateCommitText(input, before, after, true, enable_right_space_);
     engine_->CommitText(decorated_text);
     if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
+    // This bypasses Context::Commit() -- commit_notifier_ never fires for it
+    // -- so Copilot::OnCommit can never warm the scorer for it. This is the
+    // substitute; see the constructor comment (auto_spacer.h). `false`: this
+    // is a bail-out -- the user committed raw ASCII input, discarding
+    // whatever candidate the composition still shows as highlighted.
+    if (on_commit_) on_commit_(ctx, decorated_text, false);
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -396,6 +403,13 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
     engine_->CommitText(decorated_text);
     if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
+    // Same bypass as Enter above -- Space is the dominant commit key in this
+    // configuration, so this is the one that matters most. `true`: this
+    // commits the actual selected candidate(s) (ComputeSpaceCommitText), not
+    // a bail-out -- when there is no selected candidate at all it falls back
+    // to raw input, but BuildCommitEvents already skips a segment with no
+    // GetSelectedCandidate(), so that case cannot be misreported either way.
+    if (on_commit_) on_commit_(ctx, decorated_text, true);
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -418,6 +432,10 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     auto decorated_text = DecorateCommitText(raw, before, after, true, enable_right_space_);
     engine_->CommitText(decorated_text);
     if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
+    // `false`: a bail-out, same reasoning as Enter above -- num was out of
+    // range or the candidate at that slot did not exist, so whatever the
+    // composition still shows highlighted was never committed.
+    if (on_commit_) on_commit_(ctx, decorated_text, false);
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -454,6 +472,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
   engine_->CommitText(decorated_text);
   if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
+  // `true`: the number key just selected `cand` above, so this genuinely
+  // commits the candidate the user picked -- not a bail-out.
+  if (on_commit_) on_commit_(ctx, decorated_text, true);
   ctx->Clear();
   client_state.before.clear();
   client_state.after.clear();

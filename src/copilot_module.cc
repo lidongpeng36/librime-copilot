@@ -102,6 +102,10 @@ static void rime_copilot_initialize() {
 
   Registry& r = Registry::instance();
   an<CopilotEngineComponent> engine_factory = New<CopilotEngineComponent>();
+  // Measurement-only: lets replay_copilot's --wait-for-warm reach this same
+  // instance later (see SetCopilotEngineComponentForTools in copilot_engine.h).
+  // No runtime schema/processor code reads this.
+  SetCopilotEngineComponentForTools(engine_factory);
   r.Register("copilot", new CopilotComponent(engine_factory));
   r.Register("copilot_translator", new CopilotTranslatorComponent(engine_factory));
 
@@ -118,6 +122,13 @@ static void rime_copilot_initialize() {
   r.Register("copilot_rerank_filter", new CopilotRerankFilterComponent(engine_factory));
 }
 
-static void rime_copilot_finalize() {}
+static void rime_copilot_finalize() {
+  // Drop the measurement-only handle set in rime_copilot_initialize(): left
+  // alone, this process-global an<> keeps CopilotEngineComponent (and its
+  // DbPool) alive past rime->finalize(), for every process that links this
+  // module -- not just replay_copilot, which is the only thing that ever
+  // reads it.
+  SetCopilotEngineComponentForTools(nullptr);
+}
 
 RIME_REGISTER_MODULE(copilot)

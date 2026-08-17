@@ -118,7 +118,7 @@ copilot:
     enable: true
     max_context_chars: 8
     window: 32
-    max_rank: 50
+    max_rank: 10
 
   # Disable specific sub-plugins (optional)
   disabled_plugins:
@@ -199,7 +199,7 @@ patch:
 | `enable` | `true` | kill switch; the db is not opened when false |
 | `max_context_chars` | `8` | longest context key: Han characters before the caret |
 | `window` | `32` | only the first N candidates are considered |
-| `max_rank` | `50` | a continuation ranked below this among its key's continuations never promotes |
+| `max_rank` | `10` | a continuation ranked below this among its key's continuations never promotes. Measured over 8324 segments of real typing: at 50 re-ranking is net **negative** on colloquial text (24 gained, 30 lost) while positive on technical text; at 10 both are positive. Function words are the reason — 吧/的/和 follow almost every verb, so they sit in every key's continuation list at high rank, and a wide threshold lets them take first place. See `docs/superpowers/specs/2026-08-16-llm-rerank-poc-results.md`. |
 
 How it decides:
 
@@ -231,6 +231,68 @@ overwrites on a name collision; look for `replacing previously registered
 component: grammar` in Rime's WARNING log). Owning the filter avoids that
 fight, and lets the context come from the real text before the caret rather
 than librime's "last commit only".
+
+### LLM Re-ranking
+
+Runs inside the same `copilot_rerank_filter` above, as its primary scoring
+source rather than a second filter: when a model is configured, the filter
+scores candidates by summed log-probability instead of looking up db
+continuations, and the db loop above runs only as the fallback for when the
+LLM path can't (disabled, on battery, model missing, or the warm cache is
+cold — see `skip` in Telemetry below). The two never both act on one
+segment.
+
+**Off by default, and why:** the model sits resident at roughly **1 GB** and
+runs continuous CPU work while the input method is open, not just per
+keystroke. Turning it on is a deliberate trade a user makes for their own
+machine, not a default this plugin should set for everyone.
+
+To turn it on (`enable` defaults to `false` in code — this block is what you
+write to opt in, not what you get):
+
+```yaml
+copilot:
+  rerank:
+    llm:
+      enable: true   # the default is false
+      model: private/Qwen3-0.6B-q4_K_M.gguf
+      battery_active: false
+      top_n: 4
+      margin: 2.0
+      length_exponent: 0.7
+```
+
+Fetch the exact build the numbers below were measured against with:
+
+```sh
+tools/rime-copilot fetch-model
+```
+
+It downloads into `<rime_dir>/private/`, checks the download's size against a
+sanity floor (so a truncated connection or an HTML error page can't silently
+become "the model"), and prints the config block to paste. `--url`/`--name`
+point it at a different quant or destination filename; `--force` re-downloads
+over an existing file.
+
+| key (`copilot/rerank/llm/…`) | default | meaning |
+|-----|---------|---------|
+| `enable` | `false` | kill switch; off by default (see above) |
+| `model` | *(empty)* | path to a `.gguf`, relative to the Rime user directory — `fetch-model` prints the right value. Nothing loads, and the LLM path silently falls back to the db, until this is set to an existing file. |
+| `battery_active` | `false` | run on battery too. Default `false` because the model's CPU cost is exactly the kind of thing a laptop should shed on battery; mirrors `copilot/llm/battery_active`'s existing convention for the prediction-popup LLM path. |
+| `top_n` | `4` | how many candidates are scored. Measured over 8324 segments: **4 beats both fewer and more, on speed *and* accuracy** — 58.4% hit / 8.1% harmful false-promotion / 14.4 ms at top_n=4, vs 56.9% / 13.1% / 114.9 ms at top_n=32. A longer list gives the model more ways to be wrong; 72.6% of correct answers sit at rank 2-3 anyway. See `docs/superpowers/specs/2026-08-16-llm-rerank-poc-results.md`. |
+| `margin` | `2.0` | a challenger must beat the incumbent's score by at least this much to promote. Sweeping this threshold (same doc): at 2.0, harmful false promotion drops to roughly a quarter of the no-threshold rate (8.1%→3.2% technical, 12.7%→6.5% colloquial) for a net-gain cost of under a point. Above 5 the curve collapses — the threshold starts rejecting correct promotions faster than wrong ones. |
+| `length_exponent` | `0.7` | candidates are scored by `logprob / n_tokens^length_exponent`, not raw summed log-probability. This one setting dominates every other tuning knob measured: 56.9% hit / 13.1% harmful FP at 0.7 vs 43.3% / 15.4% for the raw sum and 52.4% / 12.1% for dividing by the mean. |
+
+**Latency: measured once, small sample, telemetry will settle it.** The
+design targets keeping this off the keystroke path — warm the context ahead
+of typing, and pay only the ~4-candidate scoring cost per keystroke. The
+integration measurement (`docs/superpowers/specs/2026-08-16-llm-rerank-poc-results.md`,
+n=20 scored segments) came in at **p50 ≈ 29 ms, p90 ≈ 56-70 ms** — roughly
+2x the PoC's isolated 14.4 ms and over budget on this hardware. That is one
+run at a small sample size, not a verdict either way: Telemetry below writes
+`us_p50`/`us_p95` into the stats line specifically so this settles from real
+use instead of staying an offline guess. Do not read either the PoC's 14 ms
+or the integration's 29-70 ms as the number — check your own telemetry.
 
 ### Telemetry
 
@@ -264,6 +326,21 @@ candidate, the first `top_n` candidates, and — when re-ranking fired — which
 context key it used, what it promoted, from which position, and at what rank and
 match level. Field-by-field meaning is in
 `docs/superpowers/specs/2026-08-14-prediction-telemetry-design.md`.
+
+When LLM re-ranking is on, an event also carries an `llm` object whenever the
+model was actually consulted for that segment: what it promoted (if
+anything), the incumbent it was compared against, the margin between them,
+how many candidates were scored, and how long scoring took. Separately, once
+per flush interval, a `{"type":"stats", ...}` line aggregates every segment
+`StatsAccumulator` saw — not just the hard cases the per-event stream keeps —
+so rates like warm-hit can be computed against the true denominator instead
+of the hard-cases-only one. Its `skip_counts` names, for every segment the
+LLM path didn't act on, which of `disabled`/`battery`/`nomodel`/`noctx`/
+`cold`/`nohan`/`margin` stopped it. There is no stored `warm_hit` counter —
+under the fallback chain as implemented, a segment is never scored while the
+warm cache is cold, so warm-hit rate is derived as
+`llm_acted / (llm_acted + skip_counts["cold"])`, which `analyze_telemetry.py`
+computes for you.
 
 **Privacy.** The `ctx` field is Han characters only, by construction:
 `TrailingCjkRun` stops at the first non-Han character, so an ASCII secret on
@@ -302,6 +379,22 @@ The report is organised by the claim each section tests, from the design spec.
 A rejection rate that is flat across a section's buckets refutes that section's
 claim — which is the point. Python 3 standard library only; no dependencies.
 
+Two more sections read the v2 fields above (both degrade gracefully on
+older files that have neither):
+
+- **LLM decision quality** — acceptance rate bucketed by margin, the live
+  counterpart of the offline sweep that set `margin: 2.0` above. Every
+  recorded promotion already cleared whatever margin the writing machine was
+  configured with, so this says what *raising* the threshold further would
+  cost or buy, not what a lower one would have done.
+- **Skip-reason distribution** — from the stats lines: what share of
+  segments the LLM path acted on, the derived warm-hit rate, and a
+  breakdown of every skip reason. If `cold` dominates, the fix is the
+  warming trigger, not the model.
+
+A v1 line — no `llm`, no `type` — loads exactly as it always has; the two
+new sections just report "no data yet" against a file that has none.
+
 **Filters after `copilot_rerank_filter` invalidate events.** What re-ranking
 promoted is captured inside the filter; what the user selected is read at
 commit, from the candidate list as displayed. Any filter listed after
@@ -323,6 +416,12 @@ excluded from every claim table and counted in the OVERALL section as
 `EXCLUDED, head altered downstream`, with a warning when they are more than 10%
 of the data. Check that number before trusting a rejection rate — if it is
 large, the tables rest on a small remainder of your typing.
+
+The LLM decision-quality section applies the identical check against
+`llm.text` instead of `rr.text`, tracked separately since the two paths never
+both act on one segment — a `top[0] != llm.text` event is excluded from the
+LLM table without affecting `EXCLUDED, head altered downstream` above, which
+stays scoped to the db path exactly as it always was.
 
 Note that the filter order is a deliberate choice, not a mistake: re-ranking is
 placed ahead of pinning so that pinned candidates win. To collect a clean

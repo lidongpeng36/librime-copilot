@@ -12,6 +12,7 @@
 #include <rime/translation.h>
 
 #include "telemetry_commit.h"
+#include "telemetry_stats.h"
 
 using namespace rime;
 using namespace rime::telemetry;
@@ -61,6 +62,28 @@ RerankTrace TraceFor(const std::string& input, size_t start, size_t end,
   t.record.from = from;
   t.record.rank = 7;
   t.record.level = 3;
+  return t;
+}
+
+// A trace whose LLM path engaged (llm_skip == kNone) and, when `promoted` is
+// non-empty, promoted that candidate from `from`.
+RerankTrace TraceForLlm(const std::string& input, size_t start, size_t end,
+                        const std::string& promoted, int from, const std::string& skip) {
+  RerankTrace t;
+  t.valid = true;
+  t.input = input;
+  t.start = start;
+  t.end = end;
+  t.ctx = "我们";
+  t.src = "tmux";
+  t.llm_skip = llm_rerank::SkipReason::kNone;
+  t.llm.text = promoted;
+  t.llm.incumbent = "顾忌";
+  t.llm.from = from;
+  t.llm.margin = 3.4f;
+  t.llm.n_scored = 4;
+  t.llm.us = 4100;
+  t.llm.skip = skip;
   return t;
 }
 
@@ -284,7 +307,134 @@ TEST(BuildCommitEvents, RefusesATraceRecordedForTheNarrowedSpan) {
   EXPECT_TRUE(events[0].ctx.empty());
 }
 
+// The gap Task 4 left and Task 7 closes: an LLM-only promotion, with the db
+// path silent, must still count as "promoted" for ShouldRecord's scope --
+// otherwise a sel_idx==0 segment where only the LLM acted is ordinary typing
+// as far as the recorder is concerned, and Event::llm is never populated in
+// practice even though the type exists.
+TEST(BuildCommitEvents, RecordsAnLlmOnlyPromotion) {
+  Context ctx;
+  ctx.set_input("ni");
+  ctx.composition().Reset("ni");
+  ctx.composition().push_back(MakeSegment(0, 2, {"你", "尼"}, 0));
+  auto store = StoreOf({TraceForLlm("ni", 0, 2, "你", 3, "none")});
+  auto events = Build(&ctx, &store);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_FALSE(events[0].rr.has_value());  // the db path never ran
+  ASSERT_TRUE(events[0].llm.has_value());
+  EXPECT_EQ(events[0].llm->text, "你");
+  EXPECT_EQ(events[0].llm->incumbent, "顾忌");
+  EXPECT_EQ(events[0].llm->skip, "none");
+}
+
+// Engaged but declined (kNoHan/kMargin) is still worth attaching to a
+// non-first selection -- it is what tells "the LLM ran and disagreed with the
+// user" apart from "the LLM never got a chance here". `llm` carries the
+// decline; `text` inside it stays empty, exactly like `record.text` does for
+// the db path's own "ran but promoted nothing".
+TEST(BuildCommitEvents, RecordsAnLlmDeclineOnANonFirstSelection) {
+  Context ctx;
+  ctx.set_input("ni");
+  ctx.composition().Reset("ni");
+  ctx.composition().push_back(MakeSegment(0, 2, {"你", "尼"}, 1));
+  auto store = StoreOf({TraceForLlm("ni", 0, 2, "", 0, "margin")});
+  auto events = Build(&ctx, &store);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_FALSE(events[0].rr.has_value());
+  ASSERT_TRUE(events[0].llm.has_value());
+  EXPECT_TRUE(events[0].llm->text.empty());
+  EXPECT_EQ(events[0].llm->skip, "margin");
+}
+
+// llm_skip != kNone means the LLM path was never consulted for this segment
+// (disabled/battery/nomodel/noctx/cold) -- trace.llm was never filled in, and
+// must not be read as though it had been. This is also what keeps a fully
+// disabled LLM feature emitting no `llm` block at all: every trace's llm_skip
+// stays at its non-kNone default in that case.
+TEST(BuildCommitEvents, OmitsLlmWhenTheLlmPathNeverEngaged) {
+  Context ctx;
+  ctx.set_input("ni");
+  ctx.composition().Reset("ni");
+  ctx.composition().push_back(MakeSegment(0, 2, {"你", "尼"}, 1));
+  RerankTrace t = TraceFor("ni", 0, 2, "你", 3);  // db promoted; llm_skip default
+  ASSERT_NE(t.llm_skip, llm_rerank::SkipReason::kNone);
+  auto store = StoreOf({t});
+  auto events = Build(&ctx, &store);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_TRUE(events[0].rr.has_value());
+  EXPECT_FALSE(events[0].llm.has_value());
+}
+
 TEST(BuildCommitEvents, ToleratesANullContext) { EXPECT_TRUE(Build(nullptr, nullptr).empty()); }
+
+// F1 evidence: AutoSpacer's Space/Enter/number-key commits never call
+// ctx->Commit() (engine_->CommitText() + ctx->Clear() instead -- auto_spacer.cc),
+// so they never reach Context::commit_notifier_ and, before this fix, never
+// reached Copilot::OnCommit either. Copilot::EmitCommitTelemetry
+// (copilot.h/.cc) is now called directly from AutoSpacer's on_commit_
+// callback for exactly this reason. This test drives the same call --
+// BuildCommitEvents plus StatsAccumulator::Observe, exactly what
+// EmitCommitTelemetry does -- on a Context that never calls Commit(), the
+// same shape the callback sees: a composition with a selected candidate,
+// reached without ever going through Context::Commit(). It shows a Space
+// commit producing both an event line and a stats counter.
+TEST(BuildCommitEvents, ASpaceCommitProducesAnEventAndCountsInStats) {
+  Context ctx;
+  ctx.set_input("ni");
+  ctx.composition().Reset("ni");
+  // A non-first selection, exactly like AutoSpacer's ComputeSpaceCommitText
+  // reads via composition().back().GetSelectedCandidate() before it commits
+  // the decorated text and calls on_commit_ -- never ctx.Commit().
+  ctx.composition().push_back(MakeSegment(0, 2, {"你", "尼"}, 1));
+  auto store = StoreOf({TraceForLlm("ni", 0, 2, "你", 3, "none")});
+  // No call to ctx.Commit() anywhere in this test -- see the block comment
+  // above for why that is the point.
+
+  StatsAccumulator stats;
+  Options o;
+  auto events = BuildCommitEvents(&ctx, &store, o, "M1", "flypy", "t", &stats);
+
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].sel, "尼");
+  ASSERT_TRUE(events[0].llm.has_value());
+  EXPECT_EQ(events[0].llm->text, "你");
+
+  EXPECT_EQ(stats.segments(), 1);
+  auto snapshot = stats.Snapshot("t");
+  EXPECT_EQ(snapshot.llm_acted, 1);           // llm_skip == kNone: counted as engaged
+  EXPECT_TRUE(snapshot.skip_counts.empty());  // not skipped, not dropped
+}
+
+// The defect this test guards: an Enter/number-fallback bail-out
+// (AutoSpacer::on_commit_ called with selection_commit=false) commits raw
+// ASCII input and discards every candidate, but the composition still shows
+// whatever was highlighted beforehand -- exactly the same shape as the Space
+// commit above. Before the fix, BuildCommitEvents could not tell the two
+// apart and wrote an event asserting `sel = "你"`, recording the discarded
+// promotion as accepted. selection_commit=false must suppress the event
+// entirely while still letting `stats` observe that the LLM engaged --
+// see this function's header comment (telemetry_commit.h).
+TEST(BuildCommitEvents, ABailoutProducesNoEventButStillCountsInStats) {
+  Context ctx;
+  ctx.set_input("ni");
+  ctx.composition().Reset("ni");
+  // Identical composition to ASpaceCommitProducesAnEventAndCountsInStats --
+  // only `selection_commit` differs, isolating exactly what that flag changes.
+  ctx.composition().push_back(MakeSegment(0, 2, {"你", "尼"}, 1));
+  auto store = StoreOf({TraceForLlm("ni", 0, 2, "你", 3, "none")});
+
+  StatsAccumulator stats;
+  Options o;
+  auto events =
+      BuildCommitEvents(&ctx, &store, o, "M1", "flypy", "t", &stats, /*selection_commit=*/false);
+
+  EXPECT_TRUE(events.empty());  // no event asserting sel="尼" as an acceptance
+
+  EXPECT_EQ(stats.segments(), 1);  // still observed: the scorer ran regardless
+  auto snapshot = stats.Snapshot("t");
+  EXPECT_EQ(snapshot.llm_acted, 1);
+  EXPECT_TRUE(snapshot.skip_counts.empty());
+}
 
 // The premise Copilot::OnContextUpdate's trace clearing rests on: an abandoned
 // composition reaches the update notifier, with the composition already empty.

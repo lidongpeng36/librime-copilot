@@ -23,6 +23,21 @@ PREDICT_DB_NAME = "private.predict.db"
 CONFIG_NAME = "dict.json"
 SHRINK_FLOOR = 0.9
 
+# The exact build the PoC and the integration measured (see
+# docs/superpowers/specs/2026-08-16-llm-rerank-poc-results.md and
+# 2026-08-17-llm-rerank-design.md). Changing the default here silently
+# invalidates every measured number in those docs for anyone who fetches
+# fresh -- keep it pinned to what was actually measured, not "the newest
+# quant".
+MODEL_URL = ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/"
+            "Qwen3-0.6B-Q4_K_M.gguf")
+MODEL_NAME = "Qwen3-0.6B-q4_K_M.gguf"
+# The real file is ~397 MB (unsloth/Qwen3-0.6B-GGUF, checked 2026-08-17). A
+# floor well under that but far above an HTML error page or a truncated
+# connection catches both failure modes without pinning an exact byte count
+# a re-quantization upstream would break.
+MIN_MODEL_SIZE = 300_000_000
+
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -253,6 +268,76 @@ def cmd_fetch(args) -> int:
             return 1
     staged.replace(target)
     print(f"{written} entries -> {target}")
+    return 0
+
+
+def _fetch_model_write(url: str, dest: Path) -> int:
+    """Streams `url` to `dest`, returns bytes written.
+
+    The only function in this module that touches the network -- isolated so
+    tests can replace it wholesale (mirrors how the Fetch tests already patch
+    around `scel.download_all` rather than mocking `requests` internals).
+    """
+    import requests  # lazy: this module must still import on a stock interpreter
+
+    with requests.get(url, stream=True, timeout=30) as resp:
+        resp.raise_for_status()
+        written = 0
+        with open(dest, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                fh.write(chunk)
+                written += len(chunk)
+        return written
+
+
+def _print_fetch_model_config(target: Path) -> None:
+    # `model` is relative to the Rime user dir, not the process cwd -- see
+    # copilot_engine.cc's ResourceResolver comment. `private/<name>` is
+    # therefore what belongs in the schema regardless of where --rime-dir
+    # points on this machine.
+    print("Paste into a schema patch (ahead of `copilot/rerank/llm/enable: true`):")
+    print("  copilot:")
+    print("    rerank:")
+    print("      llm:")
+    print("        enable: true")
+    print(f"        model: private/{target.name}")
+
+
+def cmd_fetch_model(args) -> int:
+    rime_dir = args.rime_dir
+    private = _private(rime_dir)
+    target = private / (args.name or MODEL_NAME)
+    url = args.url or MODEL_URL
+
+    if target.is_file() and not args.force:
+        print(f"already present, skipping: {target} ({target.stat().st_size} bytes)")
+        _print_fetch_model_config(target)
+        return 0
+
+    if args.dry_run:
+        print(f"would download {url} -> {target}")
+        return 0
+
+    private.mkdir(parents=True, exist_ok=True)
+    # Never in place: a reader (llama.cpp mmaps the model at load) must never
+    # see a half-written file, the same reasoning as `build`'s staged rename.
+    partial = target.with_name(target.name + ".part")
+    try:
+        written = _fetch_model_write(url, partial)
+    except Exception as exc:  # noqa: BLE001 -- report, don't traceback
+        partial.unlink(missing_ok=True)
+        print(f"fetch-model failed: {exc}")
+        return 1
+
+    if written < MIN_MODEL_SIZE:
+        partial.unlink(missing_ok=True)
+        print(f"refusing to install: only {written} bytes, expected at least "
+             f"{MIN_MODEL_SIZE} -- probably an error page, not a model")
+        return 1
+
+    partial.replace(target)
+    print(f"{written} bytes -> {target}")
+    _print_fetch_model_config(target)
     return 0
 
 
@@ -498,6 +583,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("fetch").set_defaults(func=cmd_fetch)
 
+    fetch_model = sub.add_parser("fetch-model",
+                                 help="download the gguf used by copilot/rerank/llm")
+    fetch_model.add_argument("--url", help=f"override the download URL (default: {MODEL_URL})")
+    fetch_model.add_argument("--name",
+                             help=f"filename under private/ (default: {MODEL_NAME})")
+    fetch_model.add_argument("--force", action="store_true",
+                             help="re-download even if the file already exists")
+    fetch_model.set_defaults(func=cmd_fetch_model)
+
     for name, func in (("build", cmd_build), ("update", cmd_update)):
         command = sub.add_parser(name)
         command.add_argument("--builder", help=f"path to {paths.BUILDER_NAME}")
@@ -534,7 +628,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     args = build_parser().parse_args(argv)
     for attribute, default in (("builder", None), ("max_per_key", -1),
                                ("force_build", False), ("force", False),
-                               ("squirrel", None), ("config", None), ("output", None)):
+                               ("squirrel", None), ("config", None), ("output", None),
+                               ("url", None), ("name", None)):
         if not hasattr(args, attribute):
             setattr(args, attribute, default)
     return args.func(args)

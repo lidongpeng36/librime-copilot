@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -36,7 +37,30 @@ std::string ComputeSpaceCommitText(Context* ctx, const std::string& before,
 
 class AutoSpacer : public CopilotPlugin<AutoSpacer> {
  public:
-  explicit AutoSpacer(const Ticket& ticket);
+  // `on_commit` fires for every commit AutoSpacer itself performs (Space,
+  // Enter, and the two number-key paths in ProcessWithSurroundingContext) --
+  // the commits that bypass Context::Commit()/commit_notifier() entirely
+  // (engine_->CommitText() + ctx->Clear(), never ctx->Commit()). Those are
+  // the only commits available in the surrounding-text configuration, which
+  // is also the only configuration the re-ranking filter runs in, so
+  // Copilot::OnCommit (hung off commit_notifier()) never sees them -- this
+  // is how Copilot reaches them instead, to warm the scorer for the next
+  // input. Called with the same Context and the exact decorated text just
+  // handed to engine_->CommitText(), before ctx->Clear() -- see each call
+  // site below. Default null: the standalone `auto_spacer` processor
+  // registration (copilot_module.cc) has no CopilotEngine to warm anyway.
+  //
+  // The bool is `selection_commit`: true when the committed text reflects a
+  // candidate the user actually picked (Space; the number-key select at the
+  // bottom of ProcessWithSurroundingContext), false on the two bail-out paths
+  // (Enter's raw commit; the number-key fallback's raw commit) where the user
+  // discarded every candidate on offer and committed raw ASCII instead. On a
+  // bail-out, `ctx`'s composition can still show a highlighted candidate --
+  // it was never committed, so a caller that treats it as accepted (e.g.
+  // telemetry) would be wrong. See Copilot::EmitCommitTelemetry (copilot.h)
+  // for the one caller that reads this.
+  using CommitCallback = std::function<void(Context*, const std::string&, bool)>;
+  explicit AutoSpacer(const Ticket& ticket, CommitCallback on_commit = nullptr);
 
   ProcessResult Process(const KeyEvent& key_event);
 
@@ -61,6 +85,7 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
   };
   std::unordered_map<std::string, ClientState> client_states_;
   bool enable_right_space_ = true;
+  CommitCallback on_commit_;
 };
 
 }  // namespace rime

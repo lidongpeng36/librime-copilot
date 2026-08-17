@@ -25,10 +25,14 @@
 
 #include "copilot_db.h"
 #include "provider.h"
+#include "rerank_llm.h"
 #include "rerank_trace.h"
+#include "scorer.h"
+#include "utils.h"  // copilot::PowerChangeToken
 
 namespace rime {
 
+class CopilotEngine;
 class CopilotEngineComponent;
 struct Segment;
 
@@ -55,12 +59,20 @@ struct RerankOptions {
   // promotes. Rank rather than weight share: merged dictionaries live on
   // different scales, and a key can have thousands of continuations.
   int max_rank = 50;
+  // The LLM scoring path -- primary source when it can run; see rerank_llm.h.
+  LlmRerankOptions llm;
 };
 
 class CopilotRerankFilter : public Filter {
  public:
+  // `copilot_engine` supplies the Scorer (Task 5: it is owned by CopilotEngine
+  // now, not by this filter, so the Copilot processor's warm-cache triggers
+  // can reach the same instance). May be null -- e.g. rerank/enable is false,
+  // so the caller never asked CopilotEngineComponent for an instance -- in
+  // which case scoring is simply unavailable, same as before.
   CopilotRerankFilter(const Ticket& ticket, const an<CopilotDb>& db, const RerankOptions& options,
-                      an<RerankTraceStore> traces);
+                      an<RerankTraceStore> traces, an<CopilotEngine> copilot_engine);
+  ~CopilotRerankFilter() override;
 
   an<Translation> Apply(an<Translation> translation, CandidateList* candidates) override;
 
@@ -87,6 +99,20 @@ class CopilotRerankFilter : public Filter {
   an<CopilotDb> db_;
   RerankOptions options_;
   an<RerankTraceStore> traces_;
+  // Keeps the Scorer (below) alive: CopilotEngine owns it, and this filter
+  // may be the only thing holding a strong reference to that engine instance
+  // (a schema can run the filter without the `copilot` processor at all) --
+  // see CopilotEngine::scorer() and rerank_filter.cc's constructor.
+  an<CopilotEngine> copilot_engine_;
+  Scorer* scorer_ = nullptr;  // borrowed from copilot_engine_, never owned
+
+  // Cached rather than queried on every keystroke -- same reason and same
+  // pattern as LLMProvider (llm_provider.cc:63-78): kept current by a
+  // process-wide power monitor callback instead of a syscall per Apply().
+  // Assumed true (AC) until told otherwise, same fallback IsACPowerConnected()
+  // itself uses when the platform cannot tell.
+  bool is_on_ac_ = true;
+  ::copilot::PowerChangeToken power_token_ = 0;
 
   // Set by AppliesToSegment, consumed by Apply. Consumed rather than merely
   // read: an Apply() that somehow arrived without a preceding
@@ -97,6 +123,12 @@ class CopilotRerankFilter : public Filter {
   // since that segment's Apply() never runs and would otherwise leave a stale
   // span for the next segment's Apply() to pick up.
   std::optional<TraceSpan> pending_trace_span_;
+
+  // The segment AppliesToSegment saw, alongside pending_trace_span_ and reset
+  // on exactly the same paths (including to nullptr when AppliesToSegment
+  // declines a segment) — Apply() needs it to find where in the composition
+  // "before this segment" ends, via ConfirmedPrefix (rerank.h).
+  const Segment* pending_segment_ = nullptr;
 
   std::string cached_context_;
   an<RerankContinuations> cached_continuations_;
