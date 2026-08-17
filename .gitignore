@@ -5,3 +5,6 @@ __pycache__
 
 # Subagent-driven-development scratch (ledger, briefs, review packages)
 .superpowers/
+
+# Harness venv (pypinyin for the corpus/eval tooling)
+.venv/
