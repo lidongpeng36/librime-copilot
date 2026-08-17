@@ -236,6 +236,8 @@ RUNTIME_REQUIREMENTS = (
     Requirement("pypinyin", "pypinyin",
                 "`build` and `update` on any dictionary without a pinyin column "
                 "(e.g. tencent.dict.yaml)"),
+    Requirement("jieba", "jieba",
+                "`clean` (telling a real word from a Sogou sentence fragment)"),
     Requirement("requests", "requests", "`fetch` (downloading .scel cell dictionaries)"),
     Requirement("bs4", "beautifulsoup4", "`fetch` (finding the .scel download links)"),
 )

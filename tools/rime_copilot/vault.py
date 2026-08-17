@@ -22,7 +22,21 @@ from .paths import sha256_file  # re-exported: this module's callers use it too
 
 VAULTED_FILES = (
     "private/custom.dict.yaml",
+    # The pristine Sogou export, kept because `clean` overwrites the live file
+    # and nothing can regenerate this one.
+    "private/custom.dict.yaml.raw",
     "private/dict.json",
+    # Describes the shared *result* of cleaning -- whether the lexicon has
+    # been cleaned and the sha256 of the pristine `.raw` it was cleaned from
+    # (raw_sha256) -- so a second machine can tell what it is holding instead
+    # of guessing from a `restore` that has not yet pulled `.raw` down. This is
+    # NOT the same kind of stamp as `.copilot_build_stamp.json`
+    # (freshness.STAMP_NAME), which stays machine-local on purpose: that one
+    # describes a locally built database, derived fresh on every machine. Do
+    # not "tidy" this one away into the machine-local category -- see
+    # cmd_clean's C1 guard, which depends on every machine seeing the same
+    # stamp.
+    "private/.copilot_clean_stamp.json",
     "private.dict.yaml",
     "default.custom.yaml",
     "double_pinyin_flypy.custom.yaml",

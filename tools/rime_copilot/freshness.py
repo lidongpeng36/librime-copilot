@@ -21,7 +21,7 @@ from .paths import sha256_file
 
 # Bump when the build algorithm changes in a way that alters the output for
 # unchanged inputs. No input hash can catch that.
-RECIPE_VERSION = 1
+RECIPE_VERSION = 2
 
 STAMP_NAME = ".copilot_build_stamp.json"
 

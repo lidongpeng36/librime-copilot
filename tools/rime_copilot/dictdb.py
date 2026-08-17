@@ -7,6 +7,7 @@ in the plugin.
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ class Source:
     top: bool = False
     scale: float | None = None
     scale_range: "tuple[int, int] | None" = None
+    boost: "str | None" = None
 
 
 def load_sources(config_path: Path) -> list[Source]:
@@ -32,8 +34,22 @@ def load_sources(config_path: Path) -> list[Source]:
         if "scale" in item and "range" in item:
             raise ValueError(f"{path}: `scale` and `range` are mutually exclusive")
         scale_range = tuple(item["range"]) if "range" in item else None
+        boost = item.get("boost")
+        if boost is not None:
+            if boost != "log":
+                raise ValueError(f"{path}: unknown boost {boost!r}; the only mode is 'log'")
+            if not item.get("top"):
+                raise ValueError(f"{path}: `boost` only applies to a `top` source")
+            if "scale" in item or "range" in item:
+                # _apply_shaping runs before the boost, so a linear/range
+                # rescale would compose non-linearly with the log
+                # normalisation -- refuse rather than silently produce a
+                # weight nobody chose.
+                raise ValueError(f"{path}: `boost` is mutually exclusive with "
+                                 f"`scale`/`range`")
         sources.append(Source(path=path, top=bool(item.get("top")),
-                              scale=item.get("scale"), scale_range=scale_range))
+                              scale=item.get("scale"), scale_range=scale_range,
+                              boost=boost))
     return sources
 
 
@@ -79,9 +95,26 @@ def merge(loaded: Sequence["tuple[Source, list[Entry]]"]) -> list[Entry]:
     for source, entries in loaded:
         if not source.top:
             continue
-        for e in _apply_shaping(source, entries):
+        shaped = _apply_shaping(source, entries)
+        # `boost: "log"` gives the personal frequency the SAME RANGE as the
+        # public one — both 0..ceiling — instead of 1-2877 against a term up to
+        # ~19M. It does not make the personal term lexicographically first, and
+        # a public weight near the ceiling can still win; see the test that
+        # pins that. Log rather than linear because commit counts are
+        # long-tailed: 34.7% of this lexicon is a single commit, and a linear
+        # rescale would flatten everything below the top few hundred.
+        # Still additive, not a replacement: replacing outright was measured to
+        # invert real frequencies (see the `top` note above).
+        span = None
+        if source.boost == "log":
+            largest = max((e.weight for e in shaped), default=0)
+            span = math.log1p(largest) if largest > 0 else 0
+        for e in shaped:
             key = (e.word, e.pinyin)
-            merged[key] = ceiling + merged.get(key, 0) + e.weight
+            own = e.weight
+            if span:
+                own = ceiling * math.log1p(e.weight) / span
+            merged[key] = ceiling + merged.get(key, 0) + own
 
     result = [Entry(word, pinyin, weight) for (word, pinyin), weight in merged.items()]
     result.sort(key=lambda e: (e.word[0], -e.weight))

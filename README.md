@@ -59,6 +59,76 @@ word frequency is long-tailed, and a linear min-max squeeze collapses almost
 everything onto the same value. Mark a personal dictionary with `"top": true`
 to lift all of its entries above the others while keeping their relative order.
 
+A `top` source is stacked additively, not swapped in: `ceiling + existing +
+own`, so every one of its entries outranks every ordinary entry while its own
+frequency order survives (replacing outright was measured to invert real
+frequencies). Left at that, a personal commit count is dwarfed by the public
+weight it is stacked on — `确定是 = ceiling + 14925 + 7`, the commit count
+moving the result by 0.00004% — so the whole personal band ends up ordered by
+public frequency, and any candidate-ranking gate downstream (the copilot db's)
+has nothing of the personal signal left to measure. Add `"boost": "log"` to a
+`top` source in `dict.json` to fix that: it rescales that source's own weight
+onto the *same* 0..ceiling range as the public term (log rather than linear,
+because commit counts are long-tailed — over a third of a typical personal
+lexicon is a single commit, and a linear rescale would flatten everything
+below the top few hundred). It does not make the personal term win outright;
+a public weight near the ceiling can still outrank it.
+
+```json
+{ "dict": "~/Library/Rime/private/custom.dict.yaml", "top": true, "boost": "log" }
+```
+
+`boost` is only valid on a `top` source, and `"log"` is currently the only mode.
+
+### Pruning a Sogou-exported personal lexicon
+
+`custom.dict.yaml` exported from Sogou is mostly cross-word-boundary
+fragments learned from sentence input (`的问题`, `编译的`, `这个我`), which is
+what gives a key like `的` well over a thousand continuations once that
+dictionary is marked `top`. `rime-copilot clean` prunes it in three steps:
+
+```sh
+rime-copilot clean            # classify every entry, write the review file
+$EDITOR ~/Library/Rime/private/clean_out/review.tsv
+rime-copilot clean --apply    # read the review file back, rewrite custom.dict.yaml
+```
+
+The first run classifies `private/custom.dict.yaml` against a rule chain
+(oracled by `jieba`'s segmentation dictionary — see `CLAUDE.md`'s "lexicon
+oracle" note) into `keep`, `review`, and `drop`, and writes two files under
+`private/clean_out/`: `review.tsv`, grouped and pre-filled with the default
+action each rule suggests, and `drop.tsv`, an audit trail of every entry
+being removed and why (nothing reads it back). Editing `review.tsv` means
+changing the first column (`keep` or `drop`) on the rows the chain got
+wrong — the rest of each row is context, not input. `clean --apply` then
+reads that file, rewrites `custom.dict.yaml` to only what survived, and
+prints how many entries did.
+
+Two thresholds tune the chain, both in commit counts (the third column of
+`custom.dict.yaml`): `--threshold-high` (default 100) is how many of the
+user's own commits are enough to overrule a structural verdict — the escape
+hatch that keeps real words like `好了` and `是的` that no dictionary-based
+rule alone can distinguish from a fragment; `--threshold-low` (default 3) is
+the point below which a pin carries no evidence at all.
+
+`clean --apply` preserves the untouched export at
+`private/custom.dict.yaml.raw` the first time it runs — never again, since a
+second overwrite there would replace the true original with an
+already-cleaned copy — because nothing regenerates a Sogou export. `backup`
+carries that file to the vault alongside the live `custom.dict.yaml`, so a
+restore on a new machine gets both the cleaned dictionary and the pristine
+original it was cleaned from.
+
+To measure what a cleanup (or any lexicon/config change) actually did to
+prediction quality, use the `tools/rime_corpus/` harness (`rime-corpus` CLI)
+rather than eyeballing candidates by hand: it replays a recorded corpus
+through a real Rime build (`tools/replay_copilot.cc`) and reports a bucket
+split with an oracle bound (`rime-corpus oracle`), or exports a scoring set
+for `tools/score_candidates.cc`. `dump_copilot <db> --find <key> -- <cont>`
+remains the quick single-key spot-check — useful to confirm a key like `的`
+lost its flat plateau of fragments after a rebuild, but not a substitute for
+running the corpus harness before and after a change.
+
 ## Usage
 
 * Put the db file (by default `copilot.db`) in rime user directory.
@@ -721,8 +791,8 @@ tools/rime-copilot install   # copies the CLI + build_copilot into private/bin
 It pins an interpreter into the installed entry point's shebang, taking it
 from `private/.python-version` if that names a pyenv environment. Check the
 `python …` line it prints against the environment that actually has
-`pypinyin`, `requests`, and `beautifulsoup4`; pass `--python` to override it.
-See "Which interpreter the installed copy runs under" below.
+`pypinyin`, `jieba`, `requests`, and `beautifulsoup4`; pass `--python` to
+override it. See "Which interpreter the installed copy runs under" below.
 
 After that, `~/Library/Rime/private/bin/rime-copilot` works on its own —
 `restore` and `update` no longer need the librime checkout at all:
@@ -762,14 +832,15 @@ never become the source for another install.
 
 ### Which interpreter the installed copy runs under
 
-The pipeline has three third-party dependencies, all imported lazily so that
+The pipeline has four third-party dependencies, all imported lazily so that
 the CLI starts on a stock interpreter: `pypinyin` (needed by `build` and
 `update` for any dictionary with no pinyin column — `tencent.dict.yaml` is
 the common case, `word⇥weight` only, so every entry needs a generated
-pinyin), and `requests` + `beautifulsoup4` (needed by `fetch`). Lazy imports
-are why `status`, `restore`, and `backup` work on anything; they are also why
-a missing dependency shows up as an `ImportError` halfway through a
-subcommand, on the machine whose whole point is to have no checkout to read.
+pinyin), `jieba` (needed by `clean`, to tell a real word from a Sogou
+sentence fragment), and `requests` + `beautifulsoup4` (needed by `fetch`).
+Lazy imports are why `status`, `restore`, and `backup` work on anything; they
+are also why a missing dependency shows up as an `ImportError` halfway through
+a subcommand, on the machine whose whole point is to have no checkout to read.
 
 `install` pins one interpreter for all of that: it rewrites
 `private/bin/rime-copilot`'s shebang to an absolute interpreter path instead

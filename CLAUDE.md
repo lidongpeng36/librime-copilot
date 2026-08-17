@@ -133,12 +133,13 @@ package in `tools/rime_copilot/`:
 | `vault.py` | backup/restore of the unversioned files, to the iCloud sync dir |
 | `freshness.py` | the content-hash rebuild decision |
 | `install.py` | copying the CLI + `build_copilot` into `<rime_dir>/private/bin` so it runs standalone, and detecting drift in that copy |
+| `clean.py` | pruning the Sogou-exported personal lexicon; the rule chain and the review file |
 | `cli.py` | orchestration |
 
 Subcommands: `status`, `restore`, `backup`, `fetch`, `build`, `deploy`,
-`update`, `install`. A new machine builds `build_copilot` from a librime
-checkout, runs `install` once, then `restore` and `update` from the installed
-`private/bin/rime-copilot` — no checkout needed after that.
+`update`, `install`, `clean`. A new machine builds `build_copilot` from a
+librime checkout, runs `install` once, then `restore` and `update` from the
+installed `private/bin/rime-copilot` — no checkout needed after that.
 
 **Drift-detection contract:** `install` records a manifest
 (`private/bin/.installed.json`: source commit, source path, content hash per
@@ -147,16 +148,35 @@ has been edited in place, is missing a file, or has fallen behind the repo it
 came from — without that, an installed copy is just a second, unversioned
 `private/bin/` waiting to rot the same way the original one did.
 
+**The lexicon oracle:** `clean` decides whether an entry in the Sogou-exported
+personal lexicon is a real word or a cross-word-boundary fragment Sogou
+learned from sentence input (`的问题`, `编译的`). Neither dictionary already in
+the tree can answer that — `ext`/`tencent` carry weight 100 for every entry,
+and `base.dict.yaml` has artificial bands where `你们 501135` and `上的
+502252` sit side by side. `jieba`'s segmentation dictionary is the oracle
+instead, because it is free of such fragments by construction. It is a
+**positive** oracle only: absence proves nothing (`是的`, `自动驾驶` are absent
+and real), which is why rule R9 lets the user's own commit count overrule a
+structural verdict — two earlier drafts of the chain lacked R9 and deleted
+`好了`, `你们`, `那个`, `是的`. `jieba` is in `RUNTIME_REQUIREMENTS` alongside
+`pypinyin`, and imported lazily for the same reason.
+
+`dict.json` gained `boost: "log"` for `top` sources (`dictdb.py`): without it
+a `top` entry's own commit count is swamped by the public weight it stacks on
+(`确定是 = ceiling + 14925 + 7`), so the personal band is ordered by public
+frequency and the copilot db's rank gate has nothing to measure.
+
 **The weight convention lives in `dictdb.py` and in `src/db_provider.h` /
 `src/rerank.h`, and must match: larger = more likely.** Writing a rank instead
 of a real weight silently inverts every ordering in the plugin. `Entry.weight`
 (`dictfile.py`) is a `float`, not an `int` — it becomes fractional once a
 `scale` is applied.
 
-Third-party imports (`pypinyin`, `requests`, `bs4`) are lazy, at the
+Third-party imports (`pypinyin`, `jieba`, `requests`, `bs4`) are lazy, at the
 point of use, so every module imports on a stock interpreter. `pypinyin` is
 required at runtime for any dictionary with no pinyin column (e.g.
-`tencent.dict.yaml`, which is `word⇥weight` only); `requests`/`bs4` for
+`tencent.dict.yaml`, which is `word⇥weight` only); `jieba` for `clean`, to
+tell a real word from a Sogou sentence fragment; `requests`/`bs4` for
 `fetch`. From a checkout, whether they are found depends on the ambient
 interpreter (pyenv's per-directory `.python-version` resolves from the
 *caller's* current working directory, not the script's location, so this is
@@ -202,7 +222,7 @@ command above needs no activation. On a new machine:
 
 ```sh
 pyenv virtualenv system rime-copilot
-~/.pyenv/versions/rime-copilot/bin/pip install pypinyin requests beautifulsoup4
+~/.pyenv/versions/rime-copilot/bin/pip install pypinyin requests beautifulsoup4 jieba
 ```
 
 `RECIPE_VERSION` in `freshness.py` must be bumped by hand when a change to the

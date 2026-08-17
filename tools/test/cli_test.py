@@ -5,6 +5,7 @@ the outside world and are exercised by hand in Task 8.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -765,6 +766,288 @@ class InstallDependencies(CliBase):
         with mock.patch.object(I, "RUNTIME_REQUIREMENTS", (present,)):
             _, out = self.run_cli("install", "--builder", str(self.fake_builder()))
         self.assertNotIn("warning", out)
+
+
+class CleanFixture(unittest.TestCase):
+    """Shared fixture/helpers for the `clean` subcommand.
+
+    Not itself a test class in spirit -- kept separate from `CleanCommand` so
+    the guard-specific classes below (`CleanStampGuard`, `CleanThresholdGuard`,
+    `CleanForceGuard`) can reuse `setUp`/`run_clean` without also inheriting
+    (and re-running) every one of `CleanCommand`'s own test methods.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.rime = Path(self.tmp.name)
+        (self.rime / "private").mkdir(parents=True)
+        (self.rime / "cn_dicts").mkdir(parents=True)
+        (self.rime / "cn_dicts" / "8105.dict.yaml").write_text(
+            "---\nname: chart\n...\n\n" + "".join(f"{c}\tx\t1\n" for c in "上线的问题识六一份"),
+            encoding="utf-8")
+        (self.rime / "private" / "custom.dict.yaml").write_text(
+            "---\nname: custom\nversion: \"1\"\nsort: by_weight\n...\n\n"
+            "上线\tshang xian\t2877\n"
+            "的问题\tde wen ti\t45\n"
+            "识六\tshi liu\t475\n"
+            "一份\tyi fen\t2\n",
+            encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_lexicon(self):
+        from rime_copilot.clean import Lexicon
+        return Lexicon(known={"上线": 4210}, chart=set("上线的问题识六一份"),
+                       segment=lambda w: [w], tags=lambda w: ["n"])
+
+    def run_clean(self, *argv, dry_run=False):
+        from rime_copilot import cli, clean
+        real = clean.load_lexicon
+        clean.load_lexicon = lambda chart_path=None: self.fake_lexicon()
+        prefix = ["--rime-dir", str(self.rime)]
+        if dry_run:
+            prefix.append("--dry-run")
+        try:
+            return cli.main([*prefix, "clean", *argv])
+        finally:
+            clean.load_lexicon = real
+
+
+class CleanCommand(CleanFixture):
+    def test_dry_run_writes_nothing(self):
+        self.assertEqual(0, self.run_clean(dry_run=True))
+        self.assertFalse((self.rime / "private" / "clean_out").exists())
+
+    def test_writes_review_and_drop(self):
+        self.assertEqual(0, self.run_clean())
+        out = self.rime / "private" / "clean_out"
+        self.assertTrue((out / "review.tsv").is_file())
+        self.assertTrue((out / "drop.tsv").is_file())
+        self.assertIn("识六", (out / "review.tsv").read_text(encoding="utf-8"))
+        self.assertIn("的问题", (out / "drop.tsv").read_text(encoding="utf-8"))
+
+    def test_apply_rewrites_the_dictionary_and_preserves_the_original(self):
+        self.run_clean()
+        self.assertEqual(0, self.run_clean("--apply"))
+        raw = self.rime / "private" / "custom.dict.yaml.raw"
+        self.assertIn("的问题", raw.read_text(encoding="utf-8"))
+        cleaned = (self.rime / "private" / "custom.dict.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("的问题", cleaned)
+        self.assertIn("上线", cleaned)
+        self.assertIn("识六", cleaned)
+
+    def test_a_second_apply_does_not_clobber_the_pristine_original(self):
+        self.run_clean()
+        self.run_clean("--apply")
+        raw = self.rime / "private" / "custom.dict.yaml.raw"
+        first = raw.read_text(encoding="utf-8")
+        self.run_clean()
+        self.run_clean("--apply")
+        self.assertEqual(first, raw.read_text(encoding="utf-8"))
+
+    def test_apply_without_a_review_file_refuses(self):
+        self.assertEqual(1, self.run_clean("--apply"))
+
+    def test_apply_writes_a_stamp_that_status_reports(self):
+        from rime_copilot import cli
+        self.run_clean()
+        self.run_clean("--apply")
+        stamp = self.rime / "private" / ".copilot_clean_stamp.json"
+        self.assertTrue(stamp.is_file())
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.main(["--rime-dir", str(self.rime), "status"])
+        self.assertIn("lexicon:", buffer.getvalue())
+
+    def test_apply_leaves_no_staged_temporary_file_behind(self):
+        self.run_clean()
+        self.run_clean("--apply")
+        leftover = list((self.rime / "private").glob("*.new"))
+        self.assertEqual([], leftover, f"staged files left behind: {leftover}")
+
+    def test_a_second_apply_does_not_clobber_a_truncated_raw(self):
+        """Guards `not raw.exists()`: any `raw` already on disk, truncated or
+        not, is treated as already preserved and left alone.
+
+        The staged-then-renamed write this branch uses for `raw` (see the
+        comment above it in `cmd_clean`) makes a truncated `raw` unreachable
+        from this code path -- an interrupted `--apply` now leaves either no
+        `raw` or a complete one, never a fragment. The state is still
+        reachable from an older copy of this tool, or from something outside
+        it (an external editor, a half-finished manual copy) writing directly
+        into `raw`, which is what this test stands in for.
+        """
+        raw = self.rime / "private" / "custom.dict.yaml.raw"
+        raw.write_text("truncated", encoding="utf-8")
+        self.run_clean()
+        self.run_clean("--apply")
+        self.assertEqual("truncated", raw.read_text(encoding="utf-8"))
+
+
+class CleanStampGuard(CleanFixture):
+    """C1: a clean stamp with no matching `.raw` must never let --apply proceed.
+
+    Reproduces the reviewer's chain: `restore` on a second machine can
+    materialise `custom.dict.yaml` before `custom.dict.yaml.raw` (normal on a
+    new Mac -- iCloud has not synced everything yet). Without this guard,
+    `clean --apply` there would preserve the already-cleaned live file as the
+    "pristine" original, and a later `backup` would push that fake original
+    over the real one in the vault, destroying the only copy of the Sogou
+    export everywhere.
+    """
+
+    def stamp_path(self) -> Path:
+        return self.rime / "private" / ".copilot_clean_stamp.json"
+
+    def raw_path(self) -> Path:
+        return self.rime / "private" / "custom.dict.yaml.raw"
+
+    def write_stamp(self, raw_sha256: str) -> None:
+        self.stamp_path().write_text(json.dumps({
+            "cleaned_at": "2026-08-01T00:00:00Z",
+            "raw_sha256": raw_sha256,
+            "result_sha256": "irrelevant-to-this-guard",
+            "counts": {"keep": 0, "review": 0, "drop": 0, "surviving": 0},
+            "thresholds": {"high": 100, "low": 3, "compound": 50},
+        }), encoding="utf-8")
+
+    def test_stamp_with_no_raw_refuses(self):
+        self.run_clean()
+        self.write_stamp("deadbeef" * 8)
+        self.assertEqual(1, self.run_clean("--apply"))
+        self.assertFalse(self.raw_path().exists())
+        # The live file must be untouched by the refused apply.
+        self.assertIn("的问题",
+                      (self.rime / "private" / "custom.dict.yaml").read_text(encoding="utf-8"))
+
+    def test_stamp_with_a_mismatched_raw_refuses(self):
+        self.run_clean()
+        self.raw_path().write_text("not the sogou export", encoding="utf-8")
+        self.write_stamp("deadbeef" * 8)  # does not match the real hash of raw_path()
+        self.assertEqual(1, self.run_clean("--apply"))
+        self.assertEqual("not the sogou export", self.raw_path().read_text(encoding="utf-8"))
+
+    def test_ordinary_first_run_still_succeeds(self):
+        # No stamp, no .raw: the normal first-ever clean on a machine.
+        self.run_clean()
+        self.assertEqual(0, self.run_clean("--apply"))
+        self.assertTrue(self.raw_path().is_file())
+
+    def test_a_matching_raw_alongside_the_stamp_still_succeeds(self):
+        # The stamp is present and .raw agrees with it -- e.g. a rerun after
+        # `restore` has finished pulling everything down.
+        self.run_clean()
+        self.assertEqual(0, self.run_clean("--apply"))
+        from rime_copilot.paths import sha256_file
+        self.write_stamp(sha256_file(self.raw_path()))
+        self.run_clean("--force")
+        self.assertEqual(0, self.run_clean("--apply"))
+
+
+class CleanThresholdGuard(CleanFixture):
+    """I3: --apply must use the thresholds review.tsv was generated with."""
+
+    def test_apply_with_different_thresholds_refuses(self):
+        self.run_clean("--threshold-high", "2000")
+        self.assertEqual(1, self.run_clean("--apply"))  # default threshold-high=100
+        # Refused before anything was rewritten.
+        cleaned = (self.rime / "private" / "custom.dict.yaml").read_text(encoding="utf-8")
+        self.assertIn("的问题", cleaned)
+        self.assertFalse((self.rime / "private" / "custom.dict.yaml.raw").exists())
+
+    def test_apply_with_matching_thresholds_succeeds(self):
+        self.run_clean("--threshold-high", "2000")
+        self.assertEqual(0, self.run_clean("--apply", "--threshold-high", "2000"))
+
+    def test_a_review_file_without_a_header_is_still_accepted(self):
+        # Backward compatible with a review.tsv that predates this header.
+        self.run_clean()
+        review_path = self.rime / "private" / "clean_out" / "review.tsv"
+        stripped = "\n".join(line for line in review_path.read_text(encoding="utf-8").splitlines()
+                             if not line.startswith("# thresholds:"))
+        review_path.write_text(stripped + "\n", encoding="utf-8")
+        self.assertEqual(0, self.run_clean("--apply"))
+
+
+class CleanForceGuard(CleanFixture):
+    """I4: a bare re-run of `clean` must not silently destroy an annotated
+    review.tsv -- 1,533 hand-annotated rows is real work, and the natural
+    reason to re-run is exactly retuning the thresholds (I3).
+    """
+
+    def review_path(self) -> Path:
+        return self.rime / "private" / "clean_out" / "review.tsv"
+
+    def test_rerunning_without_force_refuses_and_preserves_the_annotation(self):
+        self.run_clean()
+        annotated = self.review_path().read_text(encoding="utf-8").replace(
+            "keep\t475\t识六", "drop\t475\t识六")
+        self.assertNotEqual(annotated, self.review_path().read_text(encoding="utf-8"),
+                            "fixture assumption broken: expected a 识六 review row")
+        self.review_path().write_text(annotated, encoding="utf-8")
+        self.assertEqual(1, self.run_clean())
+        self.assertEqual(annotated, self.review_path().read_text(encoding="utf-8"))
+
+    def test_force_regenerates_and_the_new_default_wins_on_apply(self):
+        self.run_clean()
+        self.review_path().write_text(
+            self.review_path().read_text(encoding="utf-8").replace(
+                "keep\t475\t识六", "drop\t475\t识六"),
+            encoding="utf-8")
+        self.assertEqual(0, self.run_clean("--force"))
+        # Regenerated from scratch: back to the chain's default (keep), the
+        # hand annotation is gone.
+        self.assertIn("keep\t475\t识六", self.review_path().read_text(encoding="utf-8"))
+        self.assertEqual(0, self.run_clean("--apply"))
+        cleaned = (self.rime / "private" / "custom.dict.yaml").read_text(encoding="utf-8")
+        self.assertIn("识六", cleaned)
+
+
+class CleanVocabularyMismatchGuard(unittest.TestCase):
+    """M5: `--apply` must refuse when `read_entries` silently dropped a row
+    `count_vocabulary_lines` still counts -- that used to feed a rebuildable
+    database harmlessly; here it would erase the row for good.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.rime = Path(self.tmp.name)
+        (self.rime / "private").mkdir(parents=True)
+        (self.rime / "cn_dicts").mkdir(parents=True)
+        (self.rime / "cn_dicts" / "8105.dict.yaml").write_text(
+            "---\nname: chart\n...\n\n" + "".join(f"{c}\tx\t1\n" for c in "上线一份"),
+            encoding="utf-8")
+        (self.rime / "private" / "custom.dict.yaml").write_text(
+            "---\nname: custom\nversion: \"1\"\nsort: by_weight\n...\n\n"
+            "上线\tshang xian\t2877\n"
+            "识六\tshi liu\tnot-a-number\n"  # unparseable weight: read_entries skips it silently
+            "一份\tyi fen\t2\n",
+            encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_refuses_and_writes_nothing(self):
+        from rime_copilot import cli
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = cli.main(["--rime-dir", str(self.rime), "clean"])
+        self.assertEqual(1, code)
+        self.assertIn("3 vocabulary line", buffer.getvalue())
+        self.assertFalse((self.rime / "private" / "clean_out").exists())
+
+
+class VaultedFiles(unittest.TestCase):
+    def test_the_pristine_export_is_vaulted(self):
+        from rime_copilot.vault import VAULTED_FILES
+        self.assertIn("private/custom.dict.yaml.raw", VAULTED_FILES)
+
+    def test_the_clean_stamp_is_vaulted(self):
+        # C1: without this, a second machine can never see that the lexicon
+        # was already cleaned elsewhere -- see CleanStampGuard.
+        from rime_copilot.vault import VAULTED_FILES
+        self.assertIn("private/.copilot_clean_stamp.json", VAULTED_FILES)
 
 
 if __name__ == "__main__":

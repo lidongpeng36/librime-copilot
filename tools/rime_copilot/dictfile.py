@@ -88,6 +88,26 @@ def read_entries(path: Path) -> list[Entry]:
     return entries
 
 
+def count_vocabulary_lines(path: Path) -> int:
+    """Count non-blank, non-comment lines in the vocabulary body.
+
+    `read_entries` silently drops a row with 4+ tab columns or a non-integer
+    weight -- only the whitespace case above warns. That was fine feeding a
+    rebuildable database; it is not fine feeding a destructive rewrite of a
+    source nothing can regenerate (see `clean --apply`). Callers that rewrite
+    the source compare this count against `len(read_entries(path))` and
+    refuse on a mismatch.
+    """
+    count = 0
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw in iter_body_lines(handle, str(path)):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            count += 1
+    return count
+
+
 def _auto_pinyin(word: str) -> str:
     # lazy: only dictionaries missing a pinyin column pay for this import
     try:

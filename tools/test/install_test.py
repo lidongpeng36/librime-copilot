@@ -388,7 +388,7 @@ class Requirements(unittest.TestCase):
                 for prefix in ("import ", "from "):
                     if line.startswith(prefix):
                         imported.add(line[len(prefix):].split()[0].split(".")[0])
-        third_party = imported & {"pypinyin", "requests", "bs4", "yaml", "lxml"}
+        third_party = imported & {"pypinyin", "jieba", "requests", "bs4", "yaml", "lxml"}
         self.assertEqual(third_party, {r.module for r in I.RUNTIME_REQUIREMENTS})
 
     def test_a_module_this_interpreter_has_is_not_reported_missing(self):

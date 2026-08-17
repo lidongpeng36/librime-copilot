@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import shutil
 import subprocess
@@ -22,6 +23,10 @@ SOGOU_DICT_NAME = "sogou.dict.yaml"
 PREDICT_DB_NAME = "private.predict.db"
 CONFIG_NAME = "dict.json"
 SHRINK_FLOOR = 0.9
+CLEAN_DIR_NAME = "clean_out"
+CUSTOM_DICT_NAME = "custom.dict.yaml"
+RAW_SUFFIX = ".raw"
+CLEAN_STAMP_NAME = ".copilot_clean_stamp.json"
 
 # The exact build the PoC and the integration measured (see
 # docs/superpowers/specs/2026-08-16-llm-rerank-poc-results.md and
@@ -173,6 +178,18 @@ def cmd_status(args) -> int:
         except FileNotFoundError as exc:
             # status is what you run when something is already wrong; it reports.
             print(f"build:    cannot tell ({exc})")
+
+    stamp_path = _private(rime_dir) / CLEAN_STAMP_NAME
+    if stamp_path.is_file():
+        try:
+            stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+            counts = stamp.get("counts", {})
+            print(f"lexicon:  cleaned {stamp.get('cleaned_at')}, "
+                  f"{counts.get('surviving')} entries")
+        except (OSError, ValueError) as exc:
+            print(f"lexicon:  stamp unreadable ({exc})")
+    else:
+        print("lexicon:  not cleaned")
 
     _print_installed_status(rime_dir)
     return 0
@@ -428,6 +445,168 @@ def cmd_build(args) -> int:
     return 0
 
 
+def cmd_clean(args) -> int:
+    from . import clean as cleanup
+
+    rime_dir = args.rime_dir
+    source = _private(rime_dir) / CUSTOM_DICT_NAME
+    if not source.is_file():
+        print(f"no {source}")
+        return 1
+
+    entries = dictfile.read_entries(source)
+    # M5: read_entries silently drops a row with 4+ tab columns or a
+    # non-integer weight (only the whitespace case warns). That was fine
+    # feeding a rebuildable database; it is not fine feeding a destructive
+    # rewrite of a source nothing can regenerate.
+    vocab_lines = dictfile.count_vocabulary_lines(source)
+    if vocab_lines != len(entries):
+        print(f"refusing: {source} has {vocab_lines} vocabulary line(s) but only "
+             f"{len(entries)} parsed as entries ({vocab_lines - len(entries)} would be "
+             f"silently dropped by a rewrite) -- inspect the file with dictfile before "
+             f"running clean again")
+        return 1
+
+    chart = rime_dir / cleanup.CHART_NAME
+    lexicon = cleanup.load_lexicon(chart if chart.is_file() else None)
+    thresholds = cleanup.Thresholds(high=args.threshold_high, low=args.threshold_low)
+    part = cleanup.partition(entries, lexicon, thresholds)
+
+    print(f"lexicon: {len(entries)} entries")
+    print(f"  keep   {len(part.keep)}")
+    print(f"  review {len(part.review)}")
+    print(f"  drop   {len(part.drop)}")
+
+    out = _private(rime_dir) / CLEAN_DIR_NAME
+    review_path = out / "review.tsv"
+
+    if not args.apply:
+        # Below the --force check on purpose: a dry run writes nothing, so
+        # refusing it to protect annotations would be a refusal with nothing
+        # to protect -- and `clean --dry-run` is the documented first step of
+        # the whole sequence, which would then fail on every run after the
+        # first.
+        if args.dry_run:
+            return 0
+        if review_path.is_file() and not args.force:
+            # 1,533 hand-annotated rows is real work, and the natural
+            # reason to re-run `clean` is exactly retuning the thresholds
+            # (see the I3 guard below) -- an unguarded overwrite here would
+            # lose every annotation silently.
+            print(f"refusing to overwrite {review_path}: it may hold hand-annotated "
+                 f"keep/drop decisions that would be lost -- pass --force to "
+                 f"regenerate it anyway")
+            return 1
+        out.mkdir(parents=True, exist_ok=True)
+        review_path.write_text(cleanup.render_review(part, thresholds), encoding="utf-8")
+        (out / "drop.tsv").write_text(cleanup.render_drop(part), encoding="utf-8")
+        print(f"wrote {review_path}")
+        print(f"wrote {out / 'drop.tsv'}")
+        print("annotate review.tsv, then run: rime-copilot clean --apply")
+        return 0
+
+    if not review_path.is_file():
+        print(f"no {review_path} — run `rime-copilot clean` first")
+        return 1
+    review_text = review_path.read_text(encoding="utf-8")
+
+    # I3: apply with the thresholds the review file was generated with, not
+    # whatever this invocation happens to pass -- generating with
+    # --threshold-high 2000 then applying with the default silently applies a
+    # different partition than the human reviewed.
+    recorded = cleanup.parse_review_thresholds(review_text)
+    if recorded is not None and recorded != thresholds:
+        print(f"refusing: {review_path} was generated with thresholds "
+             f"(high={recorded.high}, low={recorded.low}) but this run would apply "
+             f"(high={thresholds.high}, low={thresholds.low}) -- re-run with "
+             f"--threshold-high {recorded.high} --threshold-low {recorded.low} to match "
+             f"what was reviewed, or regenerate review.tsv (with --force) under "
+             f"--threshold-high {thresholds.high} --threshold-low {thresholds.low} and "
+             f"re-annotate it")
+        return 1
+
+    decisions = cleanup.parse_review(review_text)
+    survivors = cleanup.apply_review(part, decisions)
+    print(f"  surviving {len(survivors)}")
+    if args.dry_run:
+        return 0
+
+    # C1: a clean stamp with no `.raw` (or a `.raw` that disagrees with the
+    # stamp's recorded hash) means "already cleaned somewhere, pristine
+    # original missing or wrong here". Proceeding would preserve the
+    # ALREADY-CLEANED live file as if it were the Sogou export below, and a
+    # later `backup` would then push that fake "pristine" copy over the real
+    # one in the vault -- destroying the only copy of the export, everywhere.
+    raw = source.with_suffix(source.suffix + RAW_SUFFIX)
+    stamp_path = _private(rime_dir) / CLEAN_STAMP_NAME
+    if stamp_path.is_file():
+        try:
+            stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"refusing: {stamp_path} exists but is unreadable ({exc}) -- a clean "
+                 f"stamp is present, so this machine may not be seeing a first clean; "
+                 f"fix or remove the stamp before retrying")
+            return 1
+        if not raw.is_file():
+            print(f"refusing: {stamp_path} records that this lexicon has already been "
+                 f"cleaned, but {raw} is not present here. Applying now would preserve "
+                 f"the already-cleaned {source.name} as if it were the pristine Sogou "
+                 f"export, and a later `rime-copilot backup` would push that fake "
+                 f"original over the real one in the vault. Run `rime-copilot restore` "
+                 f"to fetch {raw.name} from the vault, or wait a moment if iCloud has "
+                 f"not materialized it yet, then retry")
+            return 1
+        expected = stamp.get("raw_sha256")
+        actual = paths.sha256_file(raw)
+        if expected is not None and actual != expected:
+            print(f"refusing: {raw} does not match the pristine original recorded in "
+                 f"{stamp_path} (expected sha256 {expected}, found {actual}). This looks "
+                 f"like a different or already-cleaned file. Run `rime-copilot restore` "
+                 f"to fetch the correct {raw.name} from the vault before applying again")
+            return 1
+
+    # The export is not regenerable. Preserve it before anything overwrites the
+    # live file -- and never a second time, or the pristine copy becomes a copy
+    # of an already-cleaned lexicon. Staged then renamed, like every other write
+    # in this package that threatens something live or irreplaceable (see
+    # cmd_fetch's `staged`/`.replace()` and vault.py's `apply_backup`): a plain
+    # in-place copy left `raw` truncated-but-existing on an interrupted run,
+    # and the `not raw.exists()` guard would then treat that fragment as the
+    # preserved original and let the next `--apply` overwrite the live file
+    # for good.
+    if not raw.exists():
+        temporary_raw = raw.with_name(raw.name + ".new")
+        shutil.copy2(source, temporary_raw)
+        temporary_raw.replace(raw)
+        print(f"preserved the original at {raw}")
+
+    # Same reasoning, lower stakes: dictfile.write_dict opens `source` in "w"
+    # mode and streams into it, so an interruption here would truncate the
+    # live dictionary (the pristine `raw` above would still be intact).
+    staged = source.with_name(source.name + ".new")
+    dictfile.write_dict(staged, name="custom",
+                        version=datetime.date.today().isoformat(), entries=survivors)
+    staged.replace(source)
+    _write_clean_stamp(rime_dir, raw, source, part, len(survivors), thresholds)
+    print(f"rewrote {source}")
+    print("back the pristine export up with: rime-copilot backup")
+    return 0
+
+
+def _write_clean_stamp(rime_dir, raw, source, part, surviving, thresholds) -> None:
+    stamp = {
+        "cleaned_at": _now(),
+        "raw_sha256": paths.sha256_file(raw),
+        "result_sha256": paths.sha256_file(source),
+        "counts": {"keep": len(part.keep), "review": len(part.review),
+                   "drop": len(part.drop), "surviving": surviving},
+        "thresholds": {"high": thresholds.high, "low": thresholds.low,
+                       "compound": thresholds.compound},
+    }
+    path = _private(rime_dir) / CLEAN_STAMP_NAME
+    path.write_text(json.dumps(stamp, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def _git_commit(source_root: Path) -> "str | None":
     # Best-effort only: install must still work when git is unavailable or
     # source_root is not a git repo (e.g. a tarball checkout).
@@ -608,6 +787,19 @@ def build_parser() -> argparse.ArgumentParser:
                                       f"private/{PREDICT_DB_NAME})")
         command.set_defaults(func=func)
 
+    clean_cmd = sub.add_parser("clean",
+                               help="prune the Sogou-exported personal lexicon")
+    clean_cmd.add_argument("--apply", action="store_true",
+                           help="read review.tsv back and rewrite custom.dict.yaml")
+    clean_cmd.add_argument("--threshold-high", type=int, default=100,
+                           help="commits that overrule a structural verdict (default: 100)")
+    clean_cmd.add_argument("--threshold-low", type=int, default=3,
+                           help="commits below which a pin carries no evidence (default: 3)")
+    clean_cmd.add_argument("--force", action="store_true",
+                           help="regenerate review.tsv even though one already exists "
+                                "(discards any hand-annotated decisions in it)")
+    clean_cmd.set_defaults(func=cmd_clean)
+
     deploy = sub.add_parser("deploy")
     deploy.add_argument("--squirrel")
     deploy.set_defaults(func=cmd_deploy)
@@ -629,7 +821,9 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     for attribute, default in (("builder", None), ("max_per_key", -1),
                                ("force_build", False), ("force", False),
                                ("squirrel", None), ("config", None), ("output", None),
-                               ("url", None), ("name", None)):
+                               ("url", None), ("name", None),
+                               ("apply", False), ("threshold_high", 100),
+                               ("threshold_low", 3)):
         if not hasattr(args, attribute):
             setattr(args, attribute, default)
     return args.func(args)

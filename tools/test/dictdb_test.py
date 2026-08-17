@@ -116,6 +116,119 @@ class ScaleWeights(unittest.TestCase):
         self.assertEqual(121, scaled[0].weight)
 
 
+class LogBoost(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, config) -> Path:
+        path = self.dir / "dict.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return path
+
+    def test_own_commits_now_move_the_result(self):
+        # ceiling = 900. 上线 is the most-committed personal entry so it gets the
+        # full ceiling boost; 一份's two commits get log1p(2)/log1p(2877) of it.
+        #   上线  900 + 500 + 900.0    = 2300.0
+        #   一份  900 + 900 + 124.139 = 1924.139
+        # Pinned to exact values, not just order: with boost=None every one of
+        # this class's tests but `test_a_dominant_public_weight_can_still_win`
+        # still passes on the unboosted numbers (4277 vs 1802 here), so
+        # relative-order assertions alone do not detect the feature.
+        sources = [
+            (Source(path=Path("/public.dict.yaml")),
+             [entry("上线", 500), entry("一份", 900)]),
+            (Source(path=Path("/personal.dict.yaml"), top=True, boost="log"),
+             [entry("上线", 2877), entry("一份", 2)]),
+        ]
+        merged = {e.word: e.weight for e in merge(sources)}
+        self.assertGreater(merged["上线"], merged["一份"])
+        self.assertEqual(2300.0, merged["上线"])
+        self.assertAlmostEqual(1924.139, merged["一份"], places=3)
+
+    def test_public_weight_breaks_a_tie_in_own_commits(self):
+        # Equal commits mean an equal boost, so the public weight decides.
+        #   甲  900 +  10 + 900.0 = 1810.0
+        #   乙  900 + 900 + 900.0 = 2700.0
+        sources = [
+            (Source(path=Path("/public.dict.yaml")),
+             [entry("甲", 10), entry("乙", 900)]),
+            (Source(path=Path("/personal.dict.yaml"), top=True, boost="log"),
+             [entry("甲", 50), entry("乙", 50)]),
+        ]
+        merged = {e.word: e.weight for e in merge(sources)}
+        self.assertGreater(merged["乙"], merged["甲"])
+        self.assertEqual(1810.0, merged["甲"])
+        self.assertEqual(2700.0, merged["乙"])
+
+    def test_a_dominant_public_weight_can_still_win(self):
+        """The known limit, pinned so it stays a decision rather than a surprise.
+
+        The boost gives the personal term the same range as the public term
+        (both 0..ceiling); it does not make it lexicographically first. A word
+        whose public weight is near the ceiling still outranks a heavily
+        committed one whose public weight is tiny:
+            甲  900 +  10 + 900.0 = 1810.0
+            乙  900 + 900 +  78.3 = 1878.3
+        In the real lexicon this is rare — personal entries mostly carry public
+        weights far below the 19.26M ceiling — which is why co-equal ranges are
+        enough. If it ever bites, that is a threshold conversation, not a bug.
+        """
+        sources = [
+            (Source(path=Path("/public.dict.yaml")),
+             [entry("甲", 10), entry("乙", 900)]),
+            (Source(path=Path("/personal.dict.yaml"), top=True, boost="log"),
+             [entry("甲", 2877), entry("乙", 1)]),
+        ]
+        merged = {e.word: e.weight for e in merge(sources)}
+        self.assertGreater(merged["乙"], merged["甲"])
+        self.assertEqual(1810.0, merged["甲"])
+        self.assertAlmostEqual(1878.323, merged["乙"], places=3)
+
+    def test_without_the_flag_the_old_stacking_is_unchanged(self):
+        sources = [
+            (Source(path=Path("/public.dict.yaml")), [entry("上线", 500)]),
+            (Source(path=Path("/personal.dict.yaml"), top=True), [entry("上线", 7)]),
+        ]
+        merged = {e.word: e.weight for e in merge(sources)}
+        self.assertEqual(500 + 500 + 7, merged["上线"])
+
+    def test_load_sources_reads_the_flag(self):
+        sources = load_sources(self.write([
+            {"dict": "/a.dict.yaml", "top": True, "boost": "log"},
+            {"dict": "/b.dict.yaml", "top": True},
+        ]))
+        self.assertEqual("log", sources[0].boost)
+        self.assertIsNone(sources[1].boost)
+
+    def test_boost_requires_top(self):
+        with self.assertRaises(ValueError) as caught:
+            load_sources(self.write([{"dict": "/a.dict.yaml", "boost": "log"}]))
+        self.assertIn("top", str(caught.exception))
+
+    def test_unknown_boost_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_sources(self.write([{"dict": "/a.dict.yaml", "top": True,
+                                      "boost": "sqrt"}]))
+
+    def test_boost_with_scale_is_refused(self):
+        # _apply_shaping runs before the boost, so a linear rescale would
+        # compose non-linearly with the log normalisation.
+        with self.assertRaises(ValueError) as caught:
+            load_sources(self.write([{"dict": "/a.dict.yaml", "top": True,
+                                      "boost": "log", "scale": 2}]))
+        self.assertIn("boost", str(caught.exception))
+
+    def test_boost_with_range_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            load_sources(self.write([{"dict": "/a.dict.yaml", "top": True,
+                                      "boost": "log", "range": [1, 200]}]))
+        self.assertIn("boost", str(caught.exception))
+
+
 class WritePairs(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
