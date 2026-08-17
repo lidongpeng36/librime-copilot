@@ -58,7 +58,7 @@ struct RerankOptions {
   // A continuation ranked below this among its key's continuations never
   // promotes. Rank rather than weight share: merged dictionaries live on
   // different scales, and a key can have thousands of continuations.
-  int max_rank = 50;
+  int max_rank = 10;
   // The LLM scoring path -- primary source when it can run; see rerank_llm.h.
   LlmRerankOptions llm;
 };
