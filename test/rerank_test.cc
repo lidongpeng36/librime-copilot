@@ -8,12 +8,21 @@
 
 #include "rerank.h"
 
+#include <rime/candidate.h>
+#include <rime/composition.h>
+#include <rime/menu.h>
+#include <rime/segmentation.h>
+#include <rime/translation.h>
+
 #include <string>
 #include <vector>
 
 using copilot::Entry;
 using copilot::ProviderType;
+using rime::Composition;
+using rime::ConfirmedPrefix;
 using rime::PickPromotion;
+using rime::Segment;
 using rime::TrailingCjkRun;
 
 namespace {
@@ -23,7 +32,103 @@ Entry E(const std::string& text, double freq) { return {text, freq, ProviderType
 constexpr int kMax = 8;
 constexpr int kMaxRank = 50;
 
+// Same builders as test/commit_text_test.cc (see its header comment) —
+// duplicated locally rather than shared because both files build them as
+// small, self-contained anonymous-namespace helpers.
+
+// One already-selected segment carrying a single candidate.
+Segment MakeSelectedSegment(size_t start, size_t end, const std::string& text) {
+  Segment seg(static_cast<int>(start), static_cast<int>(end));
+  seg.status = Segment::kSelected;
+  auto menu = rime::New<rime::Menu>();
+  auto translation = rime::New<rime::FifoTranslation>();
+  translation->Append(rime::New<rime::SimpleCandidate>("test", start, end, text));
+  menu->AddTranslation(translation);
+  seg.menu = menu;
+  seg.selected_index = 0;
+  return seg;
+}
+
+// A selected segment spanning [start, seg_end) whose candidate only converts
+// [start, cand_end) — Rime's "typed yyuu, highlighted 云 (just yy)".
+Segment MakeSelectedPartialSegment(size_t start, size_t seg_end, size_t cand_end,
+                                   const std::string& text) {
+  Segment seg(static_cast<int>(start), static_cast<int>(seg_end));
+  seg.status = Segment::kSelected;
+  auto menu = rime::New<rime::Menu>();
+  auto translation = rime::New<rime::FifoTranslation>();
+  translation->Append(rime::New<rime::SimpleCandidate>("test", start, cand_end, text));
+  menu->AddTranslation(translation);
+  seg.menu = menu;
+  seg.selected_index = 0;
+  return seg;
+}
+
+// A not-yet-selected segment (the shape of `current`, or of something sitting
+// unselected ahead of it).
+Segment MakeUnselectedSegment(size_t start, size_t end) {
+  return Segment(static_cast<int>(start), static_cast<int>(end));
+}
+
 }  // namespace
+
+// ------------------------------------------------------------ ConfirmedPrefix --
+
+TEST(ConfirmedPrefix, EmptyCompositionIsEmptyPrefix) {
+  Composition comp;
+  Segment elsewhere = MakeUnselectedSegment(0, 1);  // not in `comp`
+  EXPECT_EQ("", ConfirmedPrefix(comp, &elsewhere));
+}
+
+TEST(ConfirmedPrefix, CurrentIsTheOnlySegmentAndUnselected) {
+  // The current segment never contributes its own text, selected or not: the
+  // walk stops the instant it reaches `current`.
+  Composition comp;
+  comp.push_back(MakeUnselectedSegment(0, 2));
+  EXPECT_EQ("", ConfirmedPrefix(comp, &comp.back()));
+}
+
+TEST(ConfirmedPrefix, TwoSelectedSegmentsBeforeCurrentAreConcatenatedInOrder) {
+  Composition comp;
+  comp.push_back(MakeSelectedSegment(0, 2, "这个"));
+  comp.push_back(MakeSelectedSegment(2, 4, "顺序"));
+  comp.push_back(MakeUnselectedSegment(4, 6));  // current: still being composed
+  EXPECT_EQ("这个顺序", ConfirmedPrefix(comp, &comp.back()));
+}
+
+TEST(ConfirmedPrefix, StopsAtAnUnselectedSegmentRatherThanSkippingIt) {
+  // selected, then UNSELECTED, then current: an unselected segment before
+  // `current` means anything after it isn't actually confirmed, so the walk
+  // must not skip over it to reach segments beyond.
+  Composition comp;
+  comp.push_back(MakeSelectedSegment(0, 2, "这个"));
+  comp.push_back(MakeUnselectedSegment(2, 4));
+  comp.push_back(MakeSelectedSegment(4, 6, "故意"));  // would-be "current"
+  EXPECT_EQ("这个", ConfirmedPrefix(comp, &comp.back()));
+}
+
+TEST(ConfirmedPrefix, PartialCandidateContributesItsOwnTextNotTheInputSubstring) {
+  // Typed "yyuu", picked 云 (spanning only "yy" of the segment's [0,4)): the
+  // prefix must be the candidate's text, not a substring of the segment's
+  // input range.
+  Composition comp;
+  comp.push_back(MakeSelectedPartialSegment(0, 4, 2, "云"));
+  comp.push_back(MakeUnselectedSegment(4, 6));  // current
+  EXPECT_EQ("云", ConfirmedPrefix(comp, &comp.back()));
+}
+
+TEST(ConfirmedPrefix, NullCurrentYieldsEmptyPrefix) {
+  // No known "current" segment means the walk has nothing to safely stop at —
+  // guessing which prefix of the composition is "before" an unidentified
+  // segment would risk fabricating context, so this returns no prefix at all
+  // rather than the whole composition. Mirrors the "drop rather than
+  // misattribute" rule already used for pending_trace_span_ in
+  // rerank_filter.cc.
+  Composition comp;
+  comp.push_back(MakeSelectedSegment(0, 2, "这个"));
+  comp.push_back(MakeSelectedSegment(2, 4, "顺序"));
+  EXPECT_EQ("", ConfirmedPrefix(comp, nullptr));
+}
 
 // ---------------------------------------------------------------- context --
 

@@ -2,10 +2,18 @@
 
 // Pure decisions behind contextual candidate re-ranking (see rerank_filter.h).
 //
-// Two steps, both free of Rime types so they can be unit-tested directly
-// (test/rerank_test.cc):
-//   1. TrailingCjkRun  — raw text before the caret  -> usable n-gram context
-//   2. PickPromotion   — context's continuations    -> which candidate to lift
+// Three steps, all free of any engine/session state so they can be
+// unit-tested directly (test/rerank_test.cc) without standing up Rime:
+//   1. ConfirmedPrefix — composition's earlier segments -> text confirmed so far
+//   2. TrailingCjkRun  — raw text before the caret      -> usable n-gram context
+//   3. PickPromotion   — context's continuations        -> which candidate to lift
+//
+// ConfirmedPrefix does need real Rime types (Composition/Segment), which is
+// heavier than the other two need — that's intentional, it's what lets a test
+// drive it without an engine.
+
+#include <rime/candidate.h>
+#include <rime/composition.h>
 
 #include <string>
 #include <vector>
@@ -54,6 +62,44 @@ inline std::string TrailingCjkRun(const std::string& text, int max_chars) {
     return {};
   }
   return std::string(utf8(n - taken, -1));
+}
+
+// The text of the composition's segments already confirmed before `current` —
+// i.e. what the user selected earlier in the SAME still-uncommitted
+// composition (this 顺序 in "这个|顺序" once 这个 has been picked).
+// `surrounding->before` cannot see this: it is real application text, and
+// nothing has been committed to the application yet. Left out, the re-ranker
+// keys on stale context for every segment but the first — measured on a real
+// corpus, roughly 1500 of 3819 segments (39%) are the second or later segment
+// of their composition.
+//
+// `current == nullptr` means no segment could safely be identified as
+// "current" (see AppliesToSegment/Apply in rerank_filter.cc for when that
+// happens). With nothing to stop the walk at, there is no way to tell how
+// much of the composition counts as "before" it, so this returns no prefix
+// rather than guess — the same "drop rather than misattribute" call already
+// made for pending_trace_span_ there.
+inline std::string ConfirmedPrefix(const Composition& composition, const Segment* current) {
+  if (!current) {
+    return {};
+  }
+  std::string prefix;
+  for (const Segment& seg : composition) {
+    if (&seg == current) {
+      break;
+    }
+    if (seg.status < Segment::kSelected) {
+      // An unselected segment before `current` means the user has not
+      // actually confirmed anything past it — Rime lets input segments be
+      // revisited while still composing, so treating a later segment's
+      // selection as settled would fabricate context that isn't there yet.
+      break;
+    }
+    if (auto candidate = seg.GetSelectedCandidate()) {
+      prefix += candidate->text();
+    }
+  }
+  return prefix;
 }
 
 // Which candidate to promote, and how well the db ranks it.
