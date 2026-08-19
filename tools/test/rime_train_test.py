@@ -239,3 +239,53 @@ class Isolation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VocabTest(unittest.TestCase):
+    """Encoding must match what llama.cpp's SPM tokenizer does with the same
+    token list, or every score measured offline describes a different
+    segmentation from the one inference uses. Verified end to end by
+    export.py's --check: torch -27.9069, llama.cpp -27.9071."""
+
+    def setUp(self):
+        from rime_train import vocab as _vocab
+        self.mod = _vocab
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        path = Path(self.tmp.name) / "c.dict.yaml"
+        path.write_text("---\nname: t\n...\n继\tji\t1\n续\txu\t1\n修\txiu\t1\n吧\tba\t1\n",
+                        encoding="utf-8")
+        self.pieces = self.mod.build(path)
+        self.v = self.mod.Vocab(self.pieces)
+
+    def test_specials_then_bytes_then_characters(self):
+        self.assertEqual(self.pieces[:3], self.mod.SPECIALS)
+        self.assertEqual(self.pieces[3], "<0x00>")
+        self.assertEqual(self.pieces[258], "<0xFF>")
+        self.assertEqual(self.pieces[259], "继")
+
+    def test_a_known_character_is_one_token(self):
+        self.assertEqual(len(self.v.encode("继续修吧")), 4)
+
+    def test_an_unknown_character_falls_back_to_its_utf8_bytes(self):
+        # 8k characters is not the world; byte fallback is what a
+        # character-level vocabulary needs to cover the rest.
+        ids = self.v.encode("✓")
+        self.assertEqual(len(ids), 3)
+        self.assertTrue(all(self.v.byte_base <= i < self.v.byte_base + 256 for i in ids))
+
+    def test_round_trips_through_both_paths(self):
+        text = "继续修吧 ok ✓"
+        self.assertEqual(self.v.decode(self.v.encode(text)), text)
+
+    def test_bos_is_prepended_only_when_asked(self):
+        self.assertEqual(self.v.encode("继", bos=True)[0], self.mod.BOS_ID)
+        self.assertNotEqual(self.v.encode("继")[0], self.mod.BOS_ID)
+
+    def test_the_vocabulary_fits_uint16(self):
+        # train.py stores token ids as uint16 to halve what each step reads.
+        self.assertLess(len(self.v), 65536)
+
+    def test_ascii_is_present_for_the_latin_half_of_the_corpus(self):
+        for ch in "abz09.,":
+            self.assertIn(ch, self.v.ids)

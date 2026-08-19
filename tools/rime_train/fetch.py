@@ -12,8 +12,20 @@ from pathlib import Path
 
 from .sources import Source
 
+# huggingface.co is reachable from the training host but serves at about
+# 1 kB/s there, which is not a download; the same file over hf-mirror.com
+# measured 6.9 MB/s. The mirror is therefore not a convenience, it is the
+# difference between an hour and a month, and it is a host swap rather than a
+# different API -- the paths are identical.
+DEFAULT_MIRROR = "hf-mirror.com"
 
-def fetch(source: Source, cache: Path, force: bool = False) -> Path:
+
+def mirrored(url: str, mirror: str | None) -> str:
+    return url.replace("huggingface.co", mirror, 1) if mirror else url
+
+
+def fetch(source: Source, cache: Path, force: bool = False,
+          mirror: str | None = None) -> Path:
     import requests  # lazy: every other module imports on a stock interpreter
 
     cache.mkdir(parents=True, exist_ok=True)
@@ -22,9 +34,12 @@ def fetch(source: Source, cache: Path, force: bool = False) -> Path:
         print(f"already present: {target} ({target.stat().st_size} bytes)")
         return target
 
+    url = mirrored(source.url, mirror)
+    if url != source.url:
+        print(f"  via {mirror}", file=sys.stderr)
     partial = target.with_name(target.name + ".part")
     written = 0
-    with requests.get(source.url, stream=True, timeout=60) as response:
+    with requests.get(url, stream=True, timeout=60) as response:
         response.raise_for_status()
         total = int(response.headers.get("content-length", 0))
         with open(partial, "wb") as handle:

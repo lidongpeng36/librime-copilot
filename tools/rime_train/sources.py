@@ -56,15 +56,22 @@ SOURCES = {
         pre_tokenized=True,
         note="LCCC large: same cleaning, more of it",
     ),
-    # One ~1.3GB shard of Chinese web text. Breadth, so ordinary phrasing that
-    # is neither chat nor essay is not starved. More shards exist (437 of
-    # them); one is already past what a 3-and-4-gram table needs.
-    "skypile-0": Source(
-        name="skypile-0",
-        url=("https://huggingface.co/datasets/Skywork/SkyPile-150B/resolve/main/"
-             "data/2020-40_zh_head_0000.jsonl"),
+}
+
+# SkyPile ships 437 shards of ~1.3GB each, named by crawl and rank. One is
+# already past what a 3-and-4-character collocation table needs; a 43M-parameter
+# model wants billions of tokens, and each shard yields roughly 263M characters
+# after normalization, so training scale is measured in shards rather than in
+# corpora. `head` shards come first: SkyPile ranks them by a quality model, so
+# taking them in order takes the better text first.
+_SKYPILE = "https://huggingface.co/datasets/Skywork/SkyPile-150B/resolve/main/data/"
+_SKYPILE_SHARDS = [f"2020-40_zh_head_{i:04d}.jsonl" for i in range(18)]
+
+for _i, _shard in enumerate(_SKYPILE_SHARDS):
+    SOURCES[f"skypile-{_i}"] = Source(
+        name=f"skypile-{_i}",
+        url=_SKYPILE + _shard,
         register="general",
         field="text",
-        note="SkyPile-150B, first shard",
-    ),
-}
+        note=f"SkyPile-150B {_shard}",
+    )

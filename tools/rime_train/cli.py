@@ -20,6 +20,12 @@ DEFAULT_CACHE = Path.home() / ".local/share/rime-train"
 DEFAULT_CHARSET = Path.home() / ".local/share/rime-corpus/rime-dir/cn_dicts/8105.dict.yaml"
 
 
+def _fetch_default_mirror() -> str:
+    from .fetch import DEFAULT_MIRROR
+
+    return DEFAULT_MIRROR
+
+
 def _typeable(args) -> frozenset[str]:
     path = Path(args.charset)
     if not path.is_file():
@@ -34,7 +40,7 @@ def cmd_fetch(args) -> int:
     from . import fetch as _fetch
 
     for name in args.source:
-        path = _fetch.fetch(SOURCES[name], Path(args.cache))
+        path = _fetch.fetch(SOURCES[name], Path(args.cache), mirror=args.mirror)
         print(f"{name} -> {path}")
     return 0
 
@@ -118,6 +124,17 @@ def cmd_count(args) -> int:
     return 0
 
 
+def cmd_tokenize(args) -> int:
+    """Text -> uint16 token ids on disk, once, for the training loader."""
+    from .train import tokenize_corpus
+    from .vocab import Vocab, build as build_vocab
+
+    vocab = Vocab(build_vocab(Path(args.chars)))
+    total = tokenize_corpus(Path(args.corpus), vocab, Path(args.output), args.limit)
+    print(f"{total:,} tokens ({total/1e9:.3f}B, vocab {len(vocab)}) -> {args.output}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rime-train")
     parser.add_argument("--cache", default=str(DEFAULT_CACHE))
@@ -125,6 +142,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     fetch = sub.add_parser("fetch", help="download a source (the only network step)")
     fetch.add_argument("source", nargs="+", choices=list(SOURCES))
+    # Takes its value explicitly rather than as an optional one: with
+    # `nargs="?"` argparse swallows the first positional after it, so
+    # `--mirror lccc-base skypile-0` set the mirror host to "lccc-base" and
+    # then tried to resolve it. Required wherever the origin is throttled --
+    # huggingface.co serves the training host at ~1 kB/s, hf-mirror.com at
+    # 6.9 MB/s.
+    fetch.add_argument("--mirror", default=None, metavar="HOST",
+                       help=f"swap huggingface.co for this host, e.g. {_fetch_default_mirror()}")
     fetch.set_defaults(func=cmd_fetch)
 
     build = sub.add_parser("build", help="normalize, split, filter and dedup into sentences")
@@ -149,6 +174,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     count.add_argument("--shards", type=int, default=8,
                        help="passes over the corpus; memory scales as 1/shards")
     count.set_defaults(func=cmd_count)
+
+    tokenize = sub.add_parser("tokenize", help="corpus text -> uint16 token ids")
+    tokenize.add_argument("--corpus", required=True)
+    tokenize.add_argument("--chars", required=True)
+    tokenize.add_argument("--output", required=True)
+    tokenize.add_argument("--limit", type=int, default=None)
+    tokenize.set_defaults(func=cmd_tokenize)
 
     args = parser.parse_args(argv)
     return args.func(args)

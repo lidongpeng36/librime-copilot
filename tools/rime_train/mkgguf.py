@@ -57,6 +57,10 @@ def main():
     ap.add_argument("--heads", type=int, default=6)
     ap.add_argument("--kv-heads", type=int, default=None)
     ap.add_argument("--ctx", type=int, default=512)
+    ap.add_argument("--dtype", default="f32", choices=("f32", "f16"),
+                    help="tensor type; f16 halves the memory traffic this "
+                         "workload is bound by, so latency measured in f32 is "
+                         "an upper bound on a deployable model")
     ap.add_argument("--chars", required=True,
                     help="a .dict.yaml whose single-character entries become the vocabulary")
     args = ap.parse_args()
@@ -92,14 +96,28 @@ def main():
     w.add_unk_token_id(0)
     w.add_bos_token_id(1)
     w.add_eos_token_id(2)
+    # SPM prepends U+2581 ("thin space") to the input unless told not to, and
+    # U+2581 is not in a character-level vocabulary -- so llama.cpp byte-fell
+    # back on it and tokenized 继续修吧 as 7 tokens where torch gave 4. Caught
+    # by export.py's agreement check, which is the only place a tokenizer
+    # disagreement is visible: the model still loads, still scores, and is
+    # still wrong.
+    w.add_add_space_prefix(False)
     w.add_add_bos_token(True)
     w.add_add_eos_token(False)
 
     rng = np.random.default_rng(0)
 
+    dtype = np.float32 if args.dtype == "f32" else np.float16
+
     def t(name, shape):
-        # float32 so this measures architecture, not a quantization scheme.
-        w.add_tensor(name, (rng.standard_normal(shape) * 0.02).astype(np.float32))
+        # 1-D tensors are the RMSNorm weights, and real GGUF models keep them
+        # F32 whatever the matrices are: ggml multiplies them against F32
+        # activations and aborts on a mixed-type binary op
+        # ("unsupported types: dst: f32, src0: f32, src1: f16"). Quantizing
+        # them would save 30 kB and cost the model running at all.
+        chosen = np.float32 if len(shape) == 1 else dtype
+        w.add_tensor(name, (rng.standard_normal(shape) * 0.02).astype(chosen))
 
     t("token_embd.weight", (n_vocab, args.dim))
     for i in range(args.layers):
