@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Entry point for the training-corpus pipeline."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from rime_train.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())
