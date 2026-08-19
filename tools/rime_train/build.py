@@ -45,13 +45,23 @@ def texts_from_line(line: str, source: Source) -> list[str]:
 
 
 def sentences(texts: Iterable[str], typeable: frozenset[str],
-              pre_tokenized: bool = False) -> Iterator[str]:
-    """Normalized Han runs that this schema could actually produce."""
+              pre_tokenized: bool = False, han_only: bool = True) -> Iterator[str]:
+    """Normalized text this schema could actually produce.
+
+    `han_only` picks the consumer. The n-gram wants maximal Han runs, because
+    that is all octagram ever looks up. A language model wants the punctuation,
+    Latin and digits too, because that is what it will be asked to condition
+    on -- 0% of the evaluation corpus's scoring contexts end in a Han
+    character. Training on Han runs and scoring against punctuated context is
+    not a simplification; it hands the model untrained input at exactly the
+    position that decides the score. See normalize.text_sentences.
+    """
+    split = normalize.han_sentences if han_only else normalize.text_sentences
     for text in texts:
         text = normalize.normalize(text)
         if pre_tokenized:
             text = normalize.join_han_tokens(text)
-        for sentence in normalize.han_sentences(text):
+        for sentence in split(text):
             if _charset.is_typeable(sentence, typeable):
                 yield sentence
 
@@ -72,13 +82,13 @@ def stream_source(path: Path) -> Iterator[str]:
 
 
 def build(path: Path, source: Source, typeable: frozenset[str],
-          limit_lines: int | None = None) -> Iterator[str]:
+          limit_lines: int | None = None, han_only: bool = True) -> Iterator[str]:
     """The whole pipeline for one source, streaming and deduplicated."""
     def raw() -> Iterator[str]:
         for index, line in enumerate(stream_source(path)):
             if limit_lines is not None and index >= limit_lines:
                 return
             yield from sentences(texts_from_line(line, source), typeable,
-                                 source.pre_tokenized)
+                                 source.pre_tokenized, han_only)
 
     yield from dedup.unique(raw())

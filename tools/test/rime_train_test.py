@@ -10,10 +10,12 @@ from rime_train import build, charset, dedup, isolation, ngram, normalize
 
 
 class Normalize(unittest.TestCase):
-    def test_full_width_latin_and_digits_fold_to_ascii(self):
-        # The user's own keyboard produces ASCII; leaving both forms in the
-        # corpus splits the counts for what is the same text.
-        self.assertEqual(normalize.normalize("ＡＢ１２"), "AB12")
+    def test_full_width_forms_are_preserved_not_folded(self):
+        """NFKC folding looked like consistency and was a training/inference
+        mismatch: the evaluation contexts hold 4062 ASCII commas AND 1827
+        full-width ones, and nothing normalizes them at inference."""
+        self.assertEqual(normalize.normalize("好的，继续"), "好的，继续")
+        self.assertEqual(normalize.normalize("ＡＢ１２"), "ＡＢ１２")
 
     def test_control_characters_are_dropped_and_whitespace_collapsed(self):
         self.assertEqual(normalize.normalize("  你好\x07  世界 "), "你好 世界")
@@ -32,6 +34,14 @@ class Normalize(unittest.TestCase):
     def test_text_with_no_han_yields_nothing(self):
         self.assertEqual(normalize.han_sentences("git commit -m 'x'"), [])
 
+    def test_spaces_around_punctuation_are_removed_too(self):
+        # "道歉 !" would teach a space before every exclamation mark.
+        self.assertEqual(normalize.join_han_tokens("道歉 ！ 好 的"), "道歉！好的")
+
+    def test_a_space_next_to_latin_or_digits_survives(self):
+        self.assertEqual(normalize.join_han_tokens("SEED 早上"), "SEED 早上")
+        self.assertEqual(normalize.join_han_tokens("运行 3 次"), "运行 3 次")
+
     def test_word_separating_spaces_between_han_are_removed(self):
         """LCCC ships pre-tokenized. Left alone, han_sentences would shatter
         every utterance into one-word fragments and no 3-or-4 character
@@ -42,11 +52,7 @@ class Normalize(unittest.TestCase):
             normalize.join_han_tokens("你 去 那儿 竟然 不喊 我"), "你去那儿竟然不喊我"
         )
 
-    def test_spaces_around_latin_are_kept(self):
-        # Only spaces with Han on BOTH sides are word separators.
-        self.assertEqual(
-            normalize.join_han_tokens("竟然 SEED 早上"), "竟然 SEED 早上"
-        )
+
 
     def test_joining_then_splitting_recovers_whole_utterances(self):
         joined = normalize.join_han_tokens("领个 搓衣板 去 吧")
@@ -289,3 +295,32 @@ class VocabTest(unittest.TestCase):
     def test_ascii_is_present_for_the_latin_half_of_the_corpus(self):
         for ch in "abz09.,":
             self.assertIn(ch, self.v.ids)
+
+    def test_cjk_punctuation_is_one_token_each(self):
+        # Otherwise each costs three byte-fallback tokens whose embeddings
+        # barely train, and the eval contexts hold 1827 full-width commas.
+        for ch in "，。？！“”（）":
+            self.assertEqual(len(self.v.encode(ch)), 1, ch)
+
+
+class TextSentences(unittest.TestCase):
+    """What han_sentences throws away is exactly what a language model
+    conditions on. Measured on the evaluation corpus: 0% of scoring contexts
+    end in a Han character, 77.3% end in something else."""
+
+    def test_punctuation_latin_and_digits_survive(self):
+        got = normalize.text_sentences("看下当前的项目. 我发现 build.py 运行了 3 次,怎么办?")
+        self.assertEqual(got, ["看下当前的项目. 我发现 build.py 运行了 3 次,怎么办?"])
+
+    def test_han_only_splitting_loses_all_of_it(self):
+        # The contrast this exists for.
+        text = "看下当前的项目. 我发现 build.py 运行了"
+        self.assertEqual(normalize.han_sentences(text), ["看下当前的项目", "我发现", "运行了"])
+
+    def test_sentence_enders_split_but_commas_do_not(self):
+        got = normalize.text_sentences("好的,继续吧。然后重测")
+        self.assertEqual(got, ["好的,继续吧。", "然后重测"])
+
+    def test_a_chunk_with_no_han_is_dropped(self):
+        # Latin is wanted as context, not as something to model.
+        self.assertEqual(normalize.text_sentences("just english here. and more"), [])

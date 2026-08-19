@@ -57,7 +57,8 @@ def cmd_build(args) -> int:
             if not path.is_file():
                 print(f"{name}: not fetched ({path})", file=sys.stderr)
                 return 1
-            for sentence in _build.build(path, source, typeable, args.limit_lines):
+            for sentence in _build.build(path, source, typeable, args.limit_lines,
+                                         han_only=not args.keep_punctuation):
                 handle.write(sentence + "\n")
                 per_source[name] += 1
             print(f"  {name} ({source.register}): {per_source[name]} sentences")
@@ -158,6 +159,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     build.add_argument("--charset", default=str(DEFAULT_CHARSET))
     build.add_argument("--limit-lines", type=int, default=None,
                        help="stop after this many input lines per source")
+    build.add_argument("--keep-punctuation", action="store_true",
+                       help="keep punctuation, Latin and digits -- required for "
+                            "language-model training, wrong for the n-gram")
     build.set_defaults(func=cmd_build)
 
     isolate = sub.add_parser("isolate", help="check a built corpus against the eval set")

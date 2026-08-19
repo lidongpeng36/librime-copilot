@@ -22,6 +22,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
+# CJK punctuation and the full-width forms real Chinese text is written with.
+# Not derivable from the character table, which is a table of Han characters,
+# and not reachable through NFKC either since `normalize` deliberately no
+# longer folds them. Without these each one costs three byte-fallback tokens
+# whose embeddings barely train -- and the evaluation contexts contain 1827
+# full-width commas alone.
+CJK_PUNCTUATION = list("，。、；：？！“”‘’（）【】《》〈〉…—～·「」『』〔〕％＃＆＊－＋／＝")
+
 SPECIALS = ["<unk>", "<s>", "</s>"]
 UNK_ID, BOS_ID, EOS_ID = 0, 1, 2
 BYTE_TOKENS = [f"<0x{b:02X}>" for b in range(256)]
@@ -51,6 +59,10 @@ def build(dict_path: Path) -> list[str]:
     pieces = list(SPECIALS) + list(BYTE_TOKENS)
     seen = set(pieces)
     for ch in characters(dict_path):
+        if ch not in seen:
+            seen.add(ch)
+            pieces.append(ch)
+    for ch in CJK_PUNCTUATION:
         if ch not in seen:
             seen.add(ch)
             pieces.append(ch)
