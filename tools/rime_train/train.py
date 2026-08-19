@@ -83,6 +83,9 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--warmup", type=int, default=500)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the model; small models are launch-bound "
+                         "and this is where most of the MFU is")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--save-every", type=int, default=2000)
     args = ap.parse_args()
@@ -101,9 +104,15 @@ def main() -> int:
           f"{args.steps * args.batch * args.accum * args.seq / 1e9:.2f}B will be seen",
           flush=True)
 
+    if args.compile:
+        model = torch.compile(model)
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.1)
-    scaler = torch.amp.GradScaler(device)
+    # No GradScaler: it exists for fp16's narrow exponent range, and bf16 has
+    # fp32's. Keeping it would add an unscale pass and a host sync per step for
+    # nothing -- and on a model this small the step is short enough that the
+    # sync is a measurable share of it.
     stream = batches(tokens, args.batch, args.seq, device)
     start = time.time()
     for step in range(1, args.steps + 1):
@@ -124,12 +133,10 @@ def main() -> int:
             x, y = next(stream)
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 _, loss = model(x, y)
-            scaler.scale(loss / args.accum).backward()
+            (loss / args.accum).backward()
             total += loss.item() / args.accum
-        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(opt)
-        scaler.update()
+        opt.step()
 
         if step % args.log_every == 0:
             seen = step * args.batch * args.accum * args.seq
