@@ -128,7 +128,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  llama_log_set([](ggml_log_level, const char*, void*) {}, nullptr);
+  if (!getenv("SCORE_CANDIDATES_VERBOSE"))
+    llama_log_set([](ggml_log_level, const char*, void*) {}, nullptr);
   llama_backend_init();
 
   llama_model_params model_params = llama_model_default_params();
