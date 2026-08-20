@@ -105,10 +105,10 @@ TEST(SerializeJsonl, OmitsTheLlmRecordWhenAbsent) {
   EXPECT_EQ(SerializeJsonl(e).find("\"llm\""), std::string::npos);
 }
 
-TEST(SerializeJsonl, SchemaVersionIsTwo) {
+TEST(SerializeJsonl, SchemaVersionIsThree) {
   Event e;
   e.ts = "t";
-  EXPECT_NE(SerializeJsonl(e).find("\"v\":2"), std::string::npos);
+  EXPECT_NE(SerializeJsonl(e).find("\"v\":3"), std::string::npos);
 }
 
 // The per-event stream only records hard cases (ShouldRecord), which is right
@@ -126,7 +126,7 @@ TEST(SerializeStatsJsonl, CarriesCountersAndItsOwnType) {
   EXPECT_NE(line.find("\"type\":\"stats\""), std::string::npos);
   EXPECT_NE(line.find("\"llm_acted\":5310"), std::string::npos);
   EXPECT_NE(line.find("\"cold\":519"), std::string::npos);
-  EXPECT_NE(line.find("\"v\":2"), std::string::npos);
+  EXPECT_NE(line.find("\"v\":3"), std::string::npos);
 }
 
 // No stored `warm_hit`: under the fallback chain kCold and kNone are mutually
@@ -140,4 +140,93 @@ TEST(SerializeStatsJsonl, HasNoWarmHitField) {
   s.llm_acted = 1;
   s.skip_counts["cold"] = 1;
   EXPECT_EQ(SerializeStatsJsonl(s).find("warm_hit"), std::string::npos);
+}
+
+// A decline must carry what the model wanted. This is the `nali` case from
+// the first hour of live data: incumbent 哪里, the user chose 那里, margin
+// 0.88 -- and until now the record could not say whether 那里 was what the
+// model preferred, which is the difference between "lower the margin" and
+// "the model is wrong".
+TEST(SerializeJsonl, CarriesTheModelsPickWhenNothingWasPromoted) {
+  Event e;
+  e.ts = "2026-08-20T22:18:09+0800";
+  e.machine = "M1";
+  e.sel = "那里";
+  e.sel_idx = 1;
+  LlmRecord llm;
+  llm.incumbent = "哪里";
+  llm.best = "那里";
+  llm.best_from = 1;
+  llm.margin = 0.8799f;
+  llm.n_scored = 3;
+  llm.skip = "margin";
+  e.llm = llm;
+
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_EQ(j["v"], 3);
+  EXPECT_EQ(j["llm"]["best"], "那里");
+  EXPECT_EQ(j["llm"]["best_from"], 1);
+  EXPECT_EQ(j["llm"]["text"], "");  // nothing was promoted
+  EXPECT_EQ(j["llm"]["skip"], "margin");
+}
+
+// Agreement is a value, not an absence: best == incumbent is how the report
+// tells a model-quality problem from a threshold one.
+TEST(SerializeJsonl, RecordsAgreementWithTheHeadAsAValue) {
+  Event e;
+  LlmRecord llm;
+  llm.incumbent = "阅读";
+  llm.best = "阅读";
+  llm.best_from = 0;
+  llm.margin = 0.0f;
+  llm.skip = "margin";
+  e.llm = llm;
+
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_EQ(j["llm"]["best"], j["llm"]["incumbent"]);
+  EXPECT_EQ(j["llm"]["best_from"], 0);
+}
+
+TEST(SerializeJsonl, CarriesTheSpanGatesLeftovers) {
+  Event e;
+  LlmRecord llm;
+  llm.incumbent = "管理业";
+  llm.best = "管理业";
+  llm.skip = "margin";
+  llm.dropped = {"管理", "惯例"};
+  e.llm = llm;
+
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_EQ(j["llm"]["dropped"].size(), 2u);
+  EXPECT_EQ(j["llm"]["dropped"][0], "管理");
+}
+
+TEST(SerializeJsonl, WritesAnEmptyDroppedArrayRatherThanOmittingIt) {
+  // Absent and empty are different evidence: absent is a v2 line, empty is a
+  // v3 line where the gate removed nothing (or same_span_only is off).
+  Event e;
+  e.llm = LlmRecord{};
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  ASSERT_TRUE(j["llm"].contains("dropped"));
+  EXPECT_TRUE(j["llm"]["dropped"].empty());
+}
+
+TEST(SerializeJsonl, CarriesWhyTheModelDidNotEngage) {
+  Event e;
+  e.sel = "页";
+  e.sel_idx = 1;
+  e.llm_skip = "noctx";
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_EQ(j["llm_skip"], "noctx");
+  EXPECT_FALSE(j.contains("llm"));  // never engaged: no llm object at all
+}
+
+// Omitted rather than written empty: "no trace at all" and "a trace saying
+// none" are different evidence, and an empty string is not one of the eight
+// SkipReasonName values.
+TEST(SerializeJsonl, OmitsLlmSkipWhenThereWasNoTrace) {
+  Event e;
+  e.sel = "的";
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_FALSE(j.contains("llm_skip"));
 }

@@ -153,6 +153,15 @@ bool RerankTranslation::Replenish() {
     for (const auto& cand : same_span) {
       window_texts.push_back(cand->text());
     }
+    // Recorded, never scored -- see DroppedBySpan. Uses the full window's
+    // texts, not `to_score`, because the question is what the SPAN gate
+    // removed, not what the top_n truncation did.
+    std::vector<std::string> all_texts;
+    all_texts.reserve(window.size());
+    for (const auto& cand : window) {
+      all_texts.push_back(cand->text());
+    }
+    trace.llm.dropped = DroppedBySpan(all_texts, same_span_positions, options_.llm.top_n);
     // Truncated before scoring, not after: the PoC measured scoring the full
     // window at 8x the latency of top_n for no accuracy gain (design doc,
     // decision 3) -- Decide's own top_n limit is too late to save that cost.
@@ -201,6 +210,17 @@ bool RerankTranslation::Replenish() {
     trace.llm.skip = llm_rerank::SkipReasonName(decision.skip);
     if (decision.incumbent_index >= 0) {
       trace.llm.incumbent = to_score[static_cast<size_t>(decision.incumbent_index)];
+    }
+    // The model's pick, recorded whether or not it cleared the margin: a
+    // decline that names no candidate cannot distinguish "the model agreed
+    // with the head" from "the threshold blocked the model's pick".
+    // best_index indexes `to_score`, which is a prefix of `window_texts`, which
+    // is parallel to `same_span_positions` -- so the same mapping the promoted
+    // branch uses applies here.
+    if (decision.best_index >= 0) {
+      const size_t best_local = static_cast<size_t>(decision.best_index);
+      trace.llm.best = to_score[best_local];
+      trace.llm.best_from = static_cast<int>(same_span_positions[best_local]);
     }
     if (decision.promote_index >= 0) {
       const size_t local_idx = static_cast<size_t>(decision.promote_index);

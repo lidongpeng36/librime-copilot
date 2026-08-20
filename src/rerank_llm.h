@@ -74,6 +74,12 @@ inline const char* SkipReasonName(SkipReason r) {
 
 struct Decision {
   int promote_index = -1;  // index into `candidates`; -1 means leave the order alone
+  // The best-scoring all-Han candidate, set whether or not it was promoted.
+  // `best_index == incumbent_index` is the model AGREEING with the head, not a
+  // degenerate value: it is the only signal that separates a model-quality
+  // problem (lowering `margin` cannot help) from a threshold problem (lowering
+  // it recovers the segment). -1 only when there is no all-Han candidate.
+  int best_index = -1;
   SkipReason skip = SkipReason::kNoHan;
   int incumbent_index = -1;  // the first all-Han candidate
   float margin = 0.0f;       // challenger score minus incumbent score
@@ -129,6 +135,7 @@ inline Decision Decide(const std::vector<std::string>& candidates,
     }
   }
 
+  d.best_index = best;
   if (d.incumbent_index < 0) {
     d.skip = SkipReason::kNoHan;
     return d;

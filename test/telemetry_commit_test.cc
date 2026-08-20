@@ -87,6 +87,20 @@ RerankTrace TraceForLlm(const std::string& input, size_t start, size_t end,
   return t;
 }
 
+// A trace whose LLM path never engaged, carrying the reason.
+RerankTrace TraceSkipped(const std::string& input, size_t start, size_t end,
+                         llm_rerank::SkipReason reason) {
+  RerankTrace t;
+  t.valid = true;
+  t.input = input;
+  t.start = start;
+  t.end = end;
+  t.ctx = "";
+  t.src = "tmux";
+  t.llm_skip = reason;
+  return t;
+}
+
 // The store the filter writes into, holding just these traces.
 RerankTraceStore StoreOf(const std::vector<RerankTrace>& traces) {
   RerankTraceStore store;
@@ -460,4 +474,34 @@ TEST(ContextClear, FiresTheUpdateNotifierWithTheCompositionEmptied) {
   connection.disconnect();
   EXPECT_EQ(updates, 1);
   EXPECT_FALSE(composing_when_notified);
+}
+
+// The `ww` case from live data: the db context was empty, so the segment
+// ended before scoring. The event must say so and must NOT carry an llm
+// object -- an all-default one with skip:"" is what made these look like
+// declines to the analyser.
+TEST(BuildCommitEvents, ANonEngagedSegmentReportsItsReasonAndNoLlmObject) {
+  Context ctx;
+  ctx.set_input("ww");
+  ctx.composition().Reset("ww");
+  ctx.composition().push_back(MakeSegment(0, 2, {"为", "未", "位"}, 1));
+  auto store = StoreOf({TraceSkipped("ww", 0, 2, llm_rerank::SkipReason::kNoContext)});
+
+  const auto events = Build(&ctx, &store);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].llm_skip, "noctx");
+  EXPECT_FALSE(events[0].llm.has_value());
+}
+
+TEST(BuildCommitEvents, AnEngagedSegmentReportsNoneAndKeepsItsLlmObject) {
+  Context ctx;
+  ctx.set_input("guyi");
+  ctx.composition().Reset("guyi");
+  ctx.composition().push_back(MakeSegment(0, 4, {"顾忌", "故意"}, 1));
+  auto store = StoreOf({TraceForLlm("guyi", 0, 4, "故意", 1, "none")});
+
+  const auto events = Build(&ctx, &store);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].llm_skip, "none");
+  ASSERT_TRUE(events[0].llm.has_value());
 }

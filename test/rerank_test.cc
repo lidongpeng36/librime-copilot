@@ -21,6 +21,7 @@ using copilot::Entry;
 using copilot::ProviderType;
 using rime::Composition;
 using rime::ConfirmedPrefix;
+using rime::DroppedBySpan;
 using rime::PickPromotion;
 using rime::Segment;
 using rime::TrailingCjkRun;
@@ -353,4 +354,34 @@ TEST(ScoringContext, MixedLatinAndHanSurvivesIntact) {
   // characters is context the model was trained to read.
   EXPECT_EQ("build.py 吧", rime::ScoringContext("先去修 build.py 吧", 10));
   EXPECT_EQ("先去修 build.py 吧", rime::ScoringContext("先去修 build.py 吧", 32));
+}
+
+// The span gate's leftovers, recorded so `sel in dropped` can say how often
+// same_span_only had any chance to matter. Recorded, never scored: scoring
+// them would double the per-segment model cost, which is the resource the
+// switch exists to protect.
+TEST(DroppedBySpan, ReturnsTheCandidatesEligibilityLeftOut) {
+  const std::vector<std::string> texts{"管理业", "grliye", "管理", "惯例"};
+  const std::vector<size_t> eligible{0, 1};
+  EXPECT_EQ(DroppedBySpan(texts, eligible, 4), (std::vector<std::string>{"管理", "惯例"}));
+}
+
+TEST(DroppedBySpan, IsEmptyWhenEveryCandidateIsEligible) {
+  const std::vector<std::string> texts{"管理业", "管理"};
+  const std::vector<size_t> eligible{0, 1};
+  EXPECT_TRUE(DroppedBySpan(texts, eligible, 4).empty());
+}
+
+// Capped at the scoring window: beyond it the question is moot, and an
+// unbounded list would grow the log for no decision.
+TEST(DroppedBySpan, StopsAtTheCap) {
+  const std::vector<std::string> texts{"a", "b", "c", "d", "e"};
+  const std::vector<size_t> eligible{0};
+  EXPECT_EQ(DroppedBySpan(texts, eligible, 2), (std::vector<std::string>{"b", "c"}));
+}
+
+TEST(DroppedBySpan, TreatsANonPositiveCapAsRecordNothing) {
+  const std::vector<std::string> texts{"a", "b"};
+  const std::vector<size_t> eligible{0};
+  EXPECT_TRUE(DroppedBySpan(texts, eligible, 0).empty());
 }

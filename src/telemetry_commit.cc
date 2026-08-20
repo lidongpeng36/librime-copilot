@@ -93,6 +93,7 @@ std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* trace
       // worth context we already captured.
       e.ctx = trace->ctx;
       e.src = trace->src;
+      e.llm_skip = llm_rerank::SkipReasonName(trace->llm_skip);
     }
     if (db_promoted) {
       e.rr = trace->record;

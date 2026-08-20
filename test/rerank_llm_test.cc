@@ -133,3 +133,49 @@ TEST(Decide, TruncatesToTheShortestParallelVector) {
   EXPECT_EQ(d.incumbent_index, 0);
   EXPECT_EQ(d.promote_index, -1);
 }
+
+// `best` is what the model preferred, whether or not it cleared the margin.
+// Without it a decline records how far short something fell but not what it
+// was, and "the model agreed with the head" cannot be told apart from "the
+// threshold blocked the model's pick" -- two findings whose fixes are
+// opposite (lower the margin vs. retrain).
+TEST(Decide, BestIndexIsSetWhenTheMarginBlocksThePromotion) {
+  std::vector<std::string> cands{"哪里", "那里"};
+  std::vector<float> lp{-4.0f, -3.5f};  // 那里 scores better, but not by 2.0
+  std::vector<int> nt{2, 2};
+  auto d = Decide(cands, lp, nt, Opts());
+  EXPECT_EQ(d.promote_index, -1);
+  EXPECT_EQ(d.skip, SkipReason::kMargin);
+  EXPECT_EQ(d.best_index, 1);
+  EXPECT_EQ(d.incumbent_index, 0);
+}
+
+// margin == 0.0 means the head IS the model's pick. Reading that as "lost by
+// a hair" is the misreading this field exists to prevent.
+TEST(Decide, BestIndexIsTheIncumbentWhenTheModelAgreesWithTheHead) {
+  std::vector<std::string> cands{"阅读", "月度"};
+  std::vector<float> lp{-2.0f, -9.0f};
+  std::vector<int> nt{2, 2};
+  auto d = Decide(cands, lp, nt, Opts());
+  EXPECT_EQ(d.skip, SkipReason::kMargin);
+  EXPECT_EQ(d.best_index, d.incumbent_index);
+  EXPECT_FLOAT_EQ(d.margin, 0.0f);
+}
+
+TEST(Decide, BestIndexStaysUnsetWithNoHanCandidate) {
+  std::vector<std::string> cands{"nali", "ww"};
+  std::vector<float> lp{-1.0f, -1.0f};
+  std::vector<int> nt{2, 2};
+  auto d = Decide(cands, lp, nt, Opts());
+  EXPECT_EQ(d.skip, SkipReason::kNoHan);
+  EXPECT_EQ(d.best_index, -1);
+}
+
+TEST(Decide, BestIndexEqualsPromoteIndexOnAPromotion) {
+  std::vector<std::string> cands{"guyide", "顾忌", "故意"};
+  std::vector<float> lp{-1.0f, -20.0f, -1.0f};
+  std::vector<int> nt{3, 2, 2};
+  auto d = Decide(cands, lp, nt, Opts());
+  EXPECT_EQ(d.promote_index, 2);
+  EXPECT_EQ(d.best_index, 2);
+}

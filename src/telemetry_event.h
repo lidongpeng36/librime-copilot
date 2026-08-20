@@ -27,10 +27,11 @@ namespace telemetry {
 // Bumped whenever a field changes meaning, so a reader can tell old lines from
 // new ones. Files outlive the code that wrote them.
 //
-// v2 adds `llm` to Event and introduces the stats line (StatsLine /
-// SerializeStatsJsonl); a v1 line has neither `llm` nor `type` and must keep
-// loading unchanged under a v2 reader.
-inline constexpr int kSchemaVersion = 2;
+// v3 adds `best`/`best_from`/`dropped` to LlmRecord and `llm_skip` to Event,
+// and stops emitting an `llm` object for a segment that was never scored (the
+// kNone-without-scoring path fixed in rerank_filter.cc). A v2 line carries
+// none of those and must keep loading unchanged under a v3 reader.
+inline constexpr int kSchemaVersion = 3;
 
 // What the re-ranking filter decided for one segment.
 struct RerankRecord {
@@ -45,22 +46,35 @@ struct RerankRecord {
 
 // What the LLM scoring path decided for one segment.
 struct LlmRecord {
-  std::string text;       // the promoted candidate, empty when nothing moved
-  std::string incumbent;  // the first all-Han candidate it was compared against.
-                          // Without this the "never touch bucket B" invariant
-                          // cannot be verified in production.
-  int from = 0;           // the promoted candidate's position before promotion
-  float margin = 0.0f;    // challenger minus incumbent, normalised. Stored so the
-                          // threshold can be re-swept against real selections
-                          // without a code change.
-  int n_scored = 0;       // how many candidates were actually scored
-  int64_t us = 0;         // scoring time on the input thread -- the same
-                          // quantity RerankTrace::score_us measures (the
-                          // Score() call alone). Measured p50/p90 came in ~2x
-                          // the design's estimate and over its 16ms budget;
-                          // this is what settles that in live use rather than
-                          // on 20 offline samples.
-  std::string skip;       // none|disabled|battery|nomodel|noctx|cold|nohan|margin
+  std::string text;                  // the promoted candidate, empty when nothing moved
+  std::string incumbent;             // the first all-Han candidate it was compared against.
+                                     // Without this the "never touch bucket B" invariant
+                                     // cannot be verified in production.
+  std::string best;                  // the model's top-scoring all-Han candidate, whether or
+                                     // not it was promoted. Equal to `incumbent` when the
+                                     // model agreed with the head -- the one signal that
+                                     // separates a model-quality problem from a threshold
+                                     // one, which `margin` alone cannot: margin 0.0 means
+                                     // agreement, not a near miss.
+  int best_from = 0;                 // its position in the displayed window
+  std::vector<std::string> dropped;  // candidates the same-span gate removed
+                                     // from the scoring window, capped at
+                                     // llm.top_n. Empty when the gate removed
+                                     // nothing OR when same_span_only is off;
+                                     // those two are the same fact for the
+                                     // question this answers.
+  int from = 0;                      // the promoted candidate's position before promotion
+  float margin = 0.0f;               // challenger minus incumbent, normalised. Stored so the
+                                     // threshold can be re-swept against real selections
+                                     // without a code change.
+  int n_scored = 0;                  // how many candidates were actually scored
+  int64_t us = 0;                    // scoring time on the input thread -- the same
+                                     // quantity RerankTrace::score_us measures (the
+                                     // Score() call alone). Measured p50/p90 came in ~2x
+                                     // the design's estimate and over its 16ms budget;
+                                     // this is what settles that in live use rather than
+                                     // on 20 offline samples.
+  std::string skip;                  // none|disabled|battery|nomodel|noctx|cold|nohan|margin
 };
 
 struct Event {
@@ -73,6 +87,11 @@ struct Event {
   int sel_idx = 0;               // selected index in the list as displayed
   std::string sel;               // selected candidate text
   std::vector<std::string> top;  // first telemetry/top_n candidates, in order
+  std::string llm_skip;          // why the model did not engage for this segment, one
+                                 // of the eight SkipReasonName values. Empty only when
+                                 // no trace existed at all. The stats line's aggregate
+                                 // skip_counts cannot be joined back to the segment
+                                 // that failed; this can.
   std::optional<RerankRecord> rr;
   std::optional<LlmRecord> llm;
 };
@@ -145,6 +164,11 @@ inline std::string SerializeJsonl(const Event& e) {
   j["sel_idx"] = e.sel_idx;
   j["sel"] = e.sel;
   j["top"] = e.top;
+  // Omitted rather than written empty: "no trace at all" and "a trace whose
+  // reason was none" are different evidence, and "" is not a SkipReasonName.
+  if (!e.llm_skip.empty()) {
+    j["llm_skip"] = e.llm_skip;
+  }
   if (e.rr) {
     nlohmann::ordered_json r;
     r["key"] = e.rr->key;
@@ -160,6 +184,9 @@ inline std::string SerializeJsonl(const Event& e) {
     nlohmann::ordered_json l;
     l["text"] = e.llm->text;
     l["incumbent"] = e.llm->incumbent;
+    l["best"] = e.llm->best;
+    l["best_from"] = e.llm->best_from;
+    l["dropped"] = e.llm->dropped;
     l["from"] = e.llm->from;
     l["margin"] = RoundFloat(e.llm->margin);
     l["n_scored"] = e.llm->n_scored;

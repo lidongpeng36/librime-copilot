@@ -100,6 +100,33 @@ inline std::vector<size_t> EligibleBySpan(const std::vector<size_t>& ends, bool 
   return eligible;
 }
 
+// The candidates `EligibleBySpan` left out, capped at `cap` entries.
+//
+// `eligible` holds positions into `texts`, ascending, as EligibleBySpan
+// returns them. Recorded for telemetry only: `sel in dropped` is what says how
+// often `same_span_only` had any chance to change the outcome. They are NOT
+// scored -- doing so would double the per-segment model cost, which is the
+// resource the switch exists to protect.
+inline std::vector<std::string> DroppedBySpan(const std::vector<std::string>& texts,
+                                              const std::vector<size_t>& eligible, int cap) {
+  std::vector<std::string> dropped;
+  if (cap <= 0) {
+    return dropped;
+  }
+  std::vector<bool> keep(texts.size(), false);
+  for (size_t i : eligible) {
+    if (i < keep.size()) {
+      keep[i] = true;
+    }
+  }
+  for (size_t i = 0; i < texts.size() && dropped.size() < static_cast<size_t>(cap); ++i) {
+    if (!keep[i]) {
+      dropped.push_back(texts[i]);
+    }
+  }
+  return dropped;
+}
+
 // The run of Han characters immediately before the caret, at most `max_chars`
 // long. Empty when the caret does not sit right after a Han character.
 //
