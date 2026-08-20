@@ -23,6 +23,8 @@ class LLMProvider : public Provider {
     int max_history = 10;
     int n_predict = 8;
     int rank = 5;
+    // KV cache size in tokens; see ClientConfig::n_ctx for what 0 costs.
+    int n_ctx = 512;
     bool battery_active = false;
   };
   LLMProvider(const Config& config, const std::shared_ptr<::copilot::History>& history);

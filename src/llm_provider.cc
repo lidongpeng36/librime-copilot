@@ -45,6 +45,7 @@ LLMProvider::LLMProvider(const Config& c, const std::shared_ptr<::copilot::Histo
 #ifdef USE_SIMPLE_CLIENT
   ClientConfig config;
   config.n_predict = c.n_predict;
+  config.n_ctx = c.n_ctx;
   LOG(INFO) << "LLM model: '" << config_.model << "', n_predict:" << config_.n_predict
             << ", rank:" << config_.rank;
   client_ = std::make_unique<llama::ClientSimple>(config, config_.model,

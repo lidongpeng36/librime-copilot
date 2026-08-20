@@ -736,7 +736,10 @@ ClientSimple::ClientSimple(ClientConfig config, const std::string& model,
   vocab_ = llama_model_get_vocab(model_);
 
   auto ctx_params = llama_context_default_params();
-  ctx_params.n_ctx = 0;
+  // From config, not hardcoded 0. Zero means "the model's declared context",
+  // which for Qwen3-0.6B is 40960 tokens of KV cache -- 4.38 GB -- allocated
+  // whether or not anything ever asks for a prediction.
+  ctx_params.n_ctx = config_.n_ctx;
   ctx_params.n_batch = 512;
   ctx_params.no_perf = false;
   ctx_params.n_threads = std::thread::hardware_concurrency();

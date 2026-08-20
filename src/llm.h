@@ -27,6 +27,15 @@ struct ClientConfig {
   int penalty_last_n = 64;
 
   int n_predict = 64;
+  // KV cache size, in tokens. NOT the model's own context length, which is
+  // what this used to allocate: llm.cc hardcoded `ctx_params.n_ctx = 0`, so
+  // Qwen3-0.6B took its full 40960 -- 112 KB of KV per token, 4.38 GB
+  // resident -- to predict the 8 tokens copilot/llm/n_predict asks for.
+  //
+  // 512 is generous for that job: the prompt is at most `max_history` recent
+  // commits. Raise it via copilot/llm/n_ctx if a caller needs more; 0 restores
+  // the old "whatever the model declares" behaviour and its cost.
+  int n_ctx = 512;
   bool no_perf = true;
   bool apply_chat_template = false;
 };

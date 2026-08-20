@@ -170,6 +170,10 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   // reads to decide whether to build a Scorer -- kept in lockstep with it so
   // "off by default" holds here too and the filter's LOG line ("llm.model=ok"
   // when a scorer exists) still matches reality.
+  // Defaults true: a schema that names copilot/llm/model and expects
+  // predictions keeps getting them. Setting it false is how a schema stops
+  // paying for a model it never uses -- see the construction site below.
+  bool llm_enable = true;
   bool rerank_enable = true;
   bool rerank_llm_enable = false;
   string rerank_llm_model;
@@ -191,14 +195,25 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
       config->GetInt("copilot/llm/max_history", &llm_config.max_history);
       config->GetInt("copilot/llm/n_predict", &llm_config.n_predict);
       config->GetInt("copilot/llm/rank", &llm_config.rank);
+      config->GetInt("copilot/llm/n_ctx", &llm_config.n_ctx);
       config->GetBool("copilot/llm/battery_active", &llm_config.battery_active);
+      config->GetBool("copilot/llm/enable", &llm_enable);
     }
     config->GetBool("copilot/rerank/enable", &rerank_enable);
     config->GetBool("copilot/rerank/llm/enable", &rerank_llm_enable);
     config->GetString("copilot/rerank/llm/model", &rerank_llm_model);
   }
   std::shared_ptr<::copilot::History> history = std::make_shared<::copilot::History>(100);
-  if (!model_name.empty()) {
+  // `enable` gates CONSTRUCTION, not just output, and that distinction is the
+  // whole point: LLMProvider's constructor loads the model and runs a warm-up
+  // prediction immediately (llm_provider.cc), so a schema that merely names a
+  // model paid for it whether or not the `copilot` switch was ever turned on.
+  // Measured on the deployed setup: 4.38 GB resident for a feature the user
+  // had never enabled.
+  //
+  // Defaults to true, so a schema that names a model and expects predictions
+  // keeps getting them; turning this off is the explicit way to stop paying.
+  if (!model_name.empty() && llm_enable) {
     auto r =
         the<ResourceResolver>(Service::instance().CreateResourceResolver(kCopilotLLMResourceType));
     auto model_path = r->ResolvePath(model_name);
@@ -207,6 +222,9 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
       llm_config.model = model_path;
       providers.push_back(std::make_shared<LLMProvider>(llm_config, history));
     }
+  }
+  if (!model_name.empty() && !llm_enable) {
+    LOG(INFO) << "[copilot] LLM: disabled by copilot/llm/enable; model not loaded";
   }
   if (auto db = db_pool_.GetDb(db_name)) {
     if (db->IsOpen() || db->Load()) {
