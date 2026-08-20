@@ -190,6 +190,28 @@ stamp in the vault a second machine reports `lexicon: not cleaned`, and
 acting on that report replaces the pristine export with an already-cleaned
 copy and then pushes it over the genuine one.
 
+**Both directions of the vault refuse to clobber, and the clean stamp is
+checked against the file it describes.** `restore` always protected local
+content; `backup` protected nothing, so a machine holding an *older* file
+pushed it over a newer one and reported success. That is how Mac-Mini's
+June-2025 pristine export replaced the cleaned 8231-entry lexicon another
+machine had vaulted eleven days earlier: `restore` correctly refused to
+overwrite mini's local copy (conflict), then `backup` sent that same copy up.
+`plan_backup` now takes the machine id and refuses when the vault's copy was
+last written by *another* machine — replacing your own is still frictionless,
+or the `--force` reflex becomes automatic. Reconciling goes either way
+(`restore --force` to take theirs, `backup --force` to keep yours), so the
+message names both.
+
+The second half of that incident was silent for a different reason: `status`
+printed the `lexicon:` line straight from the clean stamp, and the stamp is
+vaulted, so mini reported `cleaned 2026-08-17T09:13:29Z, 8231 entries` while
+holding the 1MB raw. It now compares the stamp's `result_sha256` against the
+live `custom.dict.yaml`, and names the pristine-export case specifically —
+that one has a different fix (`restore`, emphatically *not* `backup`) from a
+generic mismatch. A stamp predating those hashes is reported as-is rather
+than turned into a mismatch it cannot disprove.
+
 **The weight convention lives in `dictdb.py` and in `src/db_provider.h` /
 `src/rerank.h`, and must match: larger = more likely.** Writing a rank instead
 of a real weight silently inverts every ordering in the plugin. `Entry.weight`

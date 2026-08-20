@@ -78,7 +78,7 @@ class RoundTrip(unittest.TestCase):
         self.tmp.cleanup()
 
     def backup(self):
-        actions = V.plan_backup(self.rime, self.vault)
+        actions = V.plan_backup(self.rime, self.vault, machine="TestMac")
         V.apply_backup(self.rime, self.vault, actions, machine="TestMac", now="2026-08-14T00:00:00Z")
         return actions
 
@@ -137,13 +137,83 @@ class RoundTrip(unittest.TestCase):
 
     def test_backup_skips_files_absent_locally(self):
         (self.rime / "squirrel.custom.yaml").unlink()
-        actions = {a.rel: a.kind for a in V.plan_backup(self.rime, self.vault)}
+        actions = {a.rel: a.kind
+                   for a in V.plan_backup(self.rime, self.vault, machine="TestMac")}
         self.assertEqual("missing-locally", actions["squirrel.custom.yaml"])
 
     def test_second_backup_of_unchanged_files_is_a_no_op(self):
         self.backup()
-        actions = V.plan_backup(self.rime, self.vault)
+        actions = V.plan_backup(self.rime, self.vault, machine="TestMac")
         self.assertTrue(all(a.kind == "identical" for a in actions), actions)
+
+    def test_backing_up_over_another_machines_copy_is_a_conflict(self):
+        # The incident this rule exists for: Mac-Mini held the June-2025
+        # pristine export as its live custom.dict.yaml, `restore` correctly
+        # refused to overwrite it (conflict), and then `backup` pushed that
+        # file over the cleaned 8231-entry result another machine had put in
+        # the vault eleven days earlier. restore protects local content;
+        # nothing protected the vault.
+        self.backup()
+        (self.rime / "private/custom.dict.yaml").write_text("stale\n", encoding="utf-8")
+        actions = {a.rel: a.kind
+                   for a in V.plan_backup(self.rime, self.vault, machine="OtherMac")}
+        self.assertEqual("conflict", actions["private/custom.dict.yaml"])
+
+    def test_backing_up_over_your_own_copy_is_not_a_conflict(self):
+        # Updating a file you yourself last backed up is the normal case and
+        # must stay frictionless -- otherwise every edit needs --force.
+        self.backup()
+        (self.rime / "private/custom.dict.yaml").write_text("mine\n", encoding="utf-8")
+        actions = {a.rel: a.kind
+                   for a in V.plan_backup(self.rime, self.vault, machine="TestMac")}
+        self.assertEqual("backup", actions["private/custom.dict.yaml"])
+
+    def test_a_backup_conflict_is_not_written_to_the_vault(self):
+        self.backup()
+        (self.rime / "private/custom.dict.yaml").write_text("stale\n", encoding="utf-8")
+        actions = V.plan_backup(self.rime, self.vault, machine="OtherMac")
+        V.apply_backup(self.rime, self.vault, actions,
+                       machine="OtherMac", now="2026-08-20T00:00:00Z")
+        self.assertEqual("content of private/custom.dict.yaml\n",
+                         (self.vault / "files" / "private/custom.dict.yaml")
+                         .read_text(encoding="utf-8"))
+
+    def test_a_backup_conflict_leaves_the_manifest_record_alone(self):
+        # A clobbered record is how the provenance that `status` reports gets
+        # lost -- the file would still say it came from the machine that was
+        # overwritten.
+        self.backup()
+        (self.rime / "private/custom.dict.yaml").write_text("stale\n", encoding="utf-8")
+        actions = V.plan_backup(self.rime, self.vault, machine="OtherMac")
+        V.apply_backup(self.rime, self.vault, actions,
+                       machine="OtherMac", now="2026-08-20T00:00:00Z")
+        record = V.read_manifest(self.vault)["private/custom.dict.yaml"]
+        self.assertEqual("TestMac", record.machine)
+
+    def test_force_turns_a_backup_conflict_into_a_backup(self):
+        self.backup()
+        (self.rime / "private/custom.dict.yaml").write_text("newer\n", encoding="utf-8")
+        actions = V.plan_backup(self.rime, self.vault, machine="OtherMac", force=True)
+        V.apply_backup(self.rime, self.vault, actions,
+                       machine="OtherMac", now="2026-08-20T00:00:00Z")
+        self.assertEqual("newer\n",
+                         (self.vault / "files" / "private/custom.dict.yaml")
+                         .read_text(encoding="utf-8"))
+
+    def test_a_stored_file_the_manifest_does_not_know_is_a_conflict(self):
+        # No record means no provenance, so there is no way to tell whose
+        # content is about to be replaced. Refuse rather than guess.
+        self.backup()
+        V.write_manifest(self.vault, {})
+        (self.rime / "private/custom.dict.yaml").write_text("stale\n", encoding="utf-8")
+        actions = {a.rel: a.kind
+                   for a in V.plan_backup(self.rime, self.vault, machine="TestMac")}
+        self.assertEqual("conflict", actions["private/custom.dict.yaml"])
+
+    def test_a_file_not_yet_in_the_vault_is_a_backup_not_a_conflict(self):
+        actions = {a.rel: a.kind
+                   for a in V.plan_backup(self.rime, self.vault, machine="TestMac")}
+        self.assertEqual("backup", actions["private/custom.dict.yaml"])
 
     def test_restore_creates_missing_parent_directories(self):
         self.backup()

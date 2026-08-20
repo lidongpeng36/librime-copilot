@@ -284,6 +284,54 @@ def model_state(rime_dir: Path) -> tuple[str, str]:
     return worst, "; ".join(parts)
 
 
+def _print_lexicon_status(rime_dir: Path) -> None:
+    """Report the clean stamp *checked against the file it describes*.
+
+    The stamp is vaulted, so it reaches every machine -- including one that
+    never applied the cleaning it describes. Reading the stamp alone made
+    Mac-Mini report `cleaned 2026-08-17T09:13:29Z, 8231 entries` while its
+    live lexicon was the 1MB pristine export, which is precisely the kind of
+    silent divergence `status` exists to catch.
+    """
+    stamp_path = _private(rime_dir) / CLEAN_STAMP_NAME
+    if not stamp_path.is_file():
+        print("lexicon:  not cleaned")
+        return
+    try:
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"lexicon:  stamp unreadable ({exc})")
+        return
+
+    counts = stamp.get("counts", {})
+    summary = (f"cleaned {stamp.get('cleaned_at')}, "
+               f"{counts.get('surviving')} entries")
+    result = stamp.get("result_sha256")
+    lexicon = _private(rime_dir) / CUSTOM_DICT_NAME
+
+    # A stamp written before these hashes existed cannot be checked. Report
+    # what it says rather than inventing a mismatch out of a missing field.
+    if not result:
+        print(f"lexicon:  {summary}")
+        return
+    if not lexicon.is_file():
+        print(f"lexicon:  stamp says {summary}, but {CUSTOM_DICT_NAME} is missing")
+        return
+
+    actual = paths.sha256_file(lexicon)
+    if actual == result:
+        print(f"lexicon:  {summary}")
+    elif actual == stamp.get("raw_sha256"):
+        print(f"lexicon:  stamp says {summary}, but this machine holds the "
+              f"pristine export, not that result")
+        print("          `rime-copilot restore` brings the cleaned lexicon down "
+              "-- do NOT `backup` first, that is what overwrote it")
+    else:
+        print(f"lexicon:  stamp says {summary}, but {CUSTOM_DICT_NAME} matches "
+              f"neither that result nor the raw it was cleaned from")
+        print("          re-run `clean`, or `restore` the shared copy")
+
+
 def _print_model_status(rime_dir: Path) -> None:
     state, detail = model_state(rime_dir)
     print(f"model:    {state} -- {detail}")
@@ -350,18 +398,7 @@ def cmd_status(args) -> int:
             # status is what you run when something is already wrong; it reports.
             print(f"build:    cannot tell ({exc})")
 
-    stamp_path = _private(rime_dir) / CLEAN_STAMP_NAME
-    if stamp_path.is_file():
-        try:
-            stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
-            counts = stamp.get("counts", {})
-            print(f"lexicon:  cleaned {stamp.get('cleaned_at')}, "
-                  f"{counts.get('surviving')} entries")
-        except (OSError, ValueError) as exc:
-            print(f"lexicon:  stamp unreadable ({exc})")
-    else:
-        print("lexicon:  not cleaned")
-
+    _print_lexicon_status(rime_dir)
     _print_grammar_status(rime_dir)
     _print_model_status(rime_dir)
     _print_installed_status(rime_dir)
@@ -374,13 +411,25 @@ def cmd_backup(args) -> int:
     if store is None:
         print(error)
         return 1
-    actions = vault.plan_backup(rime_dir, store)
+    this_machine = paths.machine_id(rime_dir)
+    actions = vault.plan_backup(rime_dir, store, machine=this_machine,
+                                force=args.force)
     for action in actions:
-        print(f"  {action.kind:<17} {action.rel}")
+        print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
+    conflicts = [a for a in actions if a.kind == "conflict"]
     if args.dry_run:
-        return 0
-    vault.apply_backup(rime_dir, store, actions,
-                       machine=paths.machine_id(rime_dir), now=_now())
+        return 1 if conflicts else 0
+    vault.apply_backup(rime_dir, store, actions, machine=this_machine, now=_now())
+    if conflicts:
+        # Non-zero for the same reason restore is: a scripted backup must
+        # not mistake a refusal for success. The wording says which way to
+        # reconcile, because both directions are real -- the other machine's
+        # copy may be the newer one (take it with `restore --force`) or the
+        # stale one (`backup --force`).
+        print(f"{len(conflicts)} file(s) not backed up (conflict) -- another "
+              f"machine's copy would be overwritten. Compare them, then take "
+              f"theirs with `restore --force` or keep yours with `backup --force`")
+        return 1
     print(f"backed up to {store}")
     return 0
 
@@ -1024,7 +1073,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status").set_defaults(func=cmd_status)
-    sub.add_parser("backup").set_defaults(func=cmd_backup)
+    backup = sub.add_parser("backup")
+    backup.add_argument("--force", action="store_true",
+                        help="overwrite a vault copy another machine backed up")
+    backup.set_defaults(func=cmd_backup)
 
     restore = sub.add_parser("restore")
     restore.add_argument("--force", action="store_true",

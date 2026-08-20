@@ -113,6 +113,131 @@ class Backup(CliBase):
         _, out = self.run_cli("status")
         self.assertNotIn("conflict", out)
 
+    def hand_the_vault_to_another_machine(self, rel):
+        """Make the vault's copy of `rel` look like another machine wrote it."""
+        store = self.sync / "copilot_vault"
+        records = V.read_manifest(store)
+        records[rel] = V.Record(sha256=records[rel].sha256, size=records[rel].size,
+                                backed_up_at="2026-08-20T06:35:31Z", machine="Mac-Mini")
+        V.write_manifest(store, records)
+
+    def test_backing_up_over_another_machines_copy_exits_non_zero(self):
+        self.run_cli("backup")
+        self.hand_the_vault_to_another_machine("private/custom.dict.yaml")
+        (self.rime / "private/custom.dict.yaml").write_text("stale\n", encoding="utf-8")
+        code, out = self.run_cli("backup")
+        self.assertNotEqual(0, code)
+        self.assertIn("conflict", out)
+        self.assertIn("private/custom.dict.yaml", out)
+
+    def test_a_refused_backup_names_the_machine_it_would_have_overwritten(self):
+        self.run_cli("backup")
+        self.hand_the_vault_to_another_machine("private/custom.dict.yaml")
+        (self.rime / "private/custom.dict.yaml").write_text("stale\n", encoding="utf-8")
+        _, out = self.run_cli("backup")
+        self.assertIn("Mac-Mini", out)
+
+    def test_a_refused_backup_leaves_the_vault_untouched(self):
+        self.run_cli("backup")
+        self.hand_the_vault_to_another_machine("private/custom.dict.yaml")
+        (self.rime / "private/custom.dict.yaml").write_text("stale\n", encoding="utf-8")
+        self.run_cli("backup")
+        stored = self.sync / "copilot_vault" / "files" / "private/custom.dict.yaml"
+        self.assertEqual("content of private/custom.dict.yaml\n",
+                         stored.read_text(encoding="utf-8"))
+
+    def test_force_backs_up_over_another_machines_copy(self):
+        self.run_cli("backup")
+        self.hand_the_vault_to_another_machine("private/custom.dict.yaml")
+        (self.rime / "private/custom.dict.yaml").write_text("newer\n", encoding="utf-8")
+        code, _ = self.run_cli("backup", "--force")
+        self.assertEqual(0, code)
+        stored = self.sync / "copilot_vault" / "files" / "private/custom.dict.yaml"
+        self.assertEqual("newer\n", stored.read_text(encoding="utf-8"))
+
+    def test_editing_a_file_you_backed_up_yourself_still_just_works(self):
+        self.run_cli("backup")
+        (self.rime / "private/custom.dict.yaml").write_text("mine\n", encoding="utf-8")
+        code, _ = self.run_cli("backup")
+        self.assertEqual(0, code)
+        stored = self.sync / "copilot_vault" / "files" / "private/custom.dict.yaml"
+        self.assertEqual("mine\n", stored.read_text(encoding="utf-8"))
+
+
+class LexiconStatus(CliBase):
+    """`status` must check the stamp against the file, not just read it.
+
+    The clean stamp is vaulted, so it reaches every machine -- including one
+    that never applied the cleaning it describes. Mac-Mini reported
+    `cleaned 2026-08-17T09:13:29Z, 8231 entries` while holding the 1MB
+    pristine export, because the line was printed from the stamp alone.
+    """
+
+    def lexicon(self) -> Path:
+        return self.rime / "private" / "custom.dict.yaml"
+
+    def write_stamp(self, *, result: str, raw: str) -> None:
+        (self.rime / "private" / ".copilot_clean_stamp.json").write_text(
+            json.dumps({"cleaned_at": "2026-08-17T09:13:29Z",
+                        "raw_sha256": raw, "result_sha256": result,
+                        "counts": {"surviving": 8231}}), encoding="utf-8")
+
+    def report(self) -> str:
+        """Just the `lexicon:` line and its continuations.
+
+        Asserting against the whole status output is how a test passes for
+        the wrong reason -- "missing" matches the `missing-in-vault` lines
+        above, and `restore` appears in half a dozen hints.
+        """
+        _, out = self.run_cli("status")
+        lines = out.splitlines()
+        start = next(i for i, line in enumerate(lines)
+                     if line.startswith("lexicon:"))
+        block = [lines[start]]
+        for line in lines[start + 1:]:
+            if line.startswith(" "):
+                block.append(line)
+            else:
+                break
+        return "\n".join(block)
+
+    def test_a_lexicon_matching_the_stamp_is_reported_cleaned(self):
+        self.write_stamp(result=V.sha256_file(self.lexicon()), raw="0" * 64)
+        report = self.report()
+        self.assertIn("cleaned 2026-08-17T09:13:29Z", report)
+        self.assertIn("8231", report)
+
+    def test_a_matching_lexicon_draws_no_warning(self):
+        self.write_stamp(result=V.sha256_file(self.lexicon()), raw="0" * 64)
+        self.assertEqual(1, len(self.report().splitlines()))
+
+    def test_holding_the_pristine_export_is_not_reported_as_cleaned(self):
+        self.write_stamp(result="0" * 64, raw=V.sha256_file(self.lexicon()))
+        self.assertIn("pristine export", self.report())
+
+    def test_holding_the_pristine_export_names_the_command_that_fixes_it(self):
+        self.write_stamp(result="0" * 64, raw=V.sha256_file(self.lexicon()))
+        self.assertIn("restore", self.report())
+
+    def test_a_lexicon_matching_neither_hash_is_reported_as_a_mismatch(self):
+        self.write_stamp(result="0" * 64, raw="1" * 64)
+        self.assertIn("matches neither", self.report())
+
+    def test_a_stamp_with_no_lexicon_at_all_is_reported(self):
+        self.write_stamp(result="0" * 64, raw="1" * 64)
+        self.lexicon().unlink()
+        self.assertIn("missing", self.report())
+
+    def test_an_old_stamp_without_hashes_still_reports_cleaned(self):
+        # Stamps written before the hashes existed must not start reporting
+        # a mismatch they have no way to disprove.
+        (self.rime / "private" / ".copilot_clean_stamp.json").write_text(
+            json.dumps({"cleaned_at": "2026-08-17T09:13:29Z",
+                        "counts": {"surviving": 8231}}), encoding="utf-8")
+        report = self.report()
+        self.assertIn("cleaned 2026-08-17T09:13:29Z", report)
+        self.assertEqual(1, len(report.splitlines()))
+
 
 class Restore(CliBase):
     def test_conflict_exits_non_zero_and_names_the_file(self):

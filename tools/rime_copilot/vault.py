@@ -152,15 +152,49 @@ def apply_restore(rime_dir: Path, vault: Path, actions: Sequence[Action]) -> Non
         temporary.replace(local)
 
 
-def plan_backup(rime_dir: Path, vault: Path) -> list[Action]:
+def plan_backup(rime_dir: Path, vault: Path, *, machine: str,
+                force: bool = False) -> list[Action]:
+    """Plan a backup, refusing to overwrite another machine's copy.
+
+    The mirror image of plan_restore's rule, and it is missing here for
+    exactly one release too long: restore protects local content from the
+    vault, but nothing protected the vault from local content. A machine
+    holding an *older* file would push it over a newer one and report
+    success -- which is how a June-2025 pristine export came to replace a
+    cleaned lexicon that another machine had backed up eleven days later.
+
+    Replacing a file this machine itself last backed up is not a conflict:
+    that is the ordinary "I edited my config" case, and requiring --force
+    for it would train the reflex that makes --force meaningless.
+
+    `machine` is required rather than defaulting, because the unsafe value
+    is the one a caller would omit.
+    """
+    records = read_manifest(vault)
     actions = []
     for rel in VAULTED_FILES:
         local = safe_join(rime_dir, rel)
         stored = safe_join(vault / FILES_DIR, rel)
         if not local.is_file():
             actions.append(Action(rel, "missing-locally"))
-        elif stored.is_file() and sha256_file(local) == sha256_file(stored):
+            continue
+        if not stored.is_file():
+            actions.append(Action(rel, "backup"))
+            continue
+        if sha256_file(local) == sha256_file(stored):
             actions.append(Action(rel, "identical"))
+            continue
+        record = records.get(rel)
+        if force:
+            actions.append(Action(rel, "backup", "forced over the vault's copy"))
+        elif record is None:
+            # No provenance, so no way to say whose content this replaces.
+            actions.append(Action(rel, "conflict",
+                                  "the vault's copy is not in the manifest"))
+        elif record.machine != machine:
+            actions.append(Action(rel, "conflict",
+                                  f"the vault's copy came from {record.machine} "
+                                  f"at {record.backed_up_at}"))
         else:
             actions.append(Action(rel, "backup"))
     return actions
