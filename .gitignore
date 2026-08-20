@@ -8,3 +8,9 @@ __pycache__
 
 # Harness venv (pypinyin for the corpus/eval tooling)
 .venv/
+
+# pyenv venv name, machine-local: this file pinned `rime-copilot` for every
+# checkout, and a machine whose venv is named anything else silently fell
+# back to the ambient interpreter. Declare dependencies in
+# tools/requirements.txt; let each machine name its own environment.
+.python-version

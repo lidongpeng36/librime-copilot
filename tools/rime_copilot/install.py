@@ -242,6 +242,40 @@ RUNTIME_REQUIREMENTS = (
     Requirement("bs4", "beautifulsoup4", "`fetch` (finding the .scel download links)"),
 )
 
+REQUIREMENTS_NAME = "requirements.txt"
+
+
+def requirements_text() -> str:
+    """RUNTIME_REQUIREMENTS rendered as a pip requirements file.
+
+    Generated rather than hand-kept, because a hand-kept copy is what the
+    tree already had and it was wrong in both available ways: it had gone
+    stale (no `jieba`, added to RUNTIME_REQUIREMENTS long after) and it
+    named import names instead of pip names (`bs4`, a forwarding shim, in
+    place of `beautifulsoup4`). Nothing in the tree read the file, so its
+    only reader was a human provisioning a new machine -- who would end up
+    without `clean` and with no indication why.
+
+    The `package` field is the one that belongs here: `module` is what the
+    code imports, and the two differ exactly where getting it wrong is
+    quietest.
+    """
+    header = (f"# Generated from RUNTIME_REQUIREMENTS in rime_copilot/install.py.\n"
+              f"# Regenerate with: rime-copilot install --write-requirements\n"
+              f"# `rime-copilot status` checks the pinned interpreter against the\n"
+              f"# same list, so this file and that check cannot disagree.\n")
+    return header + "".join(f"{r.package}\n" for r in RUNTIME_REQUIREMENTS)
+
+
+def write_requirements(source_root: Path) -> Path:
+    """Regenerate `source_root/requirements.txt`. Returns the path written."""
+    path = source_root / REQUIREMENTS_NAME
+    temporary = path.with_name(path.name + ".new")
+    temporary.write_text(requirements_text(), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
 # One subprocess for the whole set: an interpreter start costs far more than
 # the imports do, and a check that scales its cost with the number of
 # dependencies is a check someone eventually moves out of `status`.

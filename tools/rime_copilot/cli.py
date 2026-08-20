@@ -995,6 +995,17 @@ def cmd_install(args) -> int:
     source_root = Path(__file__).resolve().parent.parent
     dest = Path(args.dest).expanduser() if args.dest else _install_dest(rime_dir)
 
+    if args.write_requirements:
+        # A maintenance action on the checkout, not an install: it writes
+        # back into the source tree, so it runs before -- and instead of --
+        # copying anything to the destination.
+        if not install.is_source_checkout(source_root):
+            print(f"refusing: {source_root} is not a rime-copilot checkout",
+                  file=sys.stderr)
+            return 1
+        print(f"wrote {install.write_requirements(source_root)}")
+        return 0
+
     if not install.is_source_checkout(source_root):
         print(f"refusing to install: {source_root} does not look like a rime-copilot "
              f"checkout -- installing from an installed copy would launder drift")
@@ -1155,6 +1166,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="interpreter to pin in the installed entry point's shebang "
              "(default: whatever the destination's own .python-version "
              "declares, else the interpreter running install)")
+    install_cmd.add_argument(
+        "--write-requirements", action="store_true",
+        help="regenerate tools/requirements.txt from RUNTIME_REQUIREMENTS "
+             "and exit (writes to the checkout, installs nothing)")
     install_cmd.set_defaults(func=cmd_install)
     return parser
 

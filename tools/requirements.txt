@@ -1,3 +1,8 @@
+# Generated from RUNTIME_REQUIREMENTS in rime_copilot/install.py.
+# Regenerate with: rime-copilot install --write-requirements
+# `rime-copilot status` checks the pinned interpreter against the
+# same list, so this file and that check cannot disagree.
 pypinyin
-bs4
+jieba
 requests
+beautifulsoup4

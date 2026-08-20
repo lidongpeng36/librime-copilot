@@ -529,3 +529,55 @@ class ManifestWrittenLast(InstallFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RequirementsFile(unittest.TestCase):
+    """tools/requirements.txt is a projection of RUNTIME_REQUIREMENTS.
+
+    Unlike everything else in this module, these read the real checked-in
+    file: it is the artifact under test, not a fixture. It drifted once
+    already -- `jieba` was added to RUNTIME_REQUIREMENTS and never reached
+    the file, which also listed the forwarding shim `bs4` in place of
+    `beautifulsoup4`. Nothing in the tree read the file, so nothing noticed,
+    and a machine provisioned from it had no `clean`.
+    """
+
+    def path(self) -> Path:
+        return Path(__file__).resolve().parents[1] / "requirements.txt"
+
+    def test_the_checked_in_file_matches_the_declared_requirements(self):
+        self.assertEqual(I.requirements_text(),
+                         self.path().read_text(encoding="utf-8"),
+                         "tools/requirements.txt is stale -- regenerate it with "
+                         "`rime-copilot install --write-requirements`")
+
+    def test_it_lists_every_declared_requirement(self):
+        listed = [line for line in I.requirements_text().splitlines()
+                  if line and not line.startswith("#")]
+        self.assertEqual([r.package for r in I.RUNTIME_REQUIREMENTS], listed)
+
+    def test_it_names_pip_packages_not_import_names(self):
+        listed = [line for line in I.requirements_text().splitlines()
+                  if line and not line.startswith("#")]
+        self.assertIn("beautifulsoup4", listed)
+        self.assertNotIn("bs4", listed)
+
+    def test_it_says_it_is_generated_so_nobody_hand_edits_it(self):
+        self.assertIn("generated", I.requirements_text().splitlines()[0].lower())
+
+    def test_write_requirements_creates_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            written = I.write_requirements(root)
+            self.assertEqual(root / "requirements.txt", written)
+            self.assertEqual(I.requirements_text(),
+                             written.read_text(encoding="utf-8"))
+
+    def test_write_requirements_overwrites_a_stale_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "requirements.txt").write_text("pypinyin\nbs4\nrequests\n",
+                                                   encoding="utf-8")
+            I.write_requirements(root)
+            self.assertEqual(I.requirements_text(),
+                             (root / "requirements.txt").read_text(encoding="utf-8"))

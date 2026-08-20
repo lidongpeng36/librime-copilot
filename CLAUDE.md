@@ -264,12 +264,29 @@ the one that sorts first (`claude_adapter_test`) had nothing ahead of it and
 failed in CI. Keep the bootstrap when adding a module.
 
 `.python-version` pins a pyenv virtualenv holding the runtime deps, so the
-command above needs no activation. On a new machine:
+command above needs no activation. It is **machine-local and gitignored**: it
+was tracked once, pinning the name `rime-copilot` for every checkout, and on a
+machine whose venv is named anything else it resolved to nothing and the tests
+quietly ran on the ambient interpreter — six of them erroring on a missing
+`pypinyin` that was installed all along. Name the environment whatever you
+like; declare what goes *in* it in `tools/requirements.txt`. On a new machine:
 
 ```sh
-pyenv virtualenv system rime-copilot
-~/.pyenv/versions/rime-copilot/bin/pip install pypinyin requests beautifulsoup4 jieba
+pyenv virtualenv system rime-copilot          # any name; put it in .python-version
+~/.pyenv/versions/rime-copilot/bin/pip install -r tools/requirements.txt
 ```
+
+**`tools/requirements.txt` is generated** from `RUNTIME_REQUIREMENTS`
+(`install.py`) — regenerate it with `rime-copilot install --write-requirements`,
+never by hand, and a test in `install_test.py` fails if the checked-in file
+drifts. It is generated because the hand-kept version was wrong in both
+available ways at once: stale (`jieba` reached `RUNTIME_REQUIREMENTS` and never
+the file) and naming import names instead of pip names (`bs4`, a forwarding
+shim, for `beautifulsoup4`). Nothing in the tree read it, so its only reader
+was a human setting up a machine — who got an environment with no `clean` and
+nothing saying why. `RUNTIME_REQUIREMENTS` is the list `status` actually
+executes against the pinned interpreter on every run; the file is its
+projection, and the test is what keeps the two one truth.
 
 `RECIPE_VERSION` in `freshness.py` must be bumped by hand when a change to the
 build algorithm alters the output for unchanged inputs. No input hash catches
