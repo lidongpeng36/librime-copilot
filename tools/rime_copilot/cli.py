@@ -181,6 +181,128 @@ _LLM_MODEL = re.compile(
 _GRAMMAR_LANGUAGE = re.compile(r"^\s*(?:[\"']?grammar/language[\"']?|language)\s*:\s*[\"']?([^\"'#\s]+)")
 
 
+_SCHEMA_LIST_ITEM = re.compile(r"^\s*-\s*schema\s*:\s*[\"']?([^\"'#\s]+)")
+_LIST_ITEM = re.compile(r"^\s*-\s*[\"']?([^\"'#\s]+)")
+
+
+def _scan_block(path: Path, opener: str, item: re.Pattern) -> set[str]:
+    """Items of the list under `opener`, in patch form or deployed form.
+
+    Scanned, not parsed, for the reason the rest of this module is: no YAML
+    dependency for a handful of keys. Any non-item line closes the block, so
+    the next key's contents cannot leak in.
+    """
+    found: set[str] = set()
+    inside = False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith(opener):
+            inside = True
+            continue
+        if not inside:
+            continue
+        match = item.match(line)
+        if match:
+            found.add(match.group(1))
+        elif stripped:
+            inside = False
+    return found
+
+
+def enabled_schemas(rime_dir: Path) -> set[str] | None:
+    """Schema ids the running IME loads, or None when that cannot be told.
+
+    `build/` only ever grows: a schema built once stays there after it leaves
+    schema_list, so the stock luna_pinyin/bopomofo/terra outputs sit next to
+    the one schema actually in use. The grammar and model checks scanned all
+    of them and reported `zh-hant-t-essay-bgw MISSING` on every run of a
+    machine that was correctly configured -- noise in the one command whose
+    whole value is that every line deserves reading.
+
+    Deployed list first (`build/default.yaml`), the patch second: a machine
+    that has never deployed still has an answer, and it is the one that will
+    take effect.
+
+    Returns None -- NOT an empty set -- when neither can be read. The callers
+    must then scan everything, as before. Narrowing on a guess would turn a
+    genuinely missing file into an `ok`, which is the failure this whole
+    command exists to prevent; a stale extra line is the safe direction.
+    """
+    ids: set[str] = set()
+    try:
+        for path in (rime_dir / "build" / "default.yaml",
+                     rime_dir / "default.custom.yaml"):
+            if path.is_file():
+                ids = _scan_block(path, "schema_list:", _SCHEMA_LIST_ITEM)
+                if ids:
+                    break
+    except OSError:
+        return None
+    if not ids:
+        return None
+
+    # `schema/dependencies` is loaded by the IME without ever appearing in
+    # schema_list -- double_pinyin_flypy pulls in melt_eng and radical_pinyin
+    # that way. Filtering on schema_list alone would trade a false MISSING for
+    # a false ok, the worse of the two. Transitive, and each id is queued at
+    # most once, so a dependency cycle terminates.
+    pending = list(ids)
+    while pending:
+        schema = rime_dir / "build" / f"{pending.pop()}.schema.yaml"
+        if not schema.is_file():
+            continue
+        try:
+            deps = _scan_block(schema, "dependencies:", _LIST_ITEM)
+        except OSError:
+            continue
+        for dep in deps - ids:
+            ids.add(dep)
+            pending.append(dep)
+    return ids
+
+
+def _source_schema_id(rime_dir: Path, path: Path) -> str | None:
+    """The schema a config file belongs to, or None if it is not a schema's.
+
+    Only a positive identification is allowed to filter: `default.custom.yaml`
+    and `squirrel.custom.yaml` patch global config rather than a schema, and
+    dropping them for not being in schema_list would be filtering on a name
+    collision. A `<id>.custom.yaml` counts as a schema patch only when a
+    schema of that name is actually present.
+    """
+    name = path.name
+    if name.endswith(".schema.yaml"):
+        return name[: -len(".schema.yaml")]
+    if name.endswith(".custom.yaml"):
+        stem = name[: -len(".custom.yaml")]
+        if ((rime_dir / "build" / f"{stem}.schema.yaml").is_file()
+                or (rime_dir / f"{stem}.schema.yaml").is_file()):
+            return stem
+    return None
+
+
+def _schema_sources(rime_dir: Path) -> list[Path]:
+    """Config files worth scanning: the patches and the deployed results.
+
+    Both forms, because a patch that was never redeployed reads as configured
+    while the running IME has no such setting -- the two disagreeing is itself
+    worth seeing. Filtered to the schemas the IME loads (`enabled_schemas`).
+    """
+    sources = sorted(rime_dir.glob("*.custom.yaml")) + sorted(
+        (rime_dir / "build").glob("*.schema.yaml"))
+    enabled = enabled_schemas(rime_dir)
+    if enabled is None:
+        return sources
+    kept = []
+    for path in sources:
+        schema_id = _source_schema_id(rime_dir, path)
+        if schema_id is None or schema_id in enabled:
+            kept.append(path)
+    return kept
+
+
 def grammar_state(rime_dir: Path) -> tuple[str, str]:
     """(state, detail) for the octagram model the schemas ask for.
 
@@ -195,15 +317,13 @@ def grammar_state(rime_dir: Path) -> tuple[str, str]:
                     decodes as though unconfigured. Nothing else reports it.
       unreadable    the schema files could not be read
 
-    Scans `*.custom.yaml` and `build/*.schema.yaml` because the patch lives in
-    the former and the deployed result in the latter, and the two disagreeing
-    is itself worth seeing -- a patch that was never redeployed reads as
-    configured while the running IME has no grammar.
+    Reads `_schema_sources`: the patch and the deployed result, for the
+    schemas the IME actually loads. A schema nothing loads any more still has
+    its build output sitting in `build/`, and reporting on that is noise.
     """
     names: dict[str, list[str]] = {}
     try:
-        sources = sorted(rime_dir.glob("*.custom.yaml")) + sorted(
-            (rime_dir / "build").glob("*.schema.yaml"))
+        sources = _schema_sources(rime_dir)
         for path in sources:
             in_grammar_block = False
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -248,14 +368,13 @@ def model_state(rime_dir: Path) -> tuple[str, str]:
     and re-ranking quietly falls back to the db -- which is exactly what a
     working install looks like from outside.
 
-    Scanned rather than parsed: same as the grammar check, this package has no
-    YAML dependency and adding one for one key would be the tail wagging the
-    dog.
+    Scanned rather than parsed, over the same `_schema_sources` as the grammar
+    check: this package has no YAML dependency and adding one for one key
+    would be the tail wagging the dog.
     """
     names: dict[str, list[str]] = {}
     try:
-        sources = sorted(rime_dir.glob("*.custom.yaml")) + sorted(
-            (rime_dir / "build").glob("*.schema.yaml"))
+        sources = _schema_sources(rime_dir)
         for path in sources:
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 stripped = line.strip()

@@ -1446,3 +1446,126 @@ class VaultConflictExplanation(unittest.TestCase):
         self.assertIn("other-machine", out)
         self.assertIn("reconcile by hand", out)
         self.assertNotIn("edited here since your own backup", out)
+
+
+class EnabledSchemas(unittest.TestCase):
+    """Which schemas the running IME actually loads.
+
+    `build/` accumulates: a schema built once stays there forever, so a Rime
+    dir that has been through a few schema_list edits holds build outputs for
+    schemas nothing loads any more. Scanning all of them makes `status` report
+    missing files for configurations that are not running -- noise on every
+    run, in the one command whose value is that every line is worth reading.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "build").mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write_built(self, name: str, body: str) -> None:
+        (self.dir / "build" / f"{name}.schema.yaml").write_text(body, encoding="utf-8")
+
+    def test_reads_the_deployed_schema_list(self):
+        (self.dir / "build" / "default.yaml").write_text(
+            "schema_list:\n  - schema: double_pinyin_flypy\n  - schema: stroke\nswitcher:\n"
+            "  caption: x\n", encoding="utf-8")
+        self.assertEqual(cli.enabled_schemas(self.dir), {"double_pinyin_flypy", "stroke"})
+
+    def test_falls_back_to_the_patch_when_nothing_is_deployed(self):
+        # A machine that has never deployed still has an answer, and it is the
+        # one that will take effect.
+        (self.dir / "default.custom.yaml").write_text(
+            'patch:\n  schema_list:\n    - schema: double_pinyin_flypy  # comment\n'
+            '  "key_binder/bindings/+":\n    - { accept: Control+p }\n', encoding="utf-8")
+        self.assertEqual(cli.enabled_schemas(self.dir), {"double_pinyin_flypy"})
+
+    def test_no_list_anywhere_is_None_not_an_empty_set(self):
+        # None means "cannot tell" and the callers must fall back to scanning
+        # everything. An empty set would silently narrow to nothing and turn
+        # every real missing file into an ok.
+        self.assertIsNone(cli.enabled_schemas(self.dir))
+
+    def test_a_dependency_of_an_enabled_schema_counts(self):
+        # `schema/dependencies` is loaded by the running IME without ever
+        # appearing in schema_list -- double_pinyin_flypy pulls in melt_eng
+        # this way. Filtering on schema_list alone would drop it.
+        (self.dir / "build" / "default.yaml").write_text(
+            "schema_list:\n  - schema: double_pinyin_flypy\n", encoding="utf-8")
+        self.write_built("double_pinyin_flypy",
+                         "schema:\n  author:\n    - Dvel\n  dependencies:\n"
+                         "    - melt_eng\n    - radical_pinyin\n")
+        self.assertEqual(cli.enabled_schemas(self.dir),
+                         {"double_pinyin_flypy", "melt_eng", "radical_pinyin"})
+
+    def test_dependencies_are_followed_transitively(self):
+        (self.dir / "build" / "default.yaml").write_text(
+            "schema_list:\n  - schema: a\n", encoding="utf-8")
+        self.write_built("a", "schema:\n  dependencies:\n    - b\n")
+        self.write_built("b", "schema:\n  dependencies:\n    - c\n")
+        self.write_built("c", "schema:\n  name: c\n")
+        self.assertEqual(cli.enabled_schemas(self.dir), {"a", "b", "c"})
+
+    def test_a_dependency_cycle_terminates(self):
+        (self.dir / "build" / "default.yaml").write_text(
+            "schema_list:\n  - schema: a\n", encoding="utf-8")
+        self.write_built("a", "schema:\n  dependencies:\n    - b\n")
+        self.write_built("b", "schema:\n  dependencies:\n    - a\n")
+        self.assertEqual(cli.enabled_schemas(self.dir), {"a", "b"})
+
+
+class DisabledSchemasAreNotScanned(unittest.TestCase):
+    """The grammar and model checks read only what the IME loads.
+
+    Both had the same bug: they globbed every `build/*.schema.yaml`, so the
+    stock luna_pinyin/bopomofo/terra schemas -- built once at install and
+    disabled ever since -- reported `zh-hant-t-essay-bgw MISSING` forever on a
+    machine whose only enabled schema was correctly configured.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "build").mkdir()
+        (self.dir / "build" / "default.yaml").write_text(
+            "schema_list:\n  - schema: double_pinyin_flypy\n", encoding="utf-8")
+        self.addCleanup(self.tmp.cleanup)
+
+    def built(self, name: str, body: str) -> None:
+        (self.dir / "build" / f"{name}.schema.yaml").write_text(body, encoding="utf-8")
+
+    def test_a_disabled_schemas_grammar_is_ignored(self):
+        self.built("luna_pinyin", "grammar:\n  language: zh-hant-t-essay-bgw\n")
+        self.built("double_pinyin_flypy", "schema:\n  name: flypy\n")
+        self.assertEqual(cli.grammar_state(self.dir)[0], "unconfigured")
+
+    def test_an_enabled_schemas_grammar_is_still_reported(self):
+        self.built("double_pinyin_flypy", "grammar:\n  language: private/zh-hans\n")
+        state, detail = cli.grammar_state(self.dir)
+        self.assertEqual(state, "missing")
+        self.assertIn("private/zh-hans", detail)
+
+    def test_a_dependency_schemas_grammar_is_reported(self):
+        self.built("double_pinyin_flypy", "schema:\n  dependencies:\n    - melt_eng\n")
+        self.built("melt_eng", "grammar:\n  language: private/zh-hans\n")
+        self.assertEqual(cli.grammar_state(self.dir)[0], "missing")
+
+    def test_a_disabled_schemas_patch_is_ignored_too(self):
+        # The patch form is where a human writes it, so it needs the same gate.
+        self.built("luna_pinyin", "schema:\n  name: luna\n")
+        (self.dir / "luna_pinyin.custom.yaml").write_text(
+            "patch:\n  grammar/language: zh-hant-t-essay-bgw\n", encoding="utf-8")
+        self.assertEqual(cli.grammar_state(self.dir)[0], "unconfigured")
+
+    def test_a_disabled_schemas_model_is_ignored(self):
+        self.built("luna_pinyin",
+                   'patch:\n  "copilot/rerank/llm/model": private/gone.gguf\n')
+        self.assertEqual(cli.model_state(self.dir)[0], "unconfigured")
+
+    def test_default_custom_yaml_is_not_mistaken_for_a_disabled_schema(self):
+        # `default` and `squirrel` are not schemas; dropping them because they
+        # are not in schema_list would be filtering on a name collision.
+        (self.dir / "default.custom.yaml").write_text(
+            "patch:\n  grammar/language: private/zh-hans\n", encoding="utf-8")
+        self.assertEqual(cli.grammar_state(self.dir)[0], "missing")
