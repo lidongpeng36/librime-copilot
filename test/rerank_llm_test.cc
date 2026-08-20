@@ -179,3 +179,21 @@ TEST(Decide, BestIndexEqualsPromoteIndexOnAPromotion) {
   EXPECT_EQ(d.promote_index, 2);
   EXPECT_EQ(d.best_index, 2);
 }
+
+// kNone means "the model ran". The db-context gate ends the segment before
+// anything is scored, so kNone must never survive it: StatsAccumulator counts
+// such a trace in llm_acted and pushes its us=0 into the latency samples,
+// and telemetry_commit turns it into an `llm` object whose skip is "" --
+// three untrue numbers from one value.
+TEST(SkipForEmptyDbContext, ReplacesKNoneWithNoContext) {
+  EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kNone), SkipReason::kNoContext);
+}
+
+// A reason the fallback chain already established is the more specific truth
+// and must survive: "the battery gate stopped this" is not "no context".
+TEST(SkipForEmptyDbContext, KeepsAnyReasonTheChainAlreadyEstablished) {
+  EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kBattery), SkipReason::kBattery);
+  EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kCold), SkipReason::kCold);
+  EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kNoModel), SkipReason::kNoModel);
+  EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kDisabled), SkipReason::kDisabled);
+}

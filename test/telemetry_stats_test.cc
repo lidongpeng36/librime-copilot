@@ -121,3 +121,22 @@ TEST(StatsAccumulator, HasNoWarmHitConcept) {
   acc.Observe(&t);
   EXPECT_EQ(acc.Snapshot("t").skip_counts.count("cold"), 0u);
 }
+
+// The other half of the kNone-without-scoring defect: Observe() reads
+// llm_skip as "the model ran", so a mislabelled trace was counted in
+// llm_acted AND pushed its us=0 into the latency samples, inflating the
+// engagement rate and dragging p50/p95 down at the same time.
+TEST(StatsAccumulator, ASegmentThatWasNeverScoredIsNeitherActedNorTimed) {
+  StatsAccumulator acc;
+  acc.Observe(nullptr);  // no trace at all
+  auto skipped = SkippedTrace(llm_rerank::SkipReason::kNoContext);
+  acc.Observe(&skipped);
+  auto engaged = EngagedTrace("故意", 7000);
+  acc.Observe(&engaged);
+
+  const auto s = acc.Snapshot("2026-08-20T23:00:00+0800");
+  EXPECT_EQ(s.segments, 3);
+  EXPECT_EQ(s.llm_acted, 1);
+  EXPECT_EQ(s.skip_counts.at("noctx"), 1);
+  EXPECT_DOUBLE_EQ(s.us_p50, 7000.0);  // the un-scored segment contributed no 0
+}

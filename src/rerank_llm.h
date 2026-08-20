@@ -72,6 +72,20 @@ inline const char* SkipReasonName(SkipReason r) {
   return "none";
 }
 
+// The reason to record when the db-context gate (rerank_filter.cc's
+// `context.empty()` early return) ends a segment before anything is scored.
+//
+// The Han-only db context can be empty while the LLM's own context is not --
+// the user typing after Latin, punctuation or a line start -- so the fallback
+// chain may well have left kNone behind, and kNone means "the model ran".
+// kNoContext is the honest name: this IS the gate CLAUDE.md's "What is NOT
+// built" describes, and naming it here is what finally makes `noctx`
+// countable (rerank_filter.cc:290 notes the design doc named a bucket the
+// code could never produce).
+inline SkipReason SkipForEmptyDbContext(SkipReason chain_reason) {
+  return chain_reason == SkipReason::kNone ? SkipReason::kNoContext : chain_reason;
+}
+
 struct Decision {
   int promote_index = -1;  // index into `candidates`; -1 means leave the order alone
   // The best-scoring all-Han candidate, set whether or not it was promoted.

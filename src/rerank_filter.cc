@@ -513,7 +513,8 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   // this stays, and `llm_skip=noctx` is the honest measure of what it costs.
   if (context.empty()) {
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
-                    SurroundingSourceName(surrounding->source), llm_skip);
+                    SurroundingSourceName(surrounding->source),
+                    llm_rerank::SkipForEmptyDbContext(llm_skip));
     return translation;
   }
   // A missing db only takes the db branch down with it -- the LLM branch
