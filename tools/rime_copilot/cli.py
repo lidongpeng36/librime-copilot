@@ -173,10 +173,107 @@ def _vault_dir_or_error(rime_dir: Path) -> "tuple[Path | None, str | None]":
         return None, message
 
 
-# `copilot/rerank/llm/model`, in either the patch form or the deployed
-# schema's nested form.
-_LLM_MODEL = re.compile(
-    r"^\s*(?:[\"']?copilot/rerank/llm/model[\"']?|model)\s*:\s*[\"']?([^\"'#\s]+)")
+# One `key: value` line. The key may be quoted and may itself be a slash
+# path (`"copilot/rerank/llm/model"`); the value is absent when the line only
+# opens a block. Allowing a leading `-` lets a list item's inline key through,
+# which costs nothing and keeps the indent bookkeeping below honest.
+_KEY_LINE = re.compile(
+    r"""^(?P<indent>[ \t]*)(?:-[ \t]+)?(?P<q>["']?)(?P<key>[^#'"]+?)(?P=q)[ \t]*"""
+    r""":(?:[ \t]+(?P<value>.*?))?[ \t]*$""")
+
+
+def _unquote(text: str) -> str:
+    """A scalar as written, minus its quotes and any trailing comment."""
+    text = text.strip()
+    # Quoted values are taken whole first, so a `#` inside quotes survives.
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text.split("#", 1)[0].strip().strip("\"'")
+
+
+def _split_flow(body: str) -> list[str]:
+    """Top-level comma-separated items of a flow map body, respecting quotes
+    and nested `{}` / `[]`."""
+    items: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote = ""
+    for char in body:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            items.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    if "".join(current).strip():
+        items.append("".join(current))
+    return items
+
+
+def _flow_leaves(base: str, body: str):
+    for item in _split_flow(body):
+        key, sep, value = item.partition(":")
+        if not sep:
+            continue
+        path = base + "/" + _unquote(key)
+        value = value.strip()
+        if value.startswith("{"):
+            yield from _flow_leaves(path, value[1:value.rfind("}")])
+        else:
+            yield path, _unquote(value)
+
+
+def _config_leaves(text: str):
+    """(path, value) for every scalar in a Rime config file.
+
+    The same setting reaches `status` in three shapes and they must all read
+    as one path. A patch may write a flat `"copilot/rerank/llm/model"` key or
+    the same subtree nested -- both are correct, because a patch key whose
+    value is a map replaces that node wholesale either way -- and the schema
+    Rime deploys puts small maps in FLOW style, which lands the key on its
+    parent's line where nothing line-anchored can see it. Matching a bare
+    `model:` instead is not the fix: `copilot/llm/model` is the next-word
+    prediction model, a different feature.
+
+    Scanned rather than parsed, for the reason the rest of this module is: no
+    YAML dependency for a handful of keys. A leading `patch/` is dropped so a
+    patch and a deployed schema yield the same paths.
+    """
+    stack: list[tuple[int, str]] = []
+    for line in text.splitlines():
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        match = _KEY_LINE.match(line)
+        if not match:
+            continue
+        indent = len(match.group("indent").expandtabs(8))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        key = _unquote(match.group("key"))
+        path = "/".join([k for _, k in stack] + [key])
+        if path.startswith("patch/"):
+            path = path[len("patch/"):]
+        value = match.group("value")
+        if value is None or not value.strip():
+            stack.append((indent, key))
+        elif value.strip().startswith("{"):
+            body = value.strip()
+            yield from _flow_leaves(path, body[1:body.rfind("}")])
+        else:
+            yield path, _unquote(value)
+
+
+RERANK_MODEL_KEY = "copilot/rerank/llm/model"
 
 _GRAMMAR_LANGUAGE = re.compile(r"^\s*(?:[\"']?grammar/language[\"']?|language)\s*:\s*[\"']?([^\"'#\s]+)")
 
@@ -374,17 +471,11 @@ def model_state(rime_dir: Path) -> tuple[str, str]:
     """
     names: dict[str, list[str]] = {}
     try:
-        sources = _schema_sources(rime_dir)
-        for path in sources:
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                stripped = line.strip()
-                if stripped.startswith("#"):
-                    continue
-                match = _LLM_MODEL.match(line)
-                # A bare `model:` belongs to too many blocks to trust; only the
-                # fully-qualified patch key is unambiguous.
-                if match and "copilot/rerank/llm/model" in stripped:
-                    names.setdefault(match.group(1), []).append(path.name)
+        for path in _schema_sources(rime_dir):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for leaf, value in _config_leaves(text):
+                if leaf == RERANK_MODEL_KEY and value:
+                    names.setdefault(value, []).append(path.name)
     except OSError as exc:
         return "unreadable", str(exc)
 
@@ -772,9 +863,16 @@ def cmd_install_model(args) -> int:
 
 
 def _print_install_model_config(target: Path) -> None:
+    # Nested, not flat "a/b/c" keys. Both forms work -- this patch replaces
+    # the whole `copilot` node either way -- but the flat form's result
+    # depends on patch keys applying in lexicographic order (they are a
+    # std::map), which is not something a pasted snippet should rest on.
     print("Paste into a schema patch:")
-    print('  "copilot/rerank/llm/enable": true')
-    print(f'  "copilot/rerank/llm/model": private/{target.name}')
+    print("  copilot:")
+    print("    rerank:")
+    print("      llm:")
+    print("        enable: true")
+    print(f"        model: private/{target.name}")
 
 
 def cmd_fetch_grammar(args) -> int:

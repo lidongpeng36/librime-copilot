@@ -1341,6 +1341,69 @@ class ModelState(unittest.TestCase):
         self.write('patch:\n  # "copilot/rerank/llm/model": private/old.gguf\n')
         self.assertEqual(cli.model_state(self.dir)[0], "unconfigured")
 
+    def write_built(self, body: str) -> None:
+        (self.dir / "build" / "double_pinyin_flypy.schema.yaml").write_text(body, encoding="utf-8")
+
+    def test_the_nested_patch_form_is_read_too(self):
+        # A patch may write the copilot subtree hierarchically instead of as
+        # flat "a/b/c" keys -- the whole node is replaced either way, so both
+        # are correct, and a check that sees only one reports a configured
+        # model as `unconfigured`.
+        self.write(
+            "patch:\n"
+            "  copilot:\n"
+            "    rerank:\n"
+            "      llm:\n"
+            "        model: private/rime40m-q8.gguf\n"
+        )
+        state, detail = cli.model_state(self.dir)
+        self.assertEqual(state, "missing")
+        self.assertIn("private/rime40m-q8.gguf", detail)
+
+    def test_the_deployed_flow_style_map_is_read_too(self):
+        # Rime's deployer emits small maps in flow style, so the deployed
+        # schema puts the model on the same line as its block's key. A
+        # line-anchored `model:` match never sees it.
+        self.write_built(
+            "copilot:\n"
+            "  rerank:\n"
+            '    llm: {context_chars: 32, enable: true, '
+            'model: "private/rime40m-q8.gguf", top_n: 4}\n'
+        )
+        state, detail = cli.model_state(self.dir)
+        self.assertEqual(state, "missing")
+        self.assertIn("private/rime40m-q8.gguf", detail)
+
+    def test_the_prediction_model_is_not_mistaken_for_the_rerank_model(self):
+        # copilot/llm/model names the next-word prediction model, a different
+        # feature. Counting it here would report `ok` for a re-ranking model
+        # that is not configured at all.
+        self.write(
+            "patch:\n"
+            "  copilot:\n"
+            "    llm:\n"
+            "      model: private/Qwen3-0.6B-q4_K_M.gguf\n"
+        )
+        self.assertEqual(cli.model_state(self.dir)[0], "unconfigured")
+
+    def test_the_install_model_hint_uses_the_nested_form(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli._print_install_model_config(self.dir / "private" / "rime40m-q8.gguf")
+        self.assertIn("rerank:", buf.getvalue())
+
+    def test_the_install_model_hint_is_a_patch_status_can_read(self):
+        # The hint and the check must not drift apart: whatever install-model
+        # tells the user to paste has to be what `status` then reports as ok.
+        (self.dir / "private").mkdir()
+        (self.dir / "private" / "rime40m-q8.gguf").write_bytes(b"GGUF")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli._print_install_model_config(self.dir / "private" / "rime40m-q8.gguf")
+        pasted = [l for l in buf.getvalue().splitlines() if l.startswith("  ")]
+        self.write("patch:\n" + "\n".join(pasted) + "\n")
+        self.assertEqual(cli.model_state(self.dir)[0], "ok")
+
 
 class InstallModel(unittest.TestCase):
     def setUp(self):
@@ -1361,7 +1424,12 @@ class InstallModel(unittest.TestCase):
         with redirect_stdout(buffer):
             self.assertEqual(0, cli.cmd_install_model(self.args()))
         self.assertTrue((self.rime / "private" / "m.gguf").is_file())
-        self.assertIn("copilot/rerank/llm/model", buffer.getvalue())
+        # Asserted through the same reader `status` uses, not as a substring:
+        # the hint is only useful if pasting it makes `status` say `ok`, and
+        # that is a property of the paths it resolves to, not of its wording.
+        pasted = "\n".join(l for l in buffer.getvalue().splitlines() if l.startswith("  "))
+        self.assertIn((cli.RERANK_MODEL_KEY, "private/m.gguf"),
+                      list(cli._config_leaves("patch:\n" + pasted)))
 
     def test_refuses_a_file_that_is_not_gguf(self):
         # Installing the wrong file surfaces only as re-ranking silently
