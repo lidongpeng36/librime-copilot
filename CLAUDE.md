@@ -261,13 +261,11 @@ text before the caret. Trained from scratch on 4.5B tokens of Chinese
 (`tools/rime_train/`, see `docs/superpowers/specs/2026-08-19-corpus-pipeline-design.md`);
 42MB at Q8_0, p50 4.7ms / p99 11.0ms per scoring.
 
-Three artifacts have to be present, and **none of them is in the vault** —
-the vault is for what cannot be regenerated and holds ~1MB, while these are
-large derived files:
+Three artifacts have to be present:
 
 | artifact | how it travels | check |
 | --- | --- | --- |
-| `private/rime40m-q8.gguf` | `rime-copilot install-model --from PATH` (scp/rsync it over; it has no public URL) | `rime-copilot status` → `model:` |
+| `private/rime40m-q8.gguf` | **vaulted** — `rime-copilot restore` brings it down; `install-model --from PATH` is the manual route | `rime-copilot status` → `model:` |
 | `private/zh-hans-t-essay-bgw.gram` | `rime-copilot fetch-grammar` (public download) | `rime-copilot status` → `grammar:` |
 | `librime-copilot.dylib` | built from a librime checkout, copied into `Squirrel.app` by hand | — |
 
@@ -280,11 +278,17 @@ falls back to the db. Both look exactly like a working install from outside.
 On a new machine, after the usual `install` / `restore` / `update`:
 
 ```sh
-rime-copilot fetch-grammar                       # 41MB, public
-scp mac:~/Library/Rime/private/rime40m-q8.gguf . # or rsync, or a shared drive
-rime-copilot install-model --from ./rime40m-q8.gguf
-rime-copilot status                              # grammar: ok / model: ok
+rime-copilot restore        # brings the model down from the vault (42MB)
+rime-copilot fetch-grammar  # 41MB, public download
+rime-copilot status         # grammar: ok / model: ok
 ```
+
+The model is **named explicitly** in `vault.VAULTED_FILES`, so a retrain under
+a different filename does not travel until that list is updated. That is the
+safe direction: the second machine reports `model: missing` and names the file
+the schema asked for, rather than silently running whichever older model
+happens to still be there. `install-model --from PATH` remains for a machine
+with no vault, or for trying a model before vaulting it.
 
 then patch the schema (both commands print the exact lines), build the plugin
 from a librime checkout, and copy the dylib into `Squirrel.app`.

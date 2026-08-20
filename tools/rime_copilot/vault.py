@@ -38,6 +38,18 @@ VAULTED_FILES = (
     # stamp.
     "private/.copilot_clean_stamp.json",
     "private.dict.yaml",
+    # The neural re-ranking model. A derived artifact, and a large one, so it
+    # sits oddly beside the rest of this list -- but deriving it again costs
+    # ~14 hours of training and a 14GB corpus that is not distributed, and the
+    # alternative is scp-ing 42MB to every machine by hand. Vaulting it makes
+    # a second machine's `restore` enough.
+    #
+    # Named explicitly, so a retrain under a different filename does NOT
+    # travel until this list is updated. That is the safe direction: the
+    # second machine's `rime-copilot status` reports `model: missing` and
+    # names the file the schema asked for, rather than silently running an
+    # older model that happens to still be there.
+    "private/rime40m-q8.gguf",
     "default.custom.yaml",
     "double_pinyin_flypy.custom.yaml",
     "squirrel.custom.yaml",
