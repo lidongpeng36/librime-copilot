@@ -95,6 +95,9 @@ class Copilot : public Processor {
   an<RerankTraceStore> rerank_traces_;
   an<telemetry::Writer> telemetry_;
   telemetry::Options telemetry_options_;
+  // Plain successes seen since construction, for Options::sample_ok's 1-in-N.
+  // Never reset: the sampling only needs to be uniform, not windowed.
+  int64_t telemetry_ok_seen_ = 0;
   // Window for the aggregate stats line (telemetry_stats.h /
   // telemetry_event.h's StatsLine) -- observed on every OnCommit alongside
   // the per-event writes, flushed through the same telemetry_->Write() call

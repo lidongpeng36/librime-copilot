@@ -86,6 +86,7 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
       telemetry_options_.max_file_bytes = max_file_bytes;
     }
     config->GetInt("copilot/telemetry/keep_generations", &telemetry_options_.keep_generations);
+    config->GetInt("copilot/telemetry/sample_ok", &telemetry_options_.sample_ok);
     telemetry::ClampOptions(telemetry_options_);
 
     config->GetBool("copilot/use_surrounding_context", &use_surrounding_context_);
@@ -549,7 +550,7 @@ void Copilot::EmitCommitTelemetry(Context* ctx, bool selection_commit) {
   const auto events = telemetry::BuildCommitEvents(
       ctx, rerank_traces_.get(), telemetry_options_, user_id.empty() ? string("unknown") : user_id,
       engine_->schema() ? engine_->schema()->schema_id() : string(),
-      telemetry::FormatTimestamp(std::time(nullptr)), stats, selection_commit);
+      telemetry::FormatTimestamp(std::time(nullptr)), stats, selection_commit, &telemetry_ok_seen_);
   for (const auto& e : events) {
     telemetry_->Write(telemetry::SerializeJsonl(e));
   }
@@ -599,6 +600,7 @@ Copilot* CopilotComponent::Create(const Ticket& ticket) {
         telemetry_options.max_file_bytes = max_file_bytes;
       }
       config->GetInt("copilot/telemetry/keep_generations", &telemetry_options.keep_generations);
+      config->GetInt("copilot/telemetry/sample_ok", &telemetry_options.sample_ok);
     }
   }
   telemetry::ClampOptions(telemetry_options);

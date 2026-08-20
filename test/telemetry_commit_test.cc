@@ -505,3 +505,35 @@ TEST(BuildCommitEvents, AnEngagedSegmentReportsNoneAndKeepsItsLlmObject) {
   EXPECT_EQ(events[0].llm_skip, "none");
   ASSERT_TRUE(events[0].llm.has_value());
 }
+
+// The counter advances on every plain success the walk sees, not only on the
+// ones kept -- otherwise 1-in-N would keep the first success and then never
+// advance past it.
+TEST(BuildCommitEvents, SamplesPlainSuccessesAtTheConfiguredRate) {
+  Options o;
+  o.sample_ok = 2;
+  int64_t ok_seen = 0;
+  size_t kept = 0;
+  for (int i = 0; i < 4; ++i) {
+    Context ctx;
+    ctx.set_input("ni");
+    ctx.composition().Reset("ni");
+    ctx.composition().push_back(MakeSegment(0, 2, {"你", "尼"}, 0));
+    kept += BuildCommitEvents(&ctx, nullptr, o, "M1", "flypy", "2026-08-20T10:00:00+0800",
+                              nullptr, true, &ok_seen)
+                .size();
+  }
+  EXPECT_EQ(ok_seen, 4);
+  EXPECT_EQ(kept, 2u);
+}
+
+TEST(BuildCommitEvents, RecordsNoPlainSuccessWithoutACounter) {
+  Options o;
+  o.sample_ok = 2;
+  Context ctx;
+  ctx.set_input("ni");
+  ctx.composition().Reset("ni");
+  ctx.composition().push_back(MakeSegment(0, 2, {"你", "尼"}, 0));
+  EXPECT_TRUE(BuildCommitEvents(&ctx, nullptr, o, "M1", "flypy", "2026-08-20T10:00:00+0800")
+                  .empty());
+}

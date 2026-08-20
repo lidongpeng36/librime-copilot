@@ -13,7 +13,8 @@ namespace telemetry {
 std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* traces,
                                      const Options& options, const std::string& machine,
                                      const std::string& schema, const std::string& ts,
-                                     StatsAccumulator* stats, bool selection_commit) {
+                                     StatsAccumulator* stats, bool selection_commit,
+                                     int64_t* ok_seen) {
   std::vector<Event> events;
   if (!ctx) {
     return events;
@@ -63,7 +64,16 @@ std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* trace
     // in practice.
     const bool promoted = db_promoted || llm_promoted;
     const int sel_idx = static_cast<int>(seg.selected_index);
-    if (!ShouldRecord(sel_idx, promoted)) {
+    // Without a counter there is no way to make 1-in-N deterministic, so a
+    // caller that passes no `ok_seen` gets today's behaviour (no plain
+    // successes) rather than an ok_index stuck at 0, which would otherwise
+    // read as "always the first of every N" and record every plain success.
+    int64_t ok_index = 0;
+    const int sample_ok = ok_seen ? options.sample_ok : 0;
+    if (!promoted && sel_idx == 0 && ok_seen) {
+      ok_index = (*ok_seen)++;
+    }
+    if (!ShouldRecord(sel_idx, promoted, ok_index, sample_ok)) {
       continue;
     }
     auto selected = seg.GetSelectedCandidate();

@@ -251,3 +251,14 @@ TEST(TelemetryTimestamp, IsIso8601WithOffset) {
   EXPECT_EQ(ts[16], ':');
   EXPECT_TRUE(ts[19] == '+' || ts[19] == '-');
 }
+
+TEST(ClampOptions, BoundsTheSuccessSamplingRate) {
+  Options o;
+  o.sample_ok = -5;
+  ClampOptions(o);
+  EXPECT_EQ(o.sample_ok, 0);  // negative is "off", not "every segment"
+
+  o.sample_ok = 1000000;
+  ClampOptions(o);
+  EXPECT_EQ(o.sample_ok, 10000);
+}

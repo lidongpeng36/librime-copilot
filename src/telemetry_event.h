@@ -139,7 +139,25 @@ struct StatsLine {
 // promotion that the caller forgot to fold in here is dropped silently, which
 // is exactly the gap that made every LLM-only event invisible before this was
 // wired up.
-inline bool ShouldRecord(int sel_idx, bool promoted) { return promoted || sel_idx != 0; }
+//
+// `sample_ok` > 0 additionally keeps 1 in N of the plain successes -- ordinary
+// typing that nothing moved. Those are what an eval set needs and what the
+// hard-cases-only gate throws away; without them a set built from this log is
+// all failures and every change scores absurdly. `ok_seen` is how many plain
+// successes the caller has seen so far, so the sampling is deterministic and
+// testable rather than a coin flip.
+//
+// This does NOT affect first-candidate accuracy: misses are kept
+// unconditionally, so that number needs no sampling and no scaling.
+inline bool ShouldRecord(int sel_idx, bool promoted, int64_t ok_seen, int sample_ok) {
+  if (promoted || sel_idx != 0) {
+    return true;
+  }
+  if (sample_ok <= 0) {
+    return false;
+  }
+  return ok_seen % sample_ok == 0;
+}
 
 // nlohmann's number_float_t is double, so assigning a `float` promotes it
 // exactly -- including every bit of binary32 rounding noise (3.4f becomes

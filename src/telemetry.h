@@ -29,6 +29,10 @@ struct Options {
   int64_t max_file_bytes = 8 * 1024 * 1024;
   // Counts the live file, so 2 means the live file plus one archive `.1`.
   int keep_generations = 2;
+  // Keep 1 in N plain successes for the eval set. 0 disables, which is
+  // today's behaviour and the default, so an upgraded machine records exactly
+  // what it recorded before until the key is set.
+  int sample_ok = 0;
 };
 
 // Both ends, matching the precedent at copilot.cc:71 and

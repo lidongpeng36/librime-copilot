@@ -52,11 +52,17 @@ class StatsAccumulator;
 // engaged for a segment is a fact about the scorer, independent of what the
 // user ultimately did with the result, and StatsLine carries no `sel`-derived
 // field for a bail-out to corrupt.
+//
+// `ok_seen`, when non-null, counts the plain successes this walk saw and is
+// what makes Options::sample_ok's 1-in-N deterministic across calls. It is
+// advanced for every plain success observed, not only the ones kept --
+// advancing only on a keep would hold the counter at a multiple of N forever
+// and record every success after the first.
 std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* traces,
                                      const Options& options, const std::string& machine,
                                      const std::string& schema, const std::string& ts,
                                      StatsAccumulator* stats = nullptr,
-                                     bool selection_commit = true);
+                                     bool selection_commit = true, int64_t* ok_seen = nullptr);
 
 }  // namespace telemetry
 }  // namespace rime

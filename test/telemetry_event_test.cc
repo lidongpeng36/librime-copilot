@@ -74,10 +74,10 @@ TEST(TelemetryEvent, KeepsChineseLiteral) {
 // The recording scope from the spec: re-ranking promoted something, or the
 // user did not take the first candidate. Ordinary typing is not recorded.
 TEST(TelemetryEvent, ShouldRecordMatchesTheScope) {
-  EXPECT_FALSE(ShouldRecord(0, false));  // ordinary typing
-  EXPECT_TRUE(ShouldRecord(0, true));    // promotion accepted
-  EXPECT_TRUE(ShouldRecord(3, true));    // promotion rejected
-  EXPECT_TRUE(ShouldRecord(3, false));   // translator mis-ranking
+  EXPECT_FALSE(ShouldRecord(0, false, 0, 0));  // ordinary typing
+  EXPECT_TRUE(ShouldRecord(0, true, 0, 0));    // promotion accepted
+  EXPECT_TRUE(ShouldRecord(3, true, 0, 0));    // promotion rejected
+  EXPECT_TRUE(ShouldRecord(3, false, 0, 0));   // translator mis-ranking
 }
 
 TEST(SerializeJsonl, IncludesTheLlmRecordWhenPresent) {
@@ -229,4 +229,31 @@ TEST(SerializeJsonl, OmitsLlmSkipWhenThereWasNoTrace) {
   e.sel = "的";
   const auto j = nlohmann::json::parse(SerializeJsonl(e));
   EXPECT_FALSE(j.contains("llm_skip"));
+}
+
+// Hard cases are unconditional -- the accuracy number depends on misses being
+// recorded in full, with no sampling and no scaling.
+TEST(ShouldRecord, KeepsEveryMissAndEveryPromotionRegardlessOfSampling) {
+  EXPECT_TRUE(ShouldRecord(3, false, 0, 0));
+  EXPECT_TRUE(ShouldRecord(3, false, 7, 20));
+  EXPECT_TRUE(ShouldRecord(0, true, 7, 20));
+}
+
+// Default off: a machine that upgrades records exactly what it records today
+// until the key is set.
+TEST(ShouldRecord, DropsPlainSuccessesWhenSamplingIsOff) {
+  EXPECT_FALSE(ShouldRecord(0, false, 0, 0));
+  EXPECT_FALSE(ShouldRecord(0, false, 99, 0));
+}
+
+TEST(ShouldRecord, KeepsOneSuccessInN) {
+  EXPECT_TRUE(ShouldRecord(0, false, 0, 3));
+  EXPECT_FALSE(ShouldRecord(0, false, 1, 3));
+  EXPECT_FALSE(ShouldRecord(0, false, 2, 3));
+  EXPECT_TRUE(ShouldRecord(0, false, 3, 3));
+}
+
+TEST(ShouldRecord, SampleOkOfOneKeepsEverySuccess) {
+  EXPECT_TRUE(ShouldRecord(0, false, 0, 1));
+  EXPECT_TRUE(ShouldRecord(0, false, 1, 1));
 }

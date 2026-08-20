@@ -15,6 +15,7 @@ void ClampOptions(Options& options) {
   options.max_file_bytes =
       std::clamp<int64_t>(options.max_file_bytes, 64 * 1024, int64_t{256} * 1024 * 1024);
   options.keep_generations = std::clamp(options.keep_generations, 1, 10);
+  options.sample_ok = std::clamp(options.sample_ok, 0, 10000);
 }
 
 bool ShouldRotate(int64_t current_size, int64_t pending_bytes, int64_t max_bytes) {

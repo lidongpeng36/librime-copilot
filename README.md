@@ -418,7 +418,14 @@ copilot:
     top_n: 5                  # candidates recorded per event, 1-20
     max_file_bytes: 8388608   # rotate past this size
     keep_generations: 2       # counts the live file, so 2 = live + one archive
+    sample_ok: 0              # keep 1 in N ordinary successes; 0 = none (default)
 ```
+
+`sample_ok` puts ordinary successes back into the log at a known rate — an
+eval set built from real typing needs those as well as the hard cases the log
+otherwise keeps exclusively. It does not affect first-candidate accuracy:
+misses are recorded in full regardless of this setting, so that number needs
+neither sampling nor scaling.
 
 One file per machine at
 `<rime user dir>/private/copilot_telemetry/<installation_id>.jsonl`, created `0600`.
