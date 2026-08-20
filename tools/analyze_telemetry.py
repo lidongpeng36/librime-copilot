@@ -48,6 +48,22 @@ CREATE TABLE ev (
                      -- engaged for this event)
   llm_head_altered INT  -- same concept as head_altered, evaluated against
                         -- llm_text instead of rr_text
+  ,
+  -- v3. NULL on a v1/v2 line: "not recorded" and "recorded as none" are
+  -- different evidence, so nothing here defaults to 0.
+  llm_best TEXT, llm_best_from INT,
+  llm_dropped_n INT,     -- how many candidates the same-span gate removed
+  sel_in_dropped INT,    -- 1 when the user chose one of them: the live cost
+                         -- of copilot/rerank/same_span_only being true
+  decline_kind TEXT,     -- agreed | blocked | NULL. `agreed` is best ==
+                         -- incumbent (a model-quality signal; lowering the
+                         -- margin cannot help); `blocked` is the model
+                         -- preferring something the threshold refused.
+  best_is_sel INT,       -- 1 when the model's pick is what the user chose --
+                         -- with decline_kind='blocked', the recoverable case
+  engage_skip TEXT       -- the event's TOP-LEVEL llm_skip: why the model did
+                         -- not engage. Distinct from the `llm_skip` column
+                         -- above, which is Decide()'s own verdict.
 );
 
 -- One row per `type":"stats"` line (telemetry_event.h:StatsLine). Disjoint
@@ -180,8 +196,27 @@ def _load_event_line(db, e):
     # left nothing at the front to have been overwritten.
     llm_head_altered = 1 if (llm_promoted and top and top[0] != llm.get("text")) else 0
 
+    # v3 fields. Absent on v1/v2 -> None throughout, never 0: a reader must be
+    # able to tell "this line predates the field" from "the field was zero".
+    llm_best = (llm or {}).get("best")
+    llm_best_from = (llm or {}).get("best_from")
+    dropped = (llm or {}).get("dropped")
+    if dropped is not None and not isinstance(dropped, list):
+        raise ValueError("llm.dropped is not a JSON array")
+    llm_dropped_n = len(dropped) if dropped is not None else None
+    sel_in_dropped = (1 if e.get("sel") in dropped else 0) if dropped is not None else None
+    # Decide()'s verdict was `margin` AND we know what it preferred. Without
+    # `best` the two kinds are indistinguishable, which is the whole reason
+    # the field was added -- so a v2 line gets None, not a guess.
+    if llm and llm_skip == "margin" and llm_best is not None:
+        decline_kind = "agreed" if llm_best == llm.get("incumbent") else "blocked"
+    else:
+        decline_kind = None
+    best_is_sel = (1 if llm_best == e.get("sel") else 0) if llm_best is not None else None
+    engage_skip = e.get("llm_skip")
+
     db.execute(
-        "INSERT INTO ev VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO ev VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             e.get("ts"), e.get("machine"), e.get("schema"), e.get("src"),
             e.get("input"), e.get("ctx"), e.get("sel_idx"), e.get("sel"),
@@ -201,6 +236,8 @@ def _load_event_line(db, e):
             llm_promoted,
             llm_verdict,
             llm_head_altered,
+            llm_best, llm_best_from, llm_dropped_n, sel_in_dropped,
+            decline_kind, best_is_sel, engage_skip,
         ),
     )
 
@@ -273,6 +310,77 @@ def rate_table(db, title, expr, where="rr_from > 0", limit=None,
         print("  (no data yet)")
 
 
+# Margins the report asks "what would this threshold have recovered?" about.
+# All BELOW the shipped default of 2.0, and that is not a style choice: a
+# `blocked` decline is by definition one whose margin fell short of whatever
+# the writing machine was configured with, so a threshold at or above that
+# value recovers nothing and would print a column of zeros forever. The old
+# report could only sweep upward; this is the other direction.
+RECOVERY_THRESHOLDS = (0.5, 1.0, 1.5)
+
+
+def accuracy_line(db):
+    """(hits, segments, rate) — first-candidate accuracy, or None.
+
+    `segments` comes from the stats lines, which count every segment
+    BuildCommitEvents walked; `misses` are the recorded events with
+    sel_idx != 0, which ShouldRecord keeps unconditionally. So the numerator
+    needs no sampling and no scaling.
+
+    Known bias, stated by the caller rather than hidden: `segments` includes
+    AutoSpacer's bail-out commits, for which no event is ever produced
+    (telemetry_commit.h), so the denominator is slightly larger than the
+    population the numerator is drawn from. Correcting it needs a second
+    counter on the stats line; deferred until it is shown to matter.
+
+    None when there are no stats lines at all: a v1 file, or a session that
+    ended before the first flush interval closed. A rate computed off the
+    events alone would be a rate over hard cases only, which is exactly the
+    misreading this function exists to replace.
+    """
+    segments = db.execute("SELECT COALESCE(SUM(segments), 0) FROM stats").fetchone()[0]
+    if not segments:
+        return None
+    misses = db.execute("SELECT COUNT(*) FROM ev WHERE sel_idx != 0").fetchone()[0]
+    hits = max(0, segments - misses)
+    return hits, segments, hits / segments
+
+
+def decline_split(db):
+    """How the LLM's declines break down, and what a lower margin would buy.
+
+    Two kinds with opposite fixes:
+      agreed   best == incumbent -- the model endorsed the head and the user
+               disagreed. Lowering `margin` cannot help; this is the share
+               that says whether the MODEL is the limit.
+      blocked  the model preferred something else and the threshold refused
+               it. When that something is what the user then chose
+               (`best_is_sel`), a lower threshold would have fixed the
+               segment outright.
+    """
+    rows = db.execute(
+        "SELECT decline_kind, best_is_sel, llm_margin FROM ev WHERE decline_kind IS NOT NULL"
+    ).fetchall()
+    split = {
+        "agreed": 0,
+        "blocked": 0,
+        "blocked_and_wanted": 0,
+        "recovered_at": {t: 0 for t in RECOVERY_THRESHOLDS},
+    }
+    for kind, best_is_sel, margin in rows:
+        if kind == "agreed":
+            split["agreed"] += 1
+            continue
+        split["blocked"] += 1
+        if not best_is_sel:
+            continue
+        split["blocked_and_wanted"] += 1
+        for threshold in RECOVERY_THRESHOLDS:
+            if margin is not None and margin >= threshold:
+                split["recovered_at"][threshold] += 1
+    return split
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("paths", nargs="+", help="JSONL files from any number of machines")
@@ -310,6 +418,17 @@ def main():
     print("=" * 64)
     print("OVERALL")
     print("=" * 64)
+    acc = accuracy_line(db)
+    if acc:
+        hits, segments, rate = acc
+        print(f"  {'first-candidate accuracy':<44}{rate:>7.1%}  ({hits} / {segments} segments)")
+        print("  Denominator counts every segment observed, including AutoSpacer's")
+        print("  bail-out commits, which produce no event; the numerator is therefore")
+        print("  slightly pessimistic. Misses are recorded in full, so this needs no")
+        print("  sampling correction.")
+    else:
+        print("  first-candidate accuracy: n/a (no stats lines -- v1 file, or the "
+             "first flush interval has not closed)")
     print(f"  {'events read':<44}{total:>8}")
     if altered:
         print(f"  {'EXCLUDED, head altered downstream':<44}{altered:>8}  {altered / total:>6.1%}")
@@ -424,6 +543,32 @@ def main():
               " ELSE '08+' END",
               where="llm_from > 0", promoted_col="llm_promoted",
               verdict_col="llm_verdict", altered_col="llm_head_altered")
+    split = decline_split(db)
+    total_declines = split["agreed"] + split["blocked"]
+    if total_declines:
+        print(f"\n  LLM declined on {total_declines} segment(s)")
+        print(f"    {'model agreed with the head':<36}{split['agreed']:>6}"
+             f"  {split['agreed'] / total_declines:>6.1%}   <- model quality")
+        print(f"    {'threshold blocked the models pick':<36}{split['blocked']:>6}"
+             f"  {split['blocked'] / total_declines:>6.1%}   <- margin")
+        if split["blocked"]:
+            print(f"      of those, the model's pick is what the user chose: "
+                 f"{split['blocked_and_wanted']}")
+            for threshold in RECOVERY_THRESHOLDS:
+                print(f"      margin {threshold} would have recovered: "
+                     f"{split['recovered_at'][threshold]}")
+        print("\n  `agreed` is the share a lower margin cannot fix. When it dominates,")
+        print("  the model is the limit and tools/rime_train/ is the next lever.")
+
+    span = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(sel_in_dropped), 0) FROM ev WHERE llm_dropped_n > 0"
+    ).fetchone()
+    if span[0]:
+        print(f"\n  same_span_only removed candidates on {span[0]} recorded segment(s); "
+             f"the user chose one of them {span[1]} time(s).")
+        print("  That second number is what setting copilot/rerank/same_span_only to")
+        print("  false could address, and nothing else measures it live.")
+
     acted = db.execute("SELECT COUNT(*) FROM ev WHERE llm = 1").fetchone()[0]
     declined = db.execute(
         "SELECT COUNT(*) FROM ev WHERE llm_verdict = 'declined'").fetchone()[0]
