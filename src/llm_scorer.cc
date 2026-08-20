@@ -400,7 +400,6 @@ struct LlmScorer::Impl {
     // there is no catastrophic-cancellation risk here to buy precision
     // against.
     std::vector<float> logprob_sum(group_n, 0.0f);
-    int max_len = 0;
     // Every candidate's first token is scored off the SAME row --
     // ctx_last_logits_, the context's own last-token logits -- so the
     // log-sum-exp that normalizes it is computed once here rather than once
@@ -421,39 +420,56 @@ struct LlmScorer::Impl {
       // own last-token logits, no decode needed (score_candidates.cc:262).
       logprob_sum[i] =
           LogProbGivenLogSumExp(ctx_last_logits_.data(), cand_tokens[i][0], ctx_log_sum_exp);
-      max_len = std::max(max_len, (int)cand_tokens[i].size());
     }
 
-    std::vector<int> active;
-    active.reserve(group_n);
-    for (int r = 0; r + 1 < max_len; ++r) {
-      active.clear();
-      int32_t n_tok = 0;
-      for (int i = 0; i < group_n; ++i) {
-        if (cand_tokens[i].empty() || r + 1 >= (int)cand_tokens[i].size()) {
-          continue;  // this candidate has no token[r+1] left to score
+    // ONE decode for every remaining token of every candidate, not one per
+    // token position. Teacher-forced scoring knows all the tokens up front,
+    // so this is the same shape as a prefill: within a batch, a token attends
+    // to earlier positions of its own sequence, so a candidate's whole tail
+    // can be submitted at once.
+    //
+    // The per-position version batched across candidates but not across
+    // positions, so a group cost `max_len - 1` sequential llama_decode calls
+    // at ~1.5-2ms of launch overhead each. Measured on this model: a
+    // 10-character candidate drove p99 to 13.2ms against a 10ms budget, while
+    // p50 sat at 5.7ms -- the tail was launch count, not arithmetic, which is
+    // why Q8_0 quantization barely moved it (12.8% -> 7.8% over 10ms).
+    //
+    // `owner[k]` maps a batch slot back to its candidate: logits at slot k
+    // predict that candidate's NEXT token, so slot k scores token[r+1] where
+    // r is the position slot k carried.
+    std::vector<int> owner;
+    std::vector<int> next_index;
+    owner.reserve(kNBatch);
+    next_index.reserve(kNBatch);
+    int32_t n_tok = 0;
+    for (int i = 0; i < group_n; ++i) {
+      const int len = (int)cand_tokens[i].size();
+      for (int r = 0; r + 1 < len; ++r) {
+        if (n_tok >= kNBatch) {
+          LOG(ERROR) << "[copilot] llm_scorer: candidate batch overflow at " << n_tok;
+          return false;
         }
-        const llama_seq_id seq = kScratchSeqBase + i;
         batch_.token[n_tok] = cand_tokens[i][r];
         batch_.pos[n_tok] = n_ctx_tok_ + r;
         batch_.n_seq_id[n_tok] = 1;
-        batch_.seq_id[n_tok][0] = seq;
+        batch_.seq_id[n_tok][0] = kScratchSeqBase + i;
         batch_.logits[n_tok] = 1;
-        active.push_back(i);
+        owner.push_back(i);
+        next_index.push_back(r + 1);
         ++n_tok;
       }
-      if (n_tok == 0) {
-        break;
-      }
+    }
+    if (n_tok > 0) {
       batch_.n_tokens = n_tok;
       if (llama_decode(ctx_, batch_) != 0) {
-        LOG(ERROR) << "[copilot] llm_scorer: candidate decode failed at token " << (r + 1);
+        LOG(ERROR) << "[copilot] llm_scorer: candidate decode failed (" << n_tok << " tokens)";
         return false;
       }
       for (int32_t k = 0; k < n_tok; ++k) {
-        const int i = active[k];
+        const int i = owner[k];
         float* logits = llama_get_logits_ith(ctx_, k);
-        logprob_sum[i] += LogProbOf(logits, n_vocab_, cand_tokens[i][r + 1]);
+        logprob_sum[i] += LogProbOf(logits, n_vocab_, cand_tokens[i][next_index[k]]);
       }
     }
 

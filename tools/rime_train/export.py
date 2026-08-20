@@ -22,7 +22,7 @@ from .mkgguf import GGUF_PY  # noqa: F401  (inserts gguf-py on sys.path)
 from .model import Config, Model
 from .vocab import BYTE_TOKENS, SPECIALS, Vocab, build as build_vocab
 
-from gguf import GGUFWriter, TokenType  # noqa: E402
+from gguf import GGMLQuantizationType, GGUFWriter, TokenType, quants  # noqa: E402
 
 
 def _state_dict(blob) -> dict:
@@ -79,13 +79,32 @@ def write(checkpoint: Path, chars: Path, out: Path, dtype: str = "f16") -> None:
     w.add_add_bos_token(True)
     w.add_add_eos_token(False)
 
-    quant = np.float16 if dtype == "f16" else np.float32
-
     def put(name, tensor):
         array = tensor.detach().numpy()
         # RMSNorm weights stay F32 whatever the matrices are: ggml multiplies
-        # them against F32 activations and aborts on a mixed-type binary op.
-        w.add_tensor(name, array.astype(np.float32 if array.ndim == 1 else quant))
+        # them against F32 activations and aborts on a mixed-type binary op
+        # ("unsupported types: dst: f32, src0: f32, src1: f16").
+        if array.ndim == 1:
+            w.add_tensor(name, array.astype(np.float32))
+            return
+        if dtype == "q8_0":
+            # Scoring is memory-bandwidth bound -- measured p99 13.76 ms in f16
+            # against a 10 ms budget -- and Q8_0 halves the weight traffic for
+            # a quantization error far below what candidate ranking resolves.
+            # Rows must be a multiple of the 32-element block; every tensor
+            # here is, but a future shape change would silently not be.
+            assert array.shape[-1] % 32 == 0, (name, array.shape)
+            # No raw_shape: with a uint8 tensor and a quantized raw_dtype,
+            # add_tensor_info treats the shape it is given as a BYTE shape and
+            # converts it back (gguf_writer.py:363-364). Passing the logical
+            # shape makes it try to read 512 bytes per row as Q8_0 blocks of
+            # 34 and fail; letting it use the quantized array's own shape is
+            # what the conversion expects.
+            w.add_tensor(name, quants.quantize(array.astype(np.float32),
+                                               GGMLQuantizationType.Q8_0),
+                         raw_dtype=GGMLQuantizationType.Q8_0)
+            return
+        w.add_tensor(name, array.astype(np.float16 if dtype == "f16" else np.float32))
 
     put("token_embd.weight", model.embed.weight)
     for i, block in enumerate(model.blocks):
@@ -129,7 +148,7 @@ def main() -> int:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--chars", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--dtype", default="f16", choices=("f16", "f32"))
+    ap.add_argument("--dtype", default="f16", choices=("q8_0", "f16", "f32"))
     ap.add_argument("--check", metavar="TEXT",
                     help="print torch's per-token logprobs for TEXT, to compare "
                          "against llama.cpp's for the exported file")
