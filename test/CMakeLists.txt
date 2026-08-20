@@ -11,6 +11,7 @@ set(copilot_test_src
   ime_bridge_socket_test.cc
   ime_bridge_state_test.cc
   prediction_context_test.cc
+  raw_input_order_test.cc
   replay_align_test.cc
   rerank_llm_test.cc
   rerank_test.cc

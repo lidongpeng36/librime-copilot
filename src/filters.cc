@@ -7,6 +7,11 @@
 
 #include "filters.h"
 
+#include <string>
+#include <vector>
+
+#include "raw_input_util.h"
+
 // AutoSpacerFilterTranslation
 namespace rime {
 
@@ -131,38 +136,45 @@ bool RawInputFilterTranslation::Replenish() {
   }
 
   inserted_ = true;
-  auto raw = New<SimpleCandidate>("raw", 0, input_.size(), input_);
-  if (next->type() == "sentence") {
-    cache_.push_back(raw);
-    cache_.push_back(next);
-    return true;
-  }
-  size_t n = (input_.size() + 1) / 2;
-  for (int i = 0; i < page_size_ - 1; ++i) {
-    DLOG(INFO) << "[CAND] " << i << ": '" << next->text() << "'|" << next->type() << "|"
-               << next->start() << "|" << next->end() << "|" << next->quality();
-    if (next->text() == input_) {
-      cache_.push_back(next);
-      return true;
-    }
-    if (next->end() < input_.size()) {
-      cache_.push_back(raw);
-      cache_.push_back(next);
-      return true;
-    }
-    cache_.push_back(next);
-    next = translation_->Peek();
-    translation_->Next();
-    if (!next) {
+  // Peek the rest of the page, then place the raw candidate among it.
+  //
+  // The placement used to be decided inline, and got it wrong in both
+  // directions at once: a `sentence` first candidate short-circuited the
+  // letters to slot 0, so did any first candidate not spanning the whole
+  // input, and the syllable count the feature is defined around
+  // (`(input.size() + 1) / 2`) was computed and never read -- so a short
+  // input got the candidate it does not need and a long one got it in the
+  // one position it must never take. It is a pure decision now
+  // (raw_input_util.h), tested without an engine in
+  // test/raw_input_order_test.cc.
+  std::vector<an<Candidate>> head{next};
+  const int room = page_size_ > 1 ? page_size_ - 1 : 0;
+  while (static_cast<int>(head.size()) < room) {
+    auto more = translation_->Peek();
+    if (!more) {
       break;
     }
+    translation_->Next();
+    head.push_back(more);
   }
-  cache_.push_back(raw);
-  // `next` is null when the upstream translation ran out inside the loop —
-  // pushing it would put a null candidate in the cache, which Peek() then
-  // hands to every downstream filter.
-  if (next) {
-    cache_.push_back(next);
+  std::vector<std::string> texts;
+  texts.reserve(head.size());
+  for (const auto& candidate : head) {
+    DLOG(INFO) << "[CAND] " << texts.size() << ": '" << candidate->text() << "'|"
+               << candidate->type() << "|" << candidate->start() << "|" << candidate->end() << "|"
+               << candidate->quality();
+    texts.push_back(candidate->text());
+  }
+  // `slot` may equal head.size() -- the letters go last when the page is not
+  // full -- so this walks one past the end.
+  const size_t slot = raw_input_detail::Slot(texts, input_, page_size_);
+  for (size_t i = 0; i <= head.size(); ++i) {
+    if (i == slot) {
+      cache_.push_back(New<SimpleCandidate>("raw", 0, input_.size(), input_));
+    }
+    if (i < head.size()) {
+      cache_.push_back(head[i]);
+    }
   }
   return true;
 }
