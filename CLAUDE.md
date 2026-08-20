@@ -275,13 +275,39 @@ configured (`octagram.cc:110` returns a constant); a schema naming a model
 that is absent logs one load failure, never retries, and re-ranking silently
 falls back to the db. Both look exactly like a working install from outside.
 
-On a new machine, after the usual `install` / `restore` / `update`:
+On a new machine, in this order — **`install` before `restore` is not
+stylistic**. The vault gained `private/rime40m-q8.gguf`, and an installed CLI
+whose `vault.py` predates that entry restores everything else and simply does
+not know the model exists. It reports success. Same shape as the `dict.json`
+`boost` hazard above.
 
 ```sh
-rime-copilot restore        # brings the model down from the vault (42MB)
-rime-copilot fetch-grammar  # 41MB, public download
-rime-copilot status         # grammar: ok / model: ok
+# 1. source and tools first
+git clone <librime>; cd librime; git clone <copilot> plugins/copilot
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+# 2. installation.yaml needs `sync_dir` by hand -- Squirrel never writes it
+plugins/copilot/tools/rime-copilot install
+# 3. only now
+~/Library/Rime/private/bin/rime-copilot restore   # config, lexicon, model (42MB)
+rime-copilot fetch-grammar                        # 41MB, public download
+rime-copilot update                               # sogou lexicon + prediction db
+# 4. the plugin itself
+sudo cp build/lib/rime-plugins/librime-copilot.dylib \
+  "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/"
+rime-copilot status                               # the check, not a formality
 ```
+
+**Run `status` and read every line.** A full review of this on 2026-08-20
+found five gaps on a machine that looked fine, four of which were silent:
+unpushed commits, an installed CLI stale enough to miss the model, a vault
+holding a day-old config, and a missing clean stamp. The fifth (`build:
+recipe version 1 -> 2`) was visible only because `status` says so.
+
+The vault-config one is the most dangerous and now explains itself: a
+`conflict` on a file THIS machine last backed up means the edit has not
+travelled, and `status` says so along with the command that fixes it. A
+`conflict` naming another machine is a real conflict. They used to print the
+same sentence.
 
 The model is **named explicitly** in `vault.VAULTED_FILES`, so a retrain under
 a different filename does not travel until that list is updated. That is the

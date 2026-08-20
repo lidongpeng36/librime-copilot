@@ -1270,3 +1270,54 @@ class InstallModel(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             cli.cmd_install_model(self.args())
         self.assertEqual([], list((self.rime / "private").glob("*.part")))
+
+
+class VaultConflictExplanation(unittest.TestCase):
+    """`conflict` is two very different situations wearing one word, and the
+    consequence of the common one is silent: another machine's `restore`
+    quietly brings down the older content and reports success. That is what
+    happened to double_pinyin_flypy.custom.yaml after a day of config edits,
+    and `status` said only "local content is not in the vault"."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.rime = root / "rime"
+        self.store = root / "vault"
+        (self.store / "files").mkdir(parents=True)
+        self.rime.mkdir()
+        (self.rime / "squirrel.custom.yaml").write_text("local\n", encoding="utf-8")
+        (self.store / "files" / "squirrel.custom.yaml").write_text("vaulted\n", encoding="utf-8")
+
+    def record(self, machine: str):
+        from rime_copilot import vault as v
+        v.write_manifest(self.store, {"squirrel.custom.yaml": v.Record(
+            sha256="x", size=8, backed_up_at="2026-08-20T07:26:24Z", machine=machine)})
+
+    def status(self, machine_id: str) -> str:
+        args = argparse.Namespace(rime_dir=self.rime, dry_run=False)
+        buffer = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(cli.paths, "vault_dir",
+                                                  return_value=self.store))
+            stack.enter_context(mock.patch.object(cli.paths, "machine_id",
+                                                  return_value=machine_id))
+            stack.enter_context(redirect_stdout(buffer))
+            cli.cmd_status(args)
+        return buffer.getvalue()
+
+    def test_our_own_stale_backup_names_the_command_that_fixes_it(self):
+        self.record("this-machine")
+        out = self.status("this-machine")
+        self.assertIn("edited here since your own backup", out)
+        self.assertIn("rime-copilot backup", out)
+        # and says what it costs, which is the part that was silent
+        self.assertIn("OLDER copy", out)
+
+    def test_another_machines_copy_is_not_something_backup_fixes(self):
+        self.record("other-machine")
+        out = self.status("this-machine")
+        self.assertIn("other-machine", out)
+        self.assertIn("reconcile by hand", out)
+        self.assertNotIn("edited here since your own backup", out)

@@ -306,9 +306,33 @@ def cmd_status(args) -> int:
     try:
         store = paths.vault_dir(rime_dir)
         print(f"vault:    {store}")
+        records = vault.read_manifest(store)
+        # The same value apply_backup stores (installation_id, not a hostname);
+        # comparing anything else would silently never match.
+        this_machine = paths.machine_id(rime_dir)
         for action in vault.plan_restore(rime_dir, store):
-            if action.kind != "identical":
-                print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
+            if action.kind == "identical":
+                continue
+            print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
+            if action.kind != "conflict":
+                continue
+            # A conflict is two very different situations wearing one word,
+            # and the manifest already knows which: it records the machine
+            # that last backed each file up. Local-differs-from-my-own-backup
+            # is not a conflict at all -- it is an un-backed-up edit, and the
+            # consequence is silent, because another machine's `restore` will
+            # quietly bring down the older content and report success. That is
+            # exactly what happened to double_pinyin_flypy.custom.yaml after a
+            # day of config changes.
+            record = records.get(action.rel)
+            if record is not None and record.machine == this_machine:
+                print(f"                    edited here since your own backup "
+                      f"({record.backed_up_at}); other machines will restore the "
+                      f"OLDER copy until you run `rime-copilot backup`")
+            elif record is not None:
+                print(f"                    the vault's copy came from "
+                      f"{record.machine} at {record.backed_up_at}; reconcile by "
+                      f"hand before backup or restore --force")
     except (FileNotFoundError, LookupError) as exc:
         print(f"vault:    unavailable ({exc})")
 
