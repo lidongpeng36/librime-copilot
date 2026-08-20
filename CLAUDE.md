@@ -383,11 +383,61 @@ as `llm_skip=noctx`. That is largely a corpus artifact — the harness splits
 requests at maximal Han runs, so the character before every run is by
 construction not Han, while real typing continues after committed Chinese.
 Lifting that gate was tried and reverted: it reaches exactly the segments
-where `RawInputFilter` has put the raw keystrokes first, and promoting there
+where `RawInputFilter` had put the raw keystrokes first, and promoting there
 displaces that head (bucket B+D fell from 43.8% to 13.4%). `Decide` enforces
 "never touch bucket B" when choosing *which* candidate wins but nothing
 enforces it on where the winner is *inserted*. See the comment guarding the
 early return in `rerank_filter.cc`.
+
+**That measurement's premise has since changed and the gate has not been
+re-measured.** `RawInputFilter` no longer puts the raw keystrokes first in any
+segment (`b64ef1c` — they go to the last slot of the page, or nowhere), so the
+head those promotions displaced is not there any more. Whether the gate is
+still earning its 68.2% is now an open question rather than a settled one; it
+was left in place deliberately, because re-deciding it needs its own numbers,
+not an inference from this paragraph.
+
+## Propagating a change to a machine that already has this
+
+A new machine follows the bootstrap above. An existing one is a different
+problem, because a change lands on **three channels that do not talk to each
+other**, and most changes touch more than one:
+
+| what changed | how it travels |
+| --- | --- |
+| `tools/` (the CLI) | git, then `install` |
+| `src/` (the plugin) | git, then a **rebuild and a hand-copied dylib** |
+| `*.custom.yaml`, the lexicon, `dict.json`, the model | the vault, via `backup` / `restore` |
+
+The dylib is the channel with no automation, and it is the one carrying every
+C++ change. `git pull` and `restore` both succeeding says nothing about
+whether the plugin's behaviour changed on that machine.
+
+```sh
+cd <librime>/plugins/copilot && git pull
+cd <librime> && cmake --build build          # C++ changes live here and nowhere else
+plugins/copilot/tools/rime-copilot install   # BEFORE restore -- see below
+~/Library/Rime/private/bin/rime-copilot restore
+sudo cp build/lib/rime-plugins/librime-copilot.dylib \
+  "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/"
+rime-copilot deploy
+rime-copilot status                          # read every line
+```
+
+`install` before `restore`, for the same reason it comes first on a new
+machine: a restored file can name things an older CLI does not understand.
+When the schema patch moved `copilot/rerank/llm/model` into nested form, a CLI
+predating that read `model: unconfigured` on a machine where the model was
+present and working — librime resolves either form, so the *plugin* was fine.
+The report was the lie, and acting on a lie like that is the damage.
+
+**`restore` will refuse on any vaulted file that machine has edited, and that
+is correct.** Local content the vault does not know is a conflict, not
+something to overwrite. Read `status` first to confirm the local copy really
+is just the not-yet-updated version, then `restore --force` to take the
+vault's. Never reach for `backup --force` to clear it: that pushes the stale
+local copy up over the change being propagated, which is the exact shape of
+the June-2025 lexicon incident above.
 
 ## Clients
 - `clients/neovim/lua/rime_ime/` — Neovim client for the IME Bridge, one
@@ -431,3 +481,23 @@ Users add `copilot` to `engine/processors` (before `key_binder`) and `copilot_tr
 to `engine/translators`, plus a `copilot` switch. Full schema-config reference (db path,
 `max_candidates`, `max_iterations`, LLM `model`/`n_predict`, `ime_bridge`, `auto_spacer`)
 lives in `README.md`.
+
+### Flat vs nested keys in a `.custom.yaml` patch
+
+A patch key whose value is a map REPLACES that node wholesale
+(`config_compiler.cc` `EditNode`: without a `/+` suffix `merging` is false, so
+`*target = value`). So `"copilot/llm/enable": false` and a nested `copilot:` →
+`llm:` → `enable:` are both correct for `copilot` — the patch already owns
+that whole node — but writing `grammar:` or `translator:` as a map would drop
+every other key the schema defines under them, silently. Those stay flat.
+
+Patch entries are a `map<string, ...>` (`config_types.h:89`), so they apply in
+**lexicographic key order, not file order**. `copilot` sorts before
+`copilot/llm/enable`, which is the only reason a file mixing both forms worked
+at all. One nested block has no ordering to get wrong.
+
+Anything reading these files by scanning lines must handle three shapes: the
+flat key, the nested block, and the FLOW map Rime's deployer writes into
+`build/*.schema.yaml` (`llm: {..., model: "...", ...}`). `_config_leaves`
+(`tools/rime_copilot/cli.py`) is the one that does; `status` reported a
+working model as `unconfigured` for want of it.
