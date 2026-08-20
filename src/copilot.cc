@@ -452,6 +452,16 @@ string Copilot::GetPredictionContext(const string& committed) const {
 }
 
 void Copilot::CopilotAndUpdate(Context* ctx, const string& context_query) {
+  // The `copilot` switch is the single authority on whether predictions
+  // appear, and the check belongs HERE rather than at the call sites --
+  // OnContextUpdate had one and SelectCharacter's on_accept callback did not,
+  // so picking a character off a candidate popped a prediction menu on a
+  // schema whose switch reads 關閉預測. A gate at the choke point cannot be
+  // forgotten by the next caller; OnContextUpdate's own check stays, since it
+  // also guards self_updating_ and the punctuation path above it.
+  if (!ctx || !ctx->get_option("copilot")) {
+    return;
+  }
   // auto history = copilot_engine_->history();
   // LOG(INFO) << "CopilotAndUpdate: " << history->get_chars(10)
   //           << " context_query: " << context_query;
