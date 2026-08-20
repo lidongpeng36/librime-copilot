@@ -6,9 +6,14 @@ log actually produces.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
+import re
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -179,3 +184,176 @@ class DeclineSplit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def load_files(files: dict) -> sqlite3.Connection:
+    """Run the real `load()` over temp files named as the machines are named.
+
+    Not `load_one`: version accounting has to happen where the file name is
+    known, because a stats line carries no `machine` of its own.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for name, lines in files.items():
+            p = Path(tmp) / name
+            p.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+            paths.append(str(p))
+        db, _ = analyze.load(paths)
+    return db
+
+
+class RecorderVersions(unittest.TestCase):
+    """A machine whose dylib predates the current schema keeps recording, and
+    every v3 column it writes is silently absent. Nothing else in the report
+    says so -- the engagement rate merely looks wrong, which is an inference,
+    not a statement."""
+
+    def test_a_machine_writing_the_previous_schema_is_named_stale(self):
+        db = load_files({
+            "New.jsonl": [{"v": 3, "ts": "2026-08-21T10:00:00+0800", "machine": "New",
+                           "sel": "想", "sel_idx": 0, "top": ["想"]}],
+            "Old.jsonl": [{"v": 2, "ts": "2026-08-21T10:00:00+0800", "machine": "Old",
+                           "sel": "想", "sel_idx": 0, "top": ["想"]}],
+        })
+        report = {r[0]: r for r in analyze.recorder_report(db)}
+        self.assertEqual(report["Old"][1], 2)
+        self.assertTrue(report["Old"][3])
+        self.assertEqual(report["New"][1], 3)
+        self.assertFalse(report["New"][3])
+
+    def test_a_machine_that_upgraded_is_judged_on_its_latest_line(self):
+        db = load_files({
+            "Mac-Mini.jsonl": [
+                {"v": 2, "ts": "2026-08-20T10:00:00+0800", "machine": "Mac-Mini",
+                 "sel": "想", "sel_idx": 0, "top": ["想"]},
+                {"v": 3, "ts": "2026-08-21T10:00:00+0800", "machine": "Mac-Mini",
+                 "sel": "想", "sel_idx": 0, "top": ["想"]},
+            ],
+        })
+        machine, latest_v, lines, stale, behind = analyze.recorder_report(db)[0]
+        self.assertEqual((machine, latest_v, lines, behind), ("Mac-Mini", 3, 2, 1))
+        self.assertFalse(stale)
+
+    def test_a_stats_line_is_attributed_to_the_file_it_came_from(self):
+        db = load_files({
+            "Mac-Mini.jsonl": [{"v": 2, "type": "stats", "ts": "2026-08-20T15:29:03+0800",
+                                "segments": 6, "llm_acted": 5}],
+        })
+        self.assertEqual(analyze.recorder_report(db), [("Mac-Mini", 2, 1, True, 1)])
+
+    def test_an_unparseable_line_is_not_counted_as_a_recorded_line(self):
+        db = load_files({
+            "Mac-Mini.jsonl": [{"v": 3, "type": "stats", "ts": "2026-08-21T10:00:00+0800",
+                                "segments": "not a number"}],
+        })
+        self.assertEqual(analyze.recorder_report(db), [])
+
+
+class SchemaVersionDrift(unittest.TestCase):
+    """The analyser's idea of `current` has to be the plugin's. A hand-kept
+    copy that drifts would report every machine as stale, or none."""
+
+    def test_the_analysers_version_matches_telemetry_event_h(self):
+        header = (Path(__file__).resolve().parents[2] / "src" / "telemetry_event.h").read_text(
+            encoding="utf-8")
+        m = re.search(r"kSchemaVersion\s*=\s*(\d+)", header)
+        self.assertIsNotNone(m, "kSchemaVersion not found in src/telemetry_event.h")
+        self.assertEqual(analyze.SCHEMA_VERSION, int(m.group(1)))
+
+
+class SmallSampleGuard(unittest.TestCase):
+    """A percentage over a handful of segments is the number that gets written
+    down as the baseline every later change is measured against."""
+
+    def test_a_rate_over_too_few_samples_is_not_printed(self):
+        self.assertEqual(analyze.pct(1, 3).strip(), "n/a")
+
+    def test_a_rate_over_enough_samples_is_printed(self):
+        self.assertEqual(analyze.pct(30, 40, min_total=40).strip(), "75.0%")
+
+    def test_an_empty_denominator_is_not_a_division(self):
+        self.assertEqual(analyze.pct(0, 0).strip(), "n/a")
+
+
+class ReportNamesAStaleRecorder(unittest.TestCase):
+    """The check is only worth having if it is loud. Task 9 of the plan had a
+    human infer staleness from the engagement rate looking wrong."""
+
+    def _report_over(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for name, lines in files.items():
+                p = Path(tmp) / name
+                p.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+                paths.append(str(p))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                argv = sys.argv
+                sys.argv = ["analyze_telemetry.py", *paths]
+                try:
+                    analyze.main()
+                finally:
+                    sys.argv = argv
+        return out.getvalue()
+
+    def test_a_machine_on_the_old_schema_is_named_in_the_report(self):
+        text = self._report_over({
+            "Old.jsonl": [
+                {"v": 2, "ts": "2026-08-21T10:00:00+0800", "machine": "Old",
+                 "sel": "想", "sel_idx": 1, "top": ["先", "想"]},
+                {"v": 2, "type": "stats", "ts": "2026-08-21T10:01:00+0800",
+                 "segments": 6, "llm_acted": 5},
+            ],
+        })
+        self.assertIn("Old", text)
+        self.assertIn("STALE", text)
+
+    def test_a_current_machine_is_not_flagged(self):
+        text = self._report_over({
+            "New.jsonl": [
+                {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
+                 "machine": "New", "sel": "想", "sel_idx": 1, "top": ["先", "想"]},
+                {"v": analyze.SCHEMA_VERSION, "type": "stats",
+                 "ts": "2026-08-21T10:01:00+0800", "segments": 6, "llm_acted": 5},
+            ],
+        })
+        self.assertNotIn("STALE", text)
+
+    def test_an_accuracy_over_a_handful_of_segments_is_not_given_as_a_rate(self):
+        text = self._report_over({
+            "New.jsonl": [
+                {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
+                 "machine": "New", "sel": "想", "sel_idx": 1, "top": ["先", "想"]},
+                {"v": analyze.SCHEMA_VERSION, "type": "stats",
+                 "ts": "2026-08-21T10:01:00+0800", "segments": 6, "llm_acted": 5},
+            ],
+        })
+        line = next(x for x in text.splitlines() if "first-candidate accuracy" in x)
+        self.assertIn("n/a", line)
+        self.assertIn("5 / 6 segments", line)
+
+
+class MixedVersionMachine(unittest.TestCase):
+    """A machine that was upgraded mid-file holds lines of both schemas, and
+    the older ones have every new column NULL. How many is what says how much
+    of the report is blank for reasons that are not about the typing."""
+
+    def test_the_lines_predating_the_current_schema_are_counted(self):
+        db = load_files({
+            "Mac-Mini.jsonl": [
+                {"v": 2, "ts": "2026-08-20T10:00:00+0800", "machine": "Mac-Mini",
+                 "sel": "想", "sel_idx": 0, "top": ["想"]},
+                {"v": 2, "ts": "2026-08-20T11:00:00+0800", "machine": "Mac-Mini",
+                 "sel": "想", "sel_idx": 0, "top": ["想"]},
+                {"v": 3, "ts": "2026-08-21T10:00:00+0800", "machine": "Mac-Mini",
+                 "sel": "想", "sel_idx": 0, "top": ["想"]},
+            ],
+        })
+        self.assertEqual(analyze.recorder_report(db), [("Mac-Mini", 3, 3, False, 2)])
+
+    def test_a_machine_wholly_on_the_current_schema_has_nothing_behind(self):
+        db = load_files({
+            "New.jsonl": [{"v": 3, "ts": "2026-08-21T10:00:00+0800", "machine": "New",
+                           "sel": "想", "sel_idx": 0, "top": ["想"]}],
+        })
+        self.assertEqual(analyze.recorder_report(db), [("New", 3, 1, False, 0)])

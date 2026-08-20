@@ -16,6 +16,8 @@ command for the merged directory, which is the shared sync dir named in
 
 import argparse
 import json
+import os
+import re
 import sqlite3
 import sys
 
@@ -81,7 +83,33 @@ CREATE TABLE stats (
 CREATE TABLE skip (
   ts TEXT, reason TEXT, count INT
 );
+
+-- One row per (machine, schema version) actually seen in the files, counted
+-- over BOTH line types. Its only job is to answer "is some machine still
+-- writing an older schema than the code in this checkout" -- i.e. is its
+-- librime-copilot.dylib stale. Nothing else in this report can say so: a
+-- stale recorder simply omits the newer columns, which reads identically to
+-- "that situation did not arise". `ts` is the newest line seen for the pair,
+-- so a machine that was upgraded mid-file is judged on its latest line and
+-- not on its history.
+CREATE TABLE recorder (
+  machine TEXT, v INT, ts TEXT, n INT,
+  PRIMARY KEY (machine, v)
+);
 """
+
+# The schema this checkout's plugin writes (src/telemetry_event.h:kSchemaVersion).
+# Kept here rather than parsed out of the header so the report needs no source
+# tree at hand; analyze_telemetry_test.py fails if the two drift, which is the
+# same generated-file-plus-drift-test arrangement tools/requirements.txt uses.
+SCHEMA_VERSION = 3
+
+# Below this many samples a percentage is noise, and the first percentage this
+# report prints becomes the baseline every later change is quoted against. The
+# counts are still shown -- they are real; it is the rate derived from them
+# that is not yet evidence.
+MIN_N = 30
+
 
 HEAD_ALTERED_NOTE = """\
   What this means: `rr.text` is captured inside copilot_rerank_filter, at the
@@ -108,6 +136,12 @@ def load(paths):
     db.executescript(SCHEMA)
     skipped = 0
     for path in paths:
+        # A stats line carries no `machine` of its own (telemetry_event.h's
+        # StatsLine has no such field), and the writer names the file after it
+        # -- telemetry.cc:41, `machine + ".jsonl"`, plus a `.N` suffix once
+        # rotation has run. So the file name is the only attribution a stats
+        # line has, and the machine name itself may contain dots.
+        file_machine = re.sub(r"\.jsonl(\.\d+)?$", "", os.path.basename(path))
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
@@ -132,11 +166,77 @@ def load(paths):
                         _load_stats_line(db, e)
                     else:
                         _load_event_line(db, e)
+                    # After the line has loaded, not before: a line the loader
+                    # rejects is not evidence about which schema the recorder
+                    # writes, and counting it would let one torn line make a
+                    # current machine look stale.
+                    _record_version(db, e, file_machine)
                 except (ValueError, TypeError, AttributeError, sqlite3.InterfaceError):
                     skipped += 1
                     continue
     db.commit()
     return db, skipped
+
+
+def _record_version(db, e, file_machine):
+    """Count this line under (machine, schema version), keeping the newest ts."""
+    v = e.get("v")
+    # A `true` here is not version 1. Anything that is not a plain int is
+    # recorded as 0, which prints as `v?` and counts as stale -- unknown and
+    # old are the same call to action (rebuild that machine's dylib).
+    v = v if isinstance(v, int) and not isinstance(v, bool) else 0
+    machine = e.get("machine") or file_machine
+    ts = e.get("ts") if isinstance(e.get("ts"), str) else ""
+    db.execute(
+        "INSERT INTO recorder VALUES (?,?,?,1) ON CONFLICT(machine, v) DO UPDATE SET "
+        "n = n + 1, ts = MAX(ts, excluded.ts)",
+        (machine, v, ts),
+    )
+
+
+def recorder_report(db, current=None):
+    """[(machine, latest_v, lines, stale, behind)], one row per machine, by name.
+
+    `stale` means that machine's most recent line was written by a plugin
+    older than this checkout's -- its dylib has not been rebuilt and installed,
+    so every column added since is absent from its lines while looking exactly
+    like a column whose situation never arose.
+
+    Judged on the LATEST line rather than on the highest version seen, so that
+    a rollback reads as a rollback instead of being hidden by the newer lines
+    that came before it.
+
+    `behind` is how many of that machine's lines predate `current`. A machine
+    upgraded mid-file is not stale, but the lines it wrote before the upgrade
+    still have every newer column NULL -- so this is what says how much of the
+    report is blank for a reason that has nothing to do with the typing.
+    """
+    current = SCHEMA_VERSION if current is None else current
+    rows = db.execute(
+        """
+        SELECT machine, SUM(n), SUM(CASE WHEN v < ? THEN n ELSE 0 END),
+               (SELECT v FROM recorder inner_r
+                 WHERE inner_r.machine = outer_r.machine
+                 ORDER BY inner_r.ts DESC, inner_r.v DESC LIMIT 1)
+        FROM recorder outer_r GROUP BY machine ORDER BY machine
+        """,
+        (current,),
+    ).fetchall()
+    return [(machine, latest_v, lines, latest_v < current, behind)
+            for machine, lines, behind, latest_v in rows]
+
+
+def pct(n, total, width=6, min_total=None):
+    """`n / total` as a right-aligned percentage, or `n/a` when total is too small.
+
+    See MIN_N. Returning a string rather than a number is deliberate: a caller
+    that got None back would have to decide what to print, and every caller
+    would decide it differently.
+    """
+    min_total = MIN_N if min_total is None else min_total
+    if not total or total < min_total:
+        return "n/a".rjust(width)
+    return f"{n / total:.1%}".rjust(width)
 
 
 def _load_event_line(db, e):
@@ -418,14 +518,20 @@ def main():
     print("=" * 64)
     print("OVERALL")
     print("=" * 64)
+    _print_recorders(db)
     acc = accuracy_line(db)
     if acc:
         hits, segments, rate = acc
-        print(f"  {'first-candidate accuracy':<44}{rate:>7.1%}  ({hits} / {segments} segments)")
+        print(f"  {'first-candidate accuracy':<44}{pct(hits, segments, 7)}  "
+              f"({hits} / {segments} segments)")
         print("  Denominator counts every segment observed, including AutoSpacer's")
         print("  bail-out commits, which produce no event; the numerator is therefore")
         print("  slightly pessimistic. Misses are recorded in full, so this needs no")
         print("  sampling correction.")
+        if segments < MIN_N:
+            print(f"  The counts are real; the rate is withheld under {MIN_N} segments,")
+            print("  because the first one printed becomes the baseline every later")
+            print("  change gets quoted against.")
     else:
         print("  first-candidate accuracy: n/a (no stats lines -- v1 file, or the "
              "first flush interval has not closed)")
@@ -548,9 +654,12 @@ def main():
     if total_declines:
         print(f"\n  LLM declined on {total_declines} segment(s)")
         print(f"    {'model agreed with the head':<36}{split['agreed']:>6}"
-             f"  {split['agreed'] / total_declines:>6.1%}   <- model quality")
+             f"  {pct(split['agreed'], total_declines)}   <- model quality")
         print(f"    {'threshold blocked the models pick':<36}{split['blocked']:>6}"
-             f"  {split['blocked'] / total_declines:>6.1%}   <- margin")
+             f"  {pct(split['blocked'], total_declines)}   <- margin")
+        if total_declines < MIN_N:
+            print(f"    (shares withheld: {total_declines} decline(s) is below the "
+                 f"{MIN_N} this report will divide by)")
         if split["blocked"]:
             print(f"      of those, the model's pick is what the user chose: "
                  f"{split['blocked_and_wanted']}")
@@ -599,6 +708,37 @@ def main():
     _print_skip_distribution(db)
     print()
     return 0
+
+
+def _print_recorders(db):
+    """Which schema each machine is writing, and which are behind this checkout.
+
+    Printed ahead of every number derived from the lines, because a stale
+    recorder's missing columns are indistinguishable from columns whose
+    situation never arose -- every section below would then read as evidence
+    when it is an artefact of a dylib that was never reinstalled. Printed even
+    when everything is current: a check that only speaks up on failure cannot
+    be told apart from a check that did not run.
+    """
+    rows = recorder_report(db)
+    if not rows:
+        return
+    print(f"  {'recorders':<30}{'latest':<8}{'lines':>7}")
+    for machine, latest_v, lines, stale, behind in rows:
+        version = f"v{latest_v}" if latest_v else "v?"
+        note = f"   !!  STALE" if stale else (
+            f"   {behind} predate v{SCHEMA_VERSION}" if behind else "")
+        print(f"    {machine:<28}{version:<8}{lines:>7}{note}")
+    stale_names = [r[0] for r in rows if r[3]]
+    if stale_names:
+        print(f"\n  !!  Not writing schema v{SCHEMA_VERSION}, which is what this checkout's")
+        print(f"      src/telemetry_event.h writes: {', '.join(stale_names)}.")
+        print("      The librime-copilot.dylib there predates the source, so every")
+        print("      column added since is simply absent from those lines -- and absent")
+        print("      reads exactly like `this never happened`. Rebuild and reinstall")
+        print("      (see CLAUDE.md, the Squirrel.app copy step) before treating the")
+        print("      sections below as evidence about that machine.")
+    print()
 
 
 def _print_skip_distribution(db):
