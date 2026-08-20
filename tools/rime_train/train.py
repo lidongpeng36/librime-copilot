@@ -144,7 +144,11 @@ def main() -> int:
             print(f"step {step:6}/{args.steps}  loss {total:.4f}  lr {lr:.2e}  "
                   f"{seen/1e6:.0f}M tokens  {seen/elapsed/1e3:.0f}k tok/s", flush=True)
         if step % args.save_every == 0 or step == args.steps:
-            torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, args.out)
+            # Unwrap torch.compile: an OptimizedModule's state_dict prefixes
+            # every key with `_orig_mod.`, which then will not load into the
+            # plain Model the exporter builds.
+            weights = getattr(model, "_orig_mod", model).state_dict()
+            torch.save({"model": weights, "cfg": cfg.__dict__}, args.out)
             print(f"  saved {args.out}", flush=True)
     return 0
 

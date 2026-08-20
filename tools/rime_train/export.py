@@ -25,11 +25,25 @@ from .vocab import BYTE_TOKENS, SPECIALS, Vocab, build as build_vocab
 from gguf import GGUFWriter, TokenType  # noqa: E402
 
 
+def _state_dict(blob) -> dict:
+    """The weights, with torch.compile's wrapper prefix removed if present.
+
+    `torch.compile` returns an OptimizedModule whose state_dict keys are all
+    prefixed `_orig_mod.`, so a checkpoint saved from the compiled model does
+    not load into the plain one. train.py now saves the unwrapped module, but
+    checkpoints written before that still carry the prefix and are perfectly
+    good weights -- refusing them would mean retraining for a naming
+    difference.
+    """
+    return {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
+            for k, v in blob["model"].items()}
+
+
 def write(checkpoint: Path, chars: Path, out: Path, dtype: str = "f16") -> None:
     blob = torch.load(checkpoint, map_location="cpu")
     cfg = Config(**blob["cfg"])
     model = Model(cfg)
-    model.load_state_dict(blob["model"])
+    model.load_state_dict(_state_dict(blob))
     model.eval()
 
     pieces = build_vocab(chars)
@@ -100,7 +114,7 @@ def reference_logprobs(checkpoint: Path, chars: Path, text: str) -> list[float]:
     blob = torch.load(checkpoint, map_location="cpu")
     cfg = Config(**blob["cfg"])
     model = Model(cfg)
-    model.load_state_dict(blob["model"])
+    model.load_state_dict(_state_dict(blob))
     model.eval()
     vocab = Vocab(build_vocab(chars))
     ids = vocab.encode(text, bos=True)
