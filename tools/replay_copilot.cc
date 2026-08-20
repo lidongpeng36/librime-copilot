@@ -454,6 +454,8 @@ struct WarmConfig {
   // whenever the schema does not set copilot/rerank/max_context_chars, same as
   // the filter itself.
   int max_context_chars = 8;
+  // LlmRerankOptions::context_chars' default; what the scorer is warmed with.
+  int llm_context_chars = 32;
   // The SAME RerankTraceStore CopilotRerankFilter writes each segment's real
   // decision into (rerank_trace.h) -- see ObserveLlm below for why this tool
   // reads that instead of re-deriving the decision itself.
@@ -468,6 +470,7 @@ WarmConfig ReadWarmConfig(RimeApi* rime, RimeSessionId session_id) {
     RimeConfig config = {nullptr};
     if (rime->schema_open(schema_id, &config)) {
       rime->config_get_int(&config, "copilot/rerank/max_context_chars", &cfg.max_context_chars);
+      rime->config_get_int(&config, "copilot/rerank/llm/context_chars", &cfg.llm_context_chars);
       rime->config_close(&config);
     }
   }
@@ -587,7 +590,10 @@ struct PendingSegmentContext {
 PendingSegmentContext BuildAndWarmContext(const Options& opts, const WarmConfig& cfg,
                                           const std::string& base) {
   PendingSegmentContext out;
-  out.context = rime::TrailingCjkRun(base, cfg.max_context_chars);
+  // Must be the same function the filter and Copilot's warm trigger use, or
+  // this harness warms a context nobody asks about and every --wait-for-warm
+  // reports success while every Apply() finds the cache cold.
+  out.context = rime::ScoringContext(base, cfg.llm_context_chars);
   if (opts.wait_for_warm) {
     out.warmed = WarmAndWait(cfg.scorer, out.context);
   }

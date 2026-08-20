@@ -280,3 +280,77 @@ TEST(PickPromotion, ReportsNoLevelWhenNothingMatches) {
   EXPECT_EQ(p.index, -1);
   EXPECT_EQ(p.level, 0);
 }
+
+// EligibleBySpan — which candidates a promotion may consider.
+//
+// The switch behind these is `copilot/rerank/same_span_only`, and both
+// positions matter: true is the behaviour this filter has always had, false
+// is what the +0.2% / +13.9% gap sits behind. A test of only one of them
+// would leave the option that changes anything uncovered.
+
+TEST(EligibleBySpan, KeepsOnlyTheHeadsSpanWhenRestricted) {
+  // head covers 3 syllables; the 2-syllable candidates are ineligible.
+  EXPECT_EQ((std::vector<size_t>{0, 2}), rime::EligibleBySpan({3, 2, 3, 2}, true));
+}
+
+TEST(EligibleBySpan, KeepsEverythingWhenUnrestricted) {
+  EXPECT_EQ((std::vector<size_t>{0, 1, 2, 3}), rime::EligibleBySpan({3, 2, 3, 2}, false));
+}
+
+TEST(EligibleBySpan, TheHeadIsAlwaysEligible) {
+  // Whatever the flag, position 0 must survive: it is the incumbent, and a
+  // decision that cannot see it has nothing to compare a promotion against.
+  EXPECT_EQ(0u, rime::EligibleBySpan({5, 1, 1}, true).front());
+  EXPECT_EQ(0u, rime::EligibleBySpan({5, 1, 1}, false).front());
+}
+
+TEST(EligibleBySpan, AllSpansEqualIsUnaffectedByTheFlag) {
+  EXPECT_EQ(rime::EligibleBySpan({4, 4, 4}, true), rime::EligibleBySpan({4, 4, 4}, false));
+}
+
+TEST(EligibleBySpan, EmptyWindowYieldsNothingRatherThanReadingTheHead) {
+  EXPECT_TRUE(rime::EligibleBySpan({}, true).empty());
+  EXPECT_TRUE(rime::EligibleBySpan({}, false).empty());
+}
+
+// ScoringContext — what the model conditions on.
+//
+// Distinct from TrailingCjkRun, and the distinction is worth 68.2% of
+// segments: gating the model on a Han-only tail meant it was consulted on
+// 8.8% of them (llm_skip=noctx). Three call sites compute this string and the
+// warm cache is keyed by it, so they all call this one function -- two of
+// them disagreeing warms a context nobody asks about and the feature silently
+// never runs.
+
+TEST(ScoringContext, KeepsNonHanThatTrailingCjkRunWouldDrop) {
+  // The context that 77.3% of eval requests actually have.
+  EXPECT_EQ("好的, ", rime::ScoringContext("好的, ", 32));
+  EXPECT_EQ("", rime::TrailingCjkRun("好的, ", 32));
+}
+
+TEST(ScoringContext, TakesTheTailNotTheHead) {
+  EXPECT_EQ("建瓴", rime::ScoringContext("高屋建瓴", 2));
+}
+
+TEST(ScoringContext, CountsCharactersNotBytes) {
+  // Four Han characters are twelve bytes; a byte-wise tail would split one.
+  EXPECT_EQ("高屋建瓴", rime::ScoringContext("高屋建瓴", 4));
+}
+
+TEST(ScoringContext, ShorterThanTheLimitIsReturnedWhole) {
+  EXPECT_EQ("好的", rime::ScoringContext("好的", 32));
+}
+
+TEST(ScoringContext, EmptyInputsYieldEmpty) {
+  EXPECT_EQ("", rime::ScoringContext("", 32));
+  EXPECT_EQ("", rime::ScoringContext("好的", 0));
+}
+
+TEST(ScoringContext, MixedLatinAndHanSurvivesIntact) {
+  // What the user's own technical writing looks like, and the reason the
+  // limit counts characters uniformly: 10 back from the end of
+  // "先去修 build.py 吧" lands inside the Latin, and every one of those
+  // characters is context the model was trained to read.
+  EXPECT_EQ("build.py 吧", rime::ScoringContext("先去修 build.py 吧", 10));
+  EXPECT_EQ("先去修 build.py 吧", rime::ScoringContext("先去修 build.py 吧", 32));
+}

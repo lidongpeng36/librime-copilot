@@ -485,8 +485,12 @@ void Copilot::WarmRerankContext(Context* ctx, const string& extra_committed) {
   if (!surrounding) {
     return;  // no real surrounding text -- same guard the filter applies
   }
+  // ScoringContext, not TrailingCjkRun: the warm cache is keyed by the exact
+  // string, and CopilotRerankFilter asks it about ScoringContext's result.
+  // Warming a different string does not fail loudly -- every warm succeeds and
+  // every Apply() finds the cache cold, so the feature silently never runs.
   const string context =
-      TrailingCjkRun(surrounding->before + extra_committed, rerank_max_context_chars_);
+      ScoringContext(surrounding->before + extra_committed, rerank_llm_context_chars_);
   if (context.empty()) {
     return;
   }

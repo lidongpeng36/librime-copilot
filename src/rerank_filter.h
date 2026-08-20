@@ -59,6 +59,22 @@ struct RerankOptions {
   // promotes. Rank rather than weight share: merged dictionaries live on
   // different scales, and a key can have thousands of continuations.
   int max_rank = 10;
+  // Whether a promotion may only take a candidate covering the SAME input
+  // span as the current first one.
+  //
+  // True is the behaviour this filter has always had, on the judgement --
+  // recorded in a comment, never tested on its own -- that changing how much
+  // input Space commits is "far more surprising than a different character".
+  // It is also decisive rather than marginal: 82.6% of top-4 windows contain
+  // a differing end(), and applying it took the LLM path from +6.8%/+5.8% to
+  // +0.2%/+0.8%. Offline, lifting it is worth +13.9% net on the A/C segments.
+  //
+  // Configurable because the question it answers is about how a promotion
+  // FEELS, which no corpus can settle -- and because the sentence path of
+  // this same design promotes whole-run candidates to position 0, changing
+  // the commit span far more than any word-level promotion does. Defaults to
+  // true so nothing changes for anyone who does not opt in.
+  bool same_span_only = true;
   // The LLM scoring path -- primary source when it can run; see rerank_llm.h.
   LlmRerankOptions llm;
 };

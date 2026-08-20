@@ -28,14 +28,15 @@ class RerankTranslation : public PrefetchTranslation {
  public:
   RerankTranslation(an<Translation> translation, an<RerankContinuations> continuations,
                     const RerankOptions& options, an<RerankTraceStore> traces, std::string input,
-                    std::string ctx, std::string src, TraceSpan span, Scorer* llm_scorer,
-                    llm_rerank::SkipReason llm_skip)
+                    std::string ctx, std::string llm_ctx, std::string src, TraceSpan span,
+                    Scorer* llm_scorer, llm_rerank::SkipReason llm_skip)
       : PrefetchTranslation(translation),
         continuations_(std::move(continuations)),
         options_(options),
         traces_(std::move(traces)),
         input_(std::move(input)),
         ctx_(std::move(ctx)),
+        llm_ctx_(std::move(llm_ctx)),
         src_(std::move(src)),
         span_(span),
         llm_scorer_(llm_scorer),
@@ -50,6 +51,12 @@ class RerankTranslation : public PrefetchTranslation {
   an<RerankTraceStore> traces_;
   std::string input_;
   std::string ctx_;
+  // What the model conditions on. Separate from ctx_ because they are
+  // different strings for different consumers: ctx_ is the Han-only tail the
+  // db is keyed by, and is what the trace records (telemetry_event.h's
+  // contract), while llm_ctx_ is the raw text before the caret that the model
+  // was trained to read. See ScoringContext in rerank.h.
+  std::string llm_ctx_;
   std::string src_;
   // The segment's own extent, captured in Apply(). A translation cannot reach
   // the Segment — it sees candidates — so it is handed in, exactly like input_,
@@ -122,24 +129,24 @@ bool RerankTranslation::Replenish() {
     // not an outage, so it does NOT fall through to the db -- "declined" and
     // "never ran" must stay distinguishable (rerank_llm.h).
     //
-    // Same-span restriction as the db loop below -- promoting across spans
-    // changes how much input Space commits, which applies to this branch
-    // exactly as much as to the db one; it is not superseded by "never touch
-    // bucket B" (rerank_llm.h), a different invariant about which candidates
-    // may be considered at all, not about which spans may be mixed together.
-    // Measured on the claude/dingtalk corpora (final-fix-report.md, F2):
-    // 82.6% of top-4 windows contain a differing end() -- far from
-    // negligible, so the restriction is applied here too.
-    const size_t head_end = window.front()->end();
+    // Same-span restriction as the db loop below, and gated by the same
+    // option (RerankOptions::same_span_only) so both branches can never
+    // disagree about which candidates are eligible. It is not superseded by
+    // "never touch bucket B" (rerank_llm.h), a different invariant about
+    // which candidates may be considered at all, not about which spans may be
+    // mixed together. Measured on the claude/dingtalk corpora
+    // (final-fix-report.md, F2): 82.6% of top-4 windows contain a differing
+    // end(), so this is decisive rather than marginal in either position.
+    std::vector<size_t> ends;
+    ends.reserve(window.size());
+    for (const auto& cand : window) {
+      ends.push_back(cand->end());
+    }
+    const std::vector<size_t> same_span_positions = EligibleBySpan(ends, options_.same_span_only);
     std::vector<an<Candidate>> same_span;
-    std::vector<size_t> same_span_positions;  // index into `window`
-    same_span.reserve(window.size());
-    same_span_positions.reserve(window.size());
-    for (size_t i = 0; i < window.size(); ++i) {
-      if (window[i]->end() == head_end) {
-        same_span.push_back(window[i]);
-        same_span_positions.push_back(i);
-      }
+    same_span.reserve(same_span_positions.size());
+    for (size_t i : same_span_positions) {
+      same_span.push_back(window[i]);
     }
     std::vector<std::string> window_texts;
     window_texts.reserve(same_span.size());
@@ -159,7 +166,7 @@ bool RerankTranslation::Replenish() {
     // cache hit, not this. trace.score_us is the only place that measures the
     // real call.
     const auto score_t0 = std::chrono::steady_clock::now();
-    const auto scored = llm_scorer_->Score(ctx_, to_score);
+    const auto scored = llm_scorer_->Score(llm_ctx_, to_score);
     trace.score_us = std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - score_t0)
                          .count();
@@ -218,14 +225,18 @@ bool RerankTranslation::Replenish() {
     // Only reorder among candidates covering the same input span as the
     // current first one — promoting across spans would change how much input
     // Space commits, which is far more surprising than a different character.
-    const size_t head_end = window.front()->end();
+    // That judgement is now `copilot/rerank/same_span_only`; see its comment
+    // in rerank_filter.h for what it costs and why it is a switch.
+    std::vector<size_t> ends;
+    ends.reserve(window.size());
+    for (const auto& cand : window) {
+      ends.push_back(cand->end());
+    }
+    const std::vector<size_t> positions = EligibleBySpan(ends, options_.same_span_only);
     std::vector<std::string> texts;
-    std::vector<size_t> positions;
-    for (size_t i = 0; i < window.size(); ++i) {
-      if (window[i]->end() == head_end) {
-        texts.push_back(window[i]->text());
-        positions.push_back(i);
-      }
+    texts.reserve(positions.size());
+    for (size_t i : positions) {
+      texts.push_back(window[i]->text());
     }
 
     // The span is the SEGMENT's, not the head candidate's. `head_end` above
@@ -316,7 +327,8 @@ CopilotRerankFilter::CopilotRerankFilter(const Ticket& ticket, const an<CopilotD
   LOG(INFO) << "[copilot] rerank: enable=" << options_.enable
             << ", max_context_chars=" << options_.max_context_chars
             << ", window=" << options_.window << ", max_rank=" << options_.max_rank
-            << ", db=" << (db_ ? "ok" : "missing") << ", llm.enable=" << options_.llm.enable
+            << ", same_span_only=" << options_.same_span_only << ", db=" << (db_ ? "ok" : "missing")
+            << ", llm.enable=" << options_.llm.enable
             << ", llm.model=" << (scorer_ ? "ok" : "missing");
   // Only worth tracking AC/battery state -- and paying for the monitor
   // callback -- when there is a scorer to gate at all, and the config cares
@@ -417,8 +429,13 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   // 序是故意的 as one run and selecting 这个 leaves 顺序's candidates re-ranked
   // with no idea 这个 was just chosen). ConfirmedPrefix supplies exactly that.
   const std::string confirmed_prefix = ConfirmedPrefix(engine_->context()->composition(), segment);
-  const std::string context =
-      TrailingCjkRun(surrounding->before + confirmed_prefix, options_.max_context_chars);
+  const std::string before = surrounding->before + confirmed_prefix;
+  // Two contexts, because the two scorers can use different things. The db is
+  // keyed by Han sequences and can look up nothing else; the model reads
+  // whatever is there. Collapsing them was costing the model 68.2% of
+  // segments -- see ScoringContext in rerank.h.
+  const std::string context = TrailingCjkRun(before, options_.max_context_chars);
+  const std::string llm_context = ScoringContext(before, options_.llm.context_chars);
 
   // The LLM fallback chain, checked in the exact order
   // docs/superpowers/specs/2026-08-17-llm-rerank-design.md ("Fallback chain")
@@ -438,19 +455,19 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
     llm_skip = llm_rerank::SkipReason::kDisabled;
   } else if (!is_on_ac_ && !options_.llm.battery_active) {
     llm_skip = llm_rerank::SkipReason::kBattery;
-  } else if (context.empty()) {
+  } else if (llm_context.empty()) {
     llm_skip = llm_rerank::SkipReason::kNoContext;
   } else if (!scorer_) {
     // No model configured at all -- nothing to warm or score against.
     llm_skip = llm_rerank::SkipReason::kNoModel;
-  } else if (!scorer_->IsWarm(context)) {
+  } else if (!scorer_->IsWarm(llm_context)) {
     llm_skip = llm_rerank::SkipReason::kCold;
     // Never block the input thread waiting for the model: post the prefill
     // and fall through to the db path for this segment. The only warming
     // trigger this filter owns -- Task 5 adds the other two (on commit, on
     // composition start), both earlier than "the user already typed into the
     // gap this would have filled".
-    scorer_->WarmUp(context);
+    scorer_->WarmUp(llm_context);
   } else if (!scorer_->Loaded()) {
     // The warm attempt above (this call or an earlier one) never finished
     // loading the model -- e.g. a load failure, logged once inside
@@ -460,6 +477,20 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
     llm_eligible = true;
   }
 
+  // Empty here means the DB has nothing to key on -- `context` is the Han-only
+  // tail -- and it ALSO ends the LLM path, which is a constraint the model
+  // does not have: it reads punctuation and Latin, and 68.2% of segments carry
+  // no trailing Han (`llm_skip=noctx`) purely because the harness splits
+  // requests at maximal Han runs.
+  //
+  // Lifting it was tried and reverted. Those newly-eligible segments are
+  // exactly the ones where RawInputFilter has put the raw keystrokes first,
+  // and promoting into them displaces that head: measured, bucket B+D fell
+  // from 43.8% to 13.4% of segments. `Decide` enforces "never touch bucket B"
+  // when choosing WHICH candidate wins (rerank_llm.h picks the first all-Han
+  // as incumbent) but nothing enforces it on where the winner is INSERTED.
+  // Reaching those segments needs that second half designed first; until then
+  // this stays, and `llm_skip=noctx` is the honest measure of what it costs.
   if (context.empty()) {
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
                     SurroundingSourceName(surrounding->source), llm_skip);
@@ -485,7 +516,7 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   // exactly the same either way.
   return New<RerankTranslation>(
       translation, continuations, options_, span ? traces_ : an<RerankTraceStore>(),
-      engine_->context()->input(), context, SurroundingSourceName(surrounding->source),
+      engine_->context()->input(), context, llm_context, SurroundingSourceName(surrounding->source),
       span.value_or(TraceSpan{}), llm_eligible ? scorer_ : nullptr, llm_skip);
 }
 
@@ -505,10 +536,12 @@ CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) 
       config->GetInt("copilot/rerank/max_context_chars", &options.max_context_chars);
       config->GetInt("copilot/rerank/window", &options.window);
       config->GetInt("copilot/rerank/max_rank", &options.max_rank);
+      config->GetBool("copilot/rerank/same_span_only", &options.same_span_only);
       config->GetBool("copilot/rerank/llm/enable", &options.llm.enable);
       config->GetString("copilot/rerank/llm/model", &options.llm.model);
       config->GetBool("copilot/rerank/llm/battery_active", &options.llm.battery_active);
       config->GetInt("copilot/rerank/llm/top_n", &options.llm.top_n);
+      config->GetInt("copilot/rerank/llm/context_chars", &options.llm.context_chars);
       // Config has GetDouble but no GetFloat (rime/config/config_component.h)
       // -- read into a double, seeded with the struct default, then narrow.
       double margin_double = static_cast<double>(options.llm.margin);

@@ -38,6 +38,68 @@ inline bool IsHanIdeograph(uint32_t cp) {
 
 }  // namespace rerank_detail
 
+// The text the LLM scorer conditions on: the last `max_chars` characters
+// before the caret, whatever they are.
+//
+// Deliberately NOT TrailingCjkRun. That trims to a Han-only tail because the
+// db is keyed by Han sequences and can look up nothing else -- a constraint of
+// the n-gram, not of the caret. Applying it to the model gated scoring on
+// "does the text before the caret end in Han", and measured on the replay
+// corpus that is false for 68.2% of segments (`llm_skip=noctx`), so the model
+// was consulted on 8.8% of them.
+//
+// The model has no such constraint: its training corpus keeps punctuation,
+// Latin and digits precisely because 0% of real scoring contexts end in a Han
+// character (2026-08-19-corpus-pipeline-design.md). Feeding it "好的, " is
+// exactly what it was built for.
+//
+// Lives here, and is called by every site that needs it, because THREE
+// places compute this string -- the filter, Copilot's warm trigger
+// (copilot.cc) and the replay harness -- and the warm cache is keyed by it.
+// Two of them disagreeing does not fail loudly; it makes every warm land on a
+// context nobody asks about, so every Apply() finds the cache cold and the
+// feature silently never runs.
+inline std::string ScoringContext(const std::string& text, int max_chars) {
+  if (text.empty() || max_chars <= 0) {
+    return {};
+  }
+  ::copilot::UTF8 utf8(text);
+  const int n = static_cast<int>(utf8.size());
+  const int take = std::min(n, max_chars);
+  std::string out;
+  for (int i = n - take; i < n; ++i) {
+    out += std::string(utf8[i]);
+  }
+  return out;
+}
+
+// Which positions in a candidate window a promotion may consider, by input
+// span. Extracted from the two places in rerank_filter.cc that used to
+// duplicate it -- the LLM branch and the db branch -- because a filter the
+// two branches could disagree about is a filter with two behaviours, and
+// because the switch it now carries needs coverage that standing up a Rime
+// engine cannot give.
+//
+// `same_span_only` true keeps only candidates covering exactly as much input
+// as the window head, which is what this filter has always done: promoting
+// across spans changes how much input Space commits. False keeps everything,
+// which is worth +13.9% net offline and is a question about how a promotion
+// FEELS that no corpus can settle. See RerankOptions::same_span_only.
+inline std::vector<size_t> EligibleBySpan(const std::vector<size_t>& ends, bool same_span_only) {
+  std::vector<size_t> eligible;
+  eligible.reserve(ends.size());
+  if (ends.empty()) {
+    return eligible;
+  }
+  const size_t head_end = ends.front();
+  for (size_t i = 0; i < ends.size(); ++i) {
+    if (!same_span_only || ends[i] == head_end) {
+      eligible.push_back(i);
+    }
+  }
+  return eligible;
+}
+
 // The run of Han characters immediately before the caret, at most `max_chars`
 // long. Empty when the caret does not sit right after a Han character.
 //

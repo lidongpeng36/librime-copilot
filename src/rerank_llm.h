@@ -24,6 +24,12 @@ struct LlmRerankOptions {
   int top_n = 4;        // 4 beats 32 on accuracy AND speed; see the spec
   float margin = 2.0f;  // cuts harmful false promotion to ~a quarter
   float length_exponent = 0.7f;
+  // Characters of context handed to the model, independent of the db's
+  // max_context_chars (8, sized for n-gram keys). Larger because an LM uses
+  // what an n-gram cannot, and bounded because prefill cost scales with it:
+  // measured ~0.03 ms per token on this model, so 32 costs about 1 ms more
+  // than 8.
+  int context_chars = 32;
 };
 
 namespace llm_rerank {
@@ -36,7 +42,7 @@ enum class SkipReason {
   kDisabled,   // rerank/llm/enable is false
   kBattery,    // on battery and battery_active is false
   kNoModel,    // model missing or failed to load
-  kNoContext,  // no trailing Han context to score against
+  kNoContext,  // nothing at all before the caret to score against
   kCold,       // warm cache miss -- the one reason only live use can measure
   kNoHan,      // no all-Han candidate in the window
   kMargin,     // the best challenger did not beat the incumbent by `margin`
