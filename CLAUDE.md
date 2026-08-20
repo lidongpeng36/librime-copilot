@@ -253,6 +253,73 @@ pyenv virtualenv system rime-copilot
 build algorithm alters the output for unchanged inputs. No input hash catches
 that, and a stale database will otherwise be reported as fresh.
 
+## Neural re-ranking: what it is and how a second machine gets it
+
+`copilot/rerank/llm` orders the candidate list with a 40.9M-parameter model
+trained for this input method rather than with the db's n-gram, using the real
+text before the caret. Trained from scratch on 4.5B tokens of Chinese
+(`tools/rime_train/`, see `docs/superpowers/specs/2026-08-19-corpus-pipeline-design.md`);
+42MB at Q8_0, p50 4.7ms / p99 11.0ms per scoring.
+
+Three artifacts have to be present, and **none of them is in the vault** —
+the vault is for what cannot be regenerated and holds ~1MB, while these are
+large derived files:
+
+| artifact | how it travels | check |
+| --- | --- | --- |
+| `private/rime40m-q8.gguf` | `rime-copilot install-model --from PATH` (scp/rsync it over; it has no public URL) | `rime-copilot status` → `model:` |
+| `private/zh-hans-t-essay-bgw.gram` | `rime-copilot fetch-grammar` (public download) | `rime-copilot status` → `grammar:` |
+| `librime-copilot.dylib` | built from a librime checkout, copied into `Squirrel.app` by hand | — |
+
+**`status` is the check, and it exists because none of these fail loudly.**
+A schema naming a `.gram` that is absent decodes as though no grammar were
+configured (`octagram.cc:110` returns a constant); a schema naming a model
+that is absent logs one load failure, never retries, and re-ranking silently
+falls back to the db. Both look exactly like a working install from outside.
+
+On a new machine, after the usual `install` / `restore` / `update`:
+
+```sh
+rime-copilot fetch-grammar                       # 41MB, public
+scp mac:~/Library/Rime/private/rime40m-q8.gguf . # or rsync, or a shared drive
+rime-copilot install-model --from ./rime40m-q8.gguf
+rime-copilot status                              # grammar: ok / model: ok
+```
+
+then patch the schema (both commands print the exact lines), build the plugin
+from a librime checkout, and copy the dylib into `Squirrel.app`.
+
+### The two switches, and why they are switches
+
+Both answer questions no corpus can settle, so both default to today's
+behaviour and are left for real use to decide:
+
+- **`copilot/rerank/llm/margin`** (default 2.0) — how much better a candidate
+  must score before it is promoted. Swept on this model: harmful promotion
+  0.8% at margin 2 against 2.8% at margin 1, for 13.3% net against 14.0%.
+- **`copilot/rerank/same_span_only`** (default true) — whether a promotion may
+  take a candidate covering a *different amount of input* than the one it
+  displaces. False is worth +4.5 points of segments and costs p99 11.0ms →
+  15.1ms, and changes how much input Space commits.
+
+### What is NOT built
+
+Whole-sentence decoding (Path A of
+`docs/superpowers/specs/2026-08-20-neural-integration-design.md`) is designed
+and deliberately not implemented: the user's priority is candidate ordering
+given existing context, not long-sentence correctness.
+
+The model is consulted on 8.8% of the replay corpus's segments, 68.2% skipped
+as `llm_skip=noctx`. That is largely a corpus artifact — the harness splits
+requests at maximal Han runs, so the character before every run is by
+construction not Han, while real typing continues after committed Chinese.
+Lifting that gate was tried and reverted: it reaches exactly the segments
+where `RawInputFilter` has put the raw keystrokes first, and promoting there
+displaces that head (bucket B+D fell from 43.8% to 13.4%). `Decide` enforces
+"never touch bucket B" when choosing *which* candidate wins but nothing
+enforces it on where the winner is *inserted*. See the comment guarding the
+early return in `rerank_filter.cc`.
+
 ## Clients
 - `clients/neovim/lua/rime_ime/` — Neovim client for the IME Bridge, one
   self-contained module directory so it can be synced to a remote host as a

@@ -173,6 +173,11 @@ def _vault_dir_or_error(rime_dir: Path) -> "tuple[Path | None, str | None]":
         return None, message
 
 
+# `copilot/rerank/llm/model`, in either the patch form or the deployed
+# schema's nested form.
+_LLM_MODEL = re.compile(
+    r"^\s*(?:[\"']?copilot/rerank/llm/model[\"']?|model)\s*:\s*[\"']?([^\"'#\s]+)")
+
 _GRAMMAR_LANGUAGE = re.compile(r"^\s*(?:[\"']?grammar/language[\"']?|language)\s*:\s*[\"']?([^\"'#\s]+)")
 
 
@@ -233,6 +238,59 @@ def grammar_state(rime_dir: Path) -> tuple[str, str]:
     return worst, "; ".join(parts)
 
 
+def model_state(rime_dir: Path) -> tuple[str, str]:
+    """(state, detail) for the neural re-ranking model the schemas ask for.
+
+    Same three states as `grammar_state`, and the same reason for existing:
+    librime does not fail when a schema names a model that is not there.
+    LlmScorer logs one load failure and never retries (`Loaded()` stays false
+    forever), the filter's fallback chain reads that as `llm_skip=kNoModel`,
+    and re-ranking quietly falls back to the db -- which is exactly what a
+    working install looks like from outside.
+
+    Scanned rather than parsed: same as the grammar check, this package has no
+    YAML dependency and adding one for one key would be the tail wagging the
+    dog.
+    """
+    names: dict[str, list[str]] = {}
+    try:
+        sources = sorted(rime_dir.glob("*.custom.yaml")) + sorted(
+            (rime_dir / "build").glob("*.schema.yaml"))
+        for path in sources:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                match = _LLM_MODEL.match(line)
+                # A bare `model:` belongs to too many blocks to trust; only the
+                # fully-qualified patch key is unambiguous.
+                if match and "copilot/rerank/llm/model" in stripped:
+                    names.setdefault(match.group(1), []).append(path.name)
+    except OSError as exc:
+        return "unreadable", str(exc)
+
+    if not names:
+        return "unconfigured", "no schema names a neural re-ranking model"
+
+    parts = []
+    worst = "ok"
+    for name, where in sorted(names.items()):
+        path = rime_dir / name
+        if path.is_file():
+            parts.append(f"{name} ({path.stat().st_size // 1048576} MB)")
+        else:
+            worst = "missing"
+            parts.append(f"{name} MISSING at {path}, named by {', '.join(sorted(set(where)))}")
+    return worst, "; ".join(parts)
+
+
+def _print_model_status(rime_dir: Path) -> None:
+    state, detail = model_state(rime_dir)
+    print(f"model:    {state} -- {detail}")
+    if state == "missing":
+        print("          `rime-copilot install-model --from PATH` copies one in")
+
+
 def _print_grammar_status(rime_dir: Path) -> None:
     state, detail = grammar_state(rime_dir)
     print(f"grammar:  {state} -- {detail}")
@@ -281,6 +339,7 @@ def cmd_status(args) -> int:
         print("lexicon:  not cleaned")
 
     _print_grammar_status(rime_dir)
+    _print_model_status(rime_dir)
     _print_installed_status(rime_dir)
     return 0
 
@@ -473,6 +532,57 @@ def cmd_fetch_model(args) -> int:
         command="fetch-model",
         show_config=_print_fetch_model_config,
     )
+
+
+GGUF_MAGIC = b"GGUF"
+
+
+def cmd_install_model(args) -> int:
+    """Copy a locally-built neural re-ranking model into private/.
+
+    Not `fetch`: this model has no public URL. It is the output of ~14 hours
+    of training on a corpus that is not distributed, so on a second machine it
+    arrives by scp, rsync or a shared drive rather than by download -- and it
+    is deliberately NOT vaulted, because the vault is for what cannot be
+    regenerated and holds 1 MB today; a 42 MB derived artifact pushed to four
+    devices on every retrain does not belong in it.
+    """
+    source = Path(args.source).expanduser()
+    if not source.is_file():
+        print(f"no such file: {source}", file=sys.stderr)
+        return 1
+    with open(source, "rb") as handle:
+        if handle.read(4) != GGUF_MAGIC:
+            # Copying the wrong file installs something llama.cpp refuses at
+            # load time, which surfaces as re-ranking silently using the db.
+            print(f"{source} is not a GGUF file (bad magic)", file=sys.stderr)
+            return 1
+
+    private = _private(args.rime_dir)
+    target = private / (args.name or source.name)
+    if target.is_file() and not args.force:
+        print(f"already present, skipping: {target} ({target.stat().st_size} bytes)")
+        _print_install_model_config(target)
+        return 0
+    if args.dry_run:
+        print(f"would copy {source} -> {target}")
+        return 0
+
+    private.mkdir(parents=True, exist_ok=True)
+    # Staged, like every other large file this tool installs: llama.cpp mmaps
+    # the model, and a reader must never see a half-written one.
+    partial = target.with_name(target.name + ".part")
+    shutil.copyfile(source, partial)
+    partial.replace(target)
+    print(f"{target.stat().st_size} bytes -> {target}")
+    _print_install_model_config(target)
+    return 0
+
+
+def _print_install_model_config(target: Path) -> None:
+    print("Paste into a schema patch:")
+    print('  "copilot/rerank/llm/enable": true')
+    print(f'  "copilot/rerank/llm/model": private/{target.name}')
 
 
 def cmd_fetch_grammar(args) -> int:
@@ -917,6 +1027,16 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_grammar.add_argument("--force", action="store_true",
                                help="re-download even if the file already exists")
     fetch_grammar.set_defaults(func=cmd_fetch_grammar)
+
+    install_model = sub.add_parser(
+        "install-model",
+        help="copy a locally-built neural re-ranking model into private/")
+    install_model.add_argument("--from", dest="source", required=True,
+                               metavar="PATH", help="the .gguf to install")
+    install_model.add_argument("--name", help="filename under private/ (default: as given)")
+    install_model.add_argument("--force", action="store_true",
+                               help="overwrite an existing file of the same name")
+    install_model.set_defaults(func=cmd_install_model)
 
     for name, func in (("build", cmd_build), ("update", cmd_update)):
         command = sub.add_parser(name)

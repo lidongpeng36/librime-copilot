@@ -5,6 +5,7 @@ the outside world and are exercised by hand in Task 8.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -1169,3 +1170,103 @@ class GrammarState(unittest.TestCase):
         state, detail = cli.grammar_state(self.dir)
         self.assertEqual(state, "missing")
         self.assertIn("private/zh MISSING", detail)
+
+
+class ModelState(unittest.TestCase):
+    """librime does not fail when a schema names a model that is not there:
+    LlmScorer logs one load failure and never retries, the fallback chain
+    reads that as kNoModel, and re-ranking quietly uses the db -- which from
+    outside is indistinguishable from a working install."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "build").mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, body: str) -> None:
+        (self.dir / "double_pinyin_flypy.custom.yaml").write_text(body, encoding="utf-8")
+
+    def test_no_model_anywhere_is_unconfigured(self):
+        self.write("patch:\n  melt_eng/enable_user_dict: true\n")
+        self.assertEqual(cli.model_state(self.dir)[0], "unconfigured")
+
+    def test_configured_and_present_is_ok(self):
+        self.write('patch:\n  "copilot/rerank/llm/model": private/rime40m-q8.gguf\n')
+        (self.dir / "private").mkdir()
+        (self.dir / "private" / "rime40m-q8.gguf").write_bytes(b"GGUF" + b"x" * 16)
+        state, detail = cli.model_state(self.dir)
+        self.assertEqual(state, "ok")
+        self.assertIn("rime40m-q8.gguf", detail)
+
+    def test_configured_and_absent_is_missing_and_names_the_file(self):
+        self.write('patch:\n  "copilot/rerank/llm/model": private/rime40m-q8.gguf\n')
+        state, detail = cli.model_state(self.dir)
+        self.assertEqual(state, "missing")
+        self.assertIn("MISSING", detail)
+        self.assertIn("double_pinyin_flypy.custom.yaml", detail)
+
+    def test_a_bare_model_key_is_ignored(self):
+        # `model:` appears under other blocks; only the qualified patch key
+        # unambiguously names the re-ranking model.
+        self.write("patch:\n  translator:\n    model: something\n")
+        self.assertEqual(cli.model_state(self.dir)[0], "unconfigured")
+
+    def test_a_commented_out_model_is_ignored(self):
+        self.write('patch:\n  # "copilot/rerank/llm/model": private/old.gguf\n')
+        self.assertEqual(cli.model_state(self.dir)[0], "unconfigured")
+
+
+class InstallModel(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.src = self.dir / "m.gguf"
+        self.src.write_bytes(b"GGUF" + b"\0" * 32)
+        self.rime = self.dir / "rime"
+        (self.rime / "private").mkdir(parents=True)
+
+    def args(self, **kw):
+        return argparse.Namespace(source=str(self.src), rime_dir=self.rime, name=None,
+                                  force=False, dry_run=False, **kw)
+
+    def test_copies_into_private_and_prints_the_patch(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(0, cli.cmd_install_model(self.args()))
+        self.assertTrue((self.rime / "private" / "m.gguf").is_file())
+        self.assertIn("copilot/rerank/llm/model", buffer.getvalue())
+
+    def test_refuses_a_file_that_is_not_gguf(self):
+        # Installing the wrong file surfaces only as re-ranking silently
+        # using the db, which looks exactly like a working install.
+        self.src.write_bytes(b"not a model")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(1, cli.cmd_install_model(self.args()))
+        self.assertFalse((self.rime / "private" / "m.gguf").exists())
+
+    def test_refuses_a_missing_source(self):
+        args = self.args()
+        args.source = str(self.dir / "nope.gguf")
+        self.assertEqual(1, cli.cmd_install_model(args))
+
+    def test_existing_file_is_left_alone_without_force(self):
+        (self.rime / "private" / "m.gguf").write_bytes(b"GGUF" + b"old")
+        with redirect_stdout(io.StringIO()):
+            cli.cmd_install_model(self.args())
+        self.assertEqual(b"GGUF" + b"old", (self.rime / "private" / "m.gguf").read_bytes())
+
+    def test_force_overwrites(self):
+        (self.rime / "private" / "m.gguf").write_bytes(b"GGUF" + b"old")
+        args = self.args()
+        args.force = True
+        with redirect_stdout(io.StringIO()):
+            cli.cmd_install_model(args)
+        self.assertEqual(self.src.read_bytes(), (self.rime / "private" / "m.gguf").read_bytes())
+
+    def test_leaves_no_part_file_behind(self):
+        with redirect_stdout(io.StringIO()):
+            cli.cmd_install_model(self.args())
+        self.assertEqual([], list((self.rime / "private").glob("*.part")))
