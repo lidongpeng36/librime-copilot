@@ -63,9 +63,16 @@ CREATE TABLE ev (
                          -- preferring something the threshold refused.
   best_is_sel INT,       -- 1 when the model's pick is what the user chose --
                          -- with decline_kind='blocked', the recoverable case
-  engage_skip TEXT       -- the event's TOP-LEVEL llm_skip: why the model did
+  engage_skip TEXT,      -- the event's TOP-LEVEL llm_skip: why the model did
                          -- not engage. Distinct from the `llm_skip` column
                          -- above, which is Decide()'s own verdict.
+  -- The two halves of `head_altered`. A filter that INSERTS above re-ranking's
+  -- pick (pin_cand_filter) leaves that pick intact further down the list; one
+  -- that REWRITES it (simplifier@traditionalize) or removes it (uniquifier)
+  -- takes it out of the list entirely. Both look like `top[0] != rr.text`, and
+  -- only the second makes `sel` incomparable with `rr.text`.
+  head_displaced INT,    -- 1 when the pick survived, below position 0
+  rr_pos_in_top INT      -- where it ended up, NULL when it is not in the list
 );
 
 -- One row per `type":"stats"` line (telemetry_event.h:StatsLine). Disjoint
@@ -267,7 +274,16 @@ def _load_event_line(db, e):
     # A missing or empty `top` is not evidence of alteration — it is an
     # event written with top_n candidates unavailable — so it is not
     # flagged.
-    head_altered = 1 if (rr and top and top[0] != rr.get("text")) else 0
+    rr_text = rr.get("text") if rr else None
+    rr_pos_in_top = top.index(rr_text) if (rr and rr_text in top) else None
+    head_altered = 1 if (rr and top and top[0] != rr_text) else 0
+    # Recorded, but head_altered stays 1 for these and the tables still exclude
+    # them. A displacement only makes `sel == rr.text` sound -- the user took
+    # the pick although it was not first, which is unambiguous. `sel != rr.text`
+    # stays ambiguous: they were shown a head re-ranking did not produce, and
+    # may have taken it only because it was first. Counting those as rejections
+    # would bias the very rate the exclusion exists to protect.
+    head_displaced = 1 if (head_altered and rr_pos_in_top is not None) else 0
 
     # v2's `llm` object -- absent on every v1 line and on a v2 line the LLM
     # path never touched (rerank_filter.cc runs the db loop OR the LLM path
@@ -309,14 +325,25 @@ def _load_event_line(db, e):
     # `best` the two kinds are indistinguishable, which is the whole reason
     # the field was added -- so a v2 line gets None, not a guess.
     if llm and llm_skip == "margin" and llm_best is not None:
-        decline_kind = "agreed" if llm_best == llm.get("incumbent") else "blocked"
+        if llm_best != llm.get("incumbent"):
+            decline_kind = "blocked"
+        elif (llm.get("n_scored") or 0) <= 1 or sel_in_dropped:
+            # `agreed` carries the advice "the model is the limit". That holds
+            # only where the model had a choice. With one scored candidate it
+            # agreed with the only thing it was shown; with the user's pick
+            # among `dropped` it never evaluated the alternative at all. Either
+            # way the lever is copilot/rerank/same_span_only, not retraining --
+            # opposite fixes, which is the same collapse Defect 1 was about.
+            decline_kind = "gated"
+        else:
+            decline_kind = "agreed"
     else:
         decline_kind = None
     best_is_sel = (1 if llm_best == e.get("sel") else 0) if llm_best is not None else None
     engage_skip = e.get("llm_skip")
 
     db.execute(
-        "INSERT INTO ev VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO ev VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             e.get("ts"), e.get("machine"), e.get("schema"), e.get("src"),
             e.get("input"), e.get("ctx"), e.get("sel_idx"), e.get("sel"),
@@ -338,6 +365,7 @@ def _load_event_line(db, e):
             llm_head_altered,
             llm_best, llm_best_from, llm_dropped_n, sel_in_dropped,
             decline_kind, best_is_sel, engage_skip,
+            head_displaced, rr_pos_in_top,
         ),
     )
 
@@ -450,9 +478,14 @@ def decline_split(db):
     """How the LLM's declines break down, and what a lower margin would buy.
 
     Two kinds with opposite fixes:
-      agreed   best == incumbent -- the model endorsed the head and the user
+      agreed   best == incumbent, over a field of more than one scored
+               candidate -- the model endorsed the head and the user
                disagreed. Lowering `margin` cannot help; this is the share
                that says whether the MODEL is the limit.
+      gated    best == incumbent, but the model had nothing to compare: one
+               scored candidate, or the user's pick removed by the span gate
+               before scoring. Reads as agreement and is not one. The lever
+               here is copilot/rerank/same_span_only.
       blocked  the model preferred something else and the threshold refused
                it. When that something is what the user then chose
                (`best_is_sel`), a lower threshold would have fixed the
@@ -463,13 +496,14 @@ def decline_split(db):
     ).fetchall()
     split = {
         "agreed": 0,
+        "gated": 0,
         "blocked": 0,
         "blocked_and_wanted": 0,
         "recovered_at": {t: 0 for t in RECOVERY_THRESHOLDS},
     }
     for kind, best_is_sel, margin in rows:
-        if kind == "agreed":
-            split["agreed"] += 1
+        if kind in ("agreed", "gated"):
+            split[kind] += 1
             continue
         split["blocked"] += 1
         if not best_is_sel:
@@ -479,6 +513,28 @@ def decline_split(db):
             if margin is not None and margin >= threshold:
                 split["recovered_at"][threshold] += 1
     return split
+
+
+def displaced_heads(db, limit=10):
+    """[(top0, events, pick_still_chosen)] for displaced events, most first.
+
+    `top0` is what ended up at the head instead. One text dominating this list
+    is a PIN (the schema's `pin_cand_filter`), not general corruption -- a
+    rewriting filter would not concentrate on a single word.
+
+    `pick_still_chosen` counts the events where the user took re-ranking's
+    pick anyway, from further down the list. That is an unambiguous accept the
+    tables do not count, and it is the live cost of the pin: the times
+    re-ranking was right and the user had to reach past the pinned head.
+    """
+    return [tuple(r) for r in db.execute(
+        """
+        SELECT top0, COUNT(*), COALESCE(SUM(sel = rr_text), 0)
+        FROM ev WHERE head_displaced = 1
+        GROUP BY top0 ORDER BY COUNT(*) DESC, top0 LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()]
 
 
 def main():
@@ -536,8 +592,11 @@ def main():
         print("  first-candidate accuracy: n/a (no stats lines -- v1 file, or the "
              "first flush interval has not closed)")
     print(f"  {'events read':<44}{total:>8}")
+    displaced = db.execute("SELECT COUNT(*) FROM ev WHERE head_displaced = 1").fetchone()[0]
     if altered:
         print(f"  {'EXCLUDED, head altered downstream':<44}{altered:>8}  {altered / total:>6.1%}")
+        print(f"    {'displaced -- the pick survived lower down':<42}{displaced:>8}")
+        print(f"    {'rewritten or removed -- the pick is gone':<42}{altered - displaced:>8}")
     print(f"  {'usable':<44}{usable:>8}")
     if altered:
         if not usable:
@@ -548,6 +607,7 @@ def main():
                   "typing.")
         print()
         print(HEAD_ALTERED_NOTE, end="")
+        _print_displaced_heads(db)
     if not usable:
         # Independent of `usable`: it comes from the stats table, which
         # head_altered (a db-`rr` concept) has no bearing on.
@@ -650,11 +710,13 @@ def main():
               where="llm_from > 0", promoted_col="llm_promoted",
               verdict_col="llm_verdict", altered_col="llm_head_altered")
     split = decline_split(db)
-    total_declines = split["agreed"] + split["blocked"]
+    total_declines = split["agreed"] + split["gated"] + split["blocked"]
     if total_declines:
         print(f"\n  LLM declined on {total_declines} segment(s)")
         print(f"    {'model agreed with the head':<36}{split['agreed']:>6}"
              f"  {pct(split['agreed'], total_declines)}   <- model quality")
+        print(f"    {'span gate left nothing to compare':<36}{split['gated']:>6}"
+             f"  {pct(split['gated'], total_declines)}   <- same_span_only")
         print(f"    {'threshold blocked the models pick':<36}{split['blocked']:>6}"
              f"  {pct(split['blocked'], total_declines)}   <- margin")
         if total_declines < MIN_N:
@@ -666,8 +728,13 @@ def main():
             for threshold in RECOVERY_THRESHOLDS:
                 print(f"      margin {threshold} would have recovered: "
                      f"{split['recovered_at'][threshold]}")
-        print("\n  `agreed` is the share a lower margin cannot fix. When it dominates,")
-        print("  the model is the limit and tools/rime_train/ is the next lever.")
+        print("\n  `agreed` is the share a lower margin cannot fix, and it is the only")
+        print("  one that says the MODEL is the limit -- when it dominates, the next")
+        print("  lever is tools/rime_train/. `gated` looks identical in the log and")
+        print("  is not the same thing: the model agreed with the only candidate it")
+        print("  was shown, or never saw the one the user picked. That one is")
+        print("  copilot/rerank/same_span_only, and reading it as `agreed` would")
+        print("  point at a retrain that could not have helped.")
 
     span = db.execute(
         "SELECT COUNT(*), COALESCE(SUM(sel_in_dropped), 0) FROM ev WHERE llm_dropped_n > 0"
@@ -739,6 +806,24 @@ def _print_recorders(db):
         print("      (see CLAUDE.md, the Squirrel.app copy step) before treating the")
         print("      sections below as evidence about that machine.")
     print()
+
+
+def _print_displaced_heads(db):
+    """What displaced re-ranking's pick, and what that cost."""
+    rows = displaced_heads(db)
+    if not rows:
+        return
+    print("\n  What took the head instead, most frequent first:")
+    for text, n, kept in rows:
+        print(f"    {text:<12}{n:>6} event(s)   the pick was still chosen {kept}")
+    print("\n  One text dominating this list is a PIN -- the schema's")
+    print("  `pin_cand_filter` -- not general corruption; a rewriting filter")
+    print("  would not concentrate on a single word. The last number is what")
+    print("  that pin costs: the times re-ranking was right and the user had")
+    print("  to reach past the pinned head. Those are unambiguous accepts, and")
+    print("  the tables below still do not count them: `sel != pick` under a")
+    print("  displacement stays ambiguous, because the head the user was shown")
+    print("  is not the head re-ranking produced.")
 
 
 def _print_skip_distribution(db):

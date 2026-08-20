@@ -43,7 +43,7 @@ class DeclineKind(unittest.TestCase):
         row = load_one({
             "v": 3, "sel": "月度", "sel_idx": 1, "top": ["阅读", "月度"],
             "llm": {"incumbent": "阅读", "best": "阅读", "best_from": 0,
-                    "margin": 0.0, "skip": "margin", "dropped": []},
+                    "margin": 0.0, "skip": "margin", "n_scored": 4, "dropped": []},
         })
         self.assertEqual(row["decline_kind"], "agreed")
         self.assertEqual(row["best_is_sel"], 0)
@@ -161,7 +161,7 @@ class DeclineSplit(unittest.TestCase):
             events=[
                 {"v": 3, "sel": "月度", "sel_idx": 1, "top": ["阅读", "月度"],
                  "llm": {"incumbent": "阅读", "best": "阅读", "margin": 0.0,
-                         "skip": "margin", "dropped": []}},
+                         "skip": "margin", "n_scored": 4, "dropped": []}},
                 {"v": 3, "sel": "那里", "sel_idx": 1, "top": ["哪里", "那里"],
                  "llm": {"incumbent": "哪里", "best": "那里", "margin": 0.88,
                          "skip": "margin", "dropped": []}},
@@ -357,3 +357,112 @@ class MixedVersionMachine(unittest.TestCase):
                            "sel": "想", "sel_idx": 0, "top": ["想"]}],
         })
         self.assertEqual(analyze.recorder_report(db), [("New", 3, 1, False, 0)])
+
+
+class DeclineWithNothingToCompare(unittest.TestCase):
+    """`agreed` carries the advice "the model is the limit, go retrain". That
+    is only true when the model had a choice. When the span gate left it one
+    candidate, or took away the one the user then picked, it agreed with the
+    only thing it was shown -- and the lever is same_span_only, not training."""
+
+    def test_agreement_over_a_real_field_is_a_model_signal(self):
+        row = load_one({
+            "v": 3, "sel": "月度", "sel_idx": 1, "top": ["阅读", "月度"],
+            "llm": {"incumbent": "阅读", "best": "阅读", "margin": 0.0,
+                    "skip": "margin", "n_scored": 4, "dropped": []},
+        })
+        self.assertEqual(row["decline_kind"], "agreed")
+
+    def test_a_single_scored_candidate_is_not_agreement(self):
+        row = load_one({
+            "v": 3, "sel": "候选", "sel_idx": 1, "top": ["候选词", "候选"],
+            "llm": {"incumbent": "候选词", "best": "候选词", "margin": 0.0,
+                    "skip": "margin", "n_scored": 1, "dropped": ["候选", "侯选"]},
+        })
+        self.assertEqual(row["decline_kind"], "gated")
+
+    def test_the_users_choice_removed_before_scoring_is_not_agreement(self):
+        row = load_one({
+            "v": 3, "sel": "候选", "sel_idx": 1, "top": ["候选词", "候选"],
+            "llm": {"incumbent": "候选词", "best": "候选词", "margin": 0.0,
+                    "skip": "margin", "n_scored": 4, "dropped": ["候选"]},
+        })
+        self.assertEqual(row["decline_kind"], "gated")
+
+    def test_a_v2_line_cannot_be_split_and_stays_unclassified(self):
+        row = load_one({
+            "v": 2, "sel": "月度", "sel_idx": 1, "top": ["阅读", "月度"],
+            "llm": {"incumbent": "阅读", "margin": 0.0, "skip": "margin"},
+        })
+        self.assertIsNone(row["decline_kind"])
+
+    def test_the_split_reports_the_gated_bucket_separately(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        for e in [
+            {"v": 3, "sel": "月度", "sel_idx": 1, "top": ["阅读", "月度"],
+             "llm": {"incumbent": "阅读", "best": "阅读", "margin": 0.0,
+                     "skip": "margin", "n_scored": 4, "dropped": []}},
+            {"v": 3, "sel": "候选", "sel_idx": 1, "top": ["候选词", "候选"],
+             "llm": {"incumbent": "候选词", "best": "候选词", "margin": 0.0,
+                     "skip": "margin", "n_scored": 1, "dropped": ["候选"]}},
+        ]:
+            analyze._load_event_line(db, e)
+        split = analyze.decline_split(db)
+        self.assertEqual((split["agreed"], split["gated"], split["blocked"]), (1, 1, 0))
+
+
+class DisplacedHead(unittest.TestCase):
+    """A filter that INSERTS above re-ranking's pick leaves that pick intact
+    further down; one that rewrites it removes it from the list entirely. Both
+    read as `top[0] != rr.text`, and only the second makes `sel` incomparable."""
+
+    def test_a_pick_pushed_down_is_displaced_not_rewritten(self):
+        row = load_one({
+            "v": 3, "sel": "的", "sel_idx": 0, "top": ["的", "代", "到"],
+            "rr": {"key": "算法", "text": "代", "from": 21},
+        })
+        self.assertEqual(row["head_altered"], 1)
+        self.assertEqual(row["head_displaced"], 1)
+        self.assertEqual(row["rr_pos_in_top"], 1)
+
+    def test_a_pick_absent_from_the_list_was_rewritten_or_removed(self):
+        row = load_one({
+            "v": 3, "sel": "牠", "sel_idx": 0, "top": ["牠", "祂"],
+            "rr": {"key": "算法", "text": "他", "from": 3},
+        })
+        self.assertEqual(row["head_altered"], 1)
+        self.assertEqual(row["head_displaced"], 0)
+        self.assertIsNone(row["rr_pos_in_top"])
+
+    def test_an_untouched_head_is_neither(self):
+        row = load_one({
+            "v": 3, "sel": "代", "sel_idx": 0, "top": ["代", "的"],
+            "rr": {"key": "算法", "text": "代", "from": 21},
+        })
+        self.assertEqual(row["head_altered"], 0)
+        self.assertEqual(row["head_displaced"], 0)
+        self.assertEqual(row["rr_pos_in_top"], 0)
+
+
+class DisplacingHeads(unittest.TestCase):
+    """What did the displacing. One text dominating means a pin, and the
+    number worth having is what that pin costs: the times re-ranking was
+    right and the user had to reach past the pinned head."""
+
+    def test_heads_are_grouped_and_the_pick_still_chosen_is_counted(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        for e in [
+            # displaced by 的; the user reached past it for re-ranking's pick
+            {"v": 3, "sel": "代", "sel_idx": 1, "top": ["的", "代"],
+             "rr": {"key": "x", "text": "代", "from": 21}},
+            # displaced by 的; the user took the pinned head instead
+            {"v": 3, "sel": "的", "sel_idx": 0, "top": ["的", "到"],
+             "rr": {"key": "x", "text": "到", "from": 9}},
+            # rewritten, not displaced -- must not appear here
+            {"v": 3, "sel": "牠", "sel_idx": 0, "top": ["牠"],
+             "rr": {"key": "x", "text": "他", "from": 3}},
+        ]:
+            analyze._load_event_line(db, e)
+        self.assertEqual(analyze.displaced_heads(db), [("的", 2, 1)])
