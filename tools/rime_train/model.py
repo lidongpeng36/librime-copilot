@@ -41,6 +41,11 @@ class Config:
     max_seq: int = 512
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
+    # False reproduces the flat std=0.02 every Linear got before 2026-08-21.
+    # A field rather than a constructor argument so the saved checkpoint's cfg
+    # records which recipe produced it -- a control arm is only worth running if
+    # you can still tell, months later, which arm a checkpoint came from.
+    depth_scaled_init: bool = True
 
     @property
     def head_dim(self) -> int:
@@ -129,10 +134,11 @@ class Model(nn.Module):
         # The two projections that write into the residual stream once per
         # layer, so their variance compounds with depth. Applied after the flat
         # init above, which has already touched them.
-        std = recipe.residual_init_std(0.02, cfg.layers)
-        for block in self.blocks:
-            nn.init.normal_(block.wo.weight, mean=0.0, std=std)
-            nn.init.normal_(block.down.weight, mean=0.0, std=std)
+        if cfg.depth_scaled_init:
+            std = recipe.residual_init_std(0.02, cfg.layers)
+            for block in self.blocks:
+                nn.init.normal_(block.wo.weight, mean=0.0, std=std)
+                nn.init.normal_(block.down.weight, mean=0.0, std=std)
 
     @staticmethod
     def _init(module):

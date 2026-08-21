@@ -137,6 +137,13 @@ def main() -> int:
                     help="torch.compile the model; small models are launch-bound "
                          "and this is where most of the MFU is")
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--legacy-recipe", action="store_true",
+                    help="reproduce the recipe the shipped model was trained with: "
+                         "weight decay on EVERY parameter including RMSNorm gains, "
+                         "and a flat std=0.02 init. The held-out sampler is NOT "
+                         "reverted -- a control arm whose validation loss is "
+                         "contaminated cannot be compared with anything, which is "
+                         "the entire reason for running one")
     ap.add_argument("--val-every", type=int, default=1000,
                     help="steps between held-out validation loss reports")
     ap.add_argument("--save-every", type=int, default=2000)
@@ -146,7 +153,7 @@ def main() -> int:
     vocab = Vocab(build_vocab(Path(args.chars)))
     cfg = Config(vocab_size=len(vocab), dim=args.dim, layers=args.layers,
                  ffn=args.ffn, heads=args.heads, kv_heads=args.heads,
-                 max_seq=args.seq)
+                 max_seq=args.seq, depth_scaled_init=not args.legacy_recipe)
     model = Model(cfg).to(device)
     print(f"{cfg.parameters()/1e6:.1f}M parameters, vocab {len(vocab)}, device {device}",
           flush=True)
@@ -167,7 +174,11 @@ def main() -> int:
     for name, param in getattr(model, "_orig_mod", model).named_parameters():
         if not param.requires_grad:
             continue
-        (decay if recipe.decays_weight(name, param.dim()) else no_decay).append(param)
+        # --legacy-recipe puts everything in the decayed group, which is what
+        # `AdamW(model.parameters(), weight_decay=0.1)` did before 2026-08-21.
+        # The printed counts are the check: 93/0 legacy against 72/21 now.
+        decayed = True if args.legacy_recipe else recipe.decays_weight(name, param.dim())
+        (decay if decayed else no_decay).append(param)
     print(f"weight decay on {len(decay)} tensors, off on {len(no_decay)}", flush=True)
     opt = torch.optim.AdamW(
         [{"params": decay, "weight_decay": 0.1},
