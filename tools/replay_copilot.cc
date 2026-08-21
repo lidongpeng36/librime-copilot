@@ -550,14 +550,59 @@ struct ObservedLlm {
 };
 
 // Reads whatever RerankTraceStore recorded during the ONE call the caller
-// already made between capturing `traces_before` and calling this -- the
+// already made between capturing `records_before` and calling this -- the
 // first WalkCandidates() of a request (segment 0) or a select_candidate()
 // (segment i+1), the two points that can materialize a NEW segment's
 // translation and are the only ones this tool wraps this way. See
-// RerankTraceStore::Last()'s own comment for why a size() delta, not exact
+// RerankTraceStore::Last()'s own comment for why a records() delta, not exact
 // (input, start, end) matching, is what proves the trace is fresh.
-ObservedLlm ObserveLlm(const WarmConfig& cfg, size_t traces_before, const std::string& context) {
-  if (cfg.traces && cfg.traces->size() > traces_before) {
+//
+// records(), NOT size(). This used a size() delta and was therefore blind in
+// two ways at once: the store saturates at kMaxEntries (16), and a re-record of
+// the same segment -- which Apply() does on every keystroke -- replaces in
+// place without growing it. Measured on the real corpus before the fix, 100% of
+// the 148 segments past 16 fed keys reported "notrace", against 57% below it,
+// and "notrace" was 71% of all segments while its own comment here called it
+// rare. Every replay-derived engagement rate was therefore computed on a sample
+// biased toward SHORT requests -- exactly the ones carrying least context, and
+// so exactly where the model has least to offer.
+// Segment 0 needs a different query, because it has no observation window to
+// read. ProcessRequest feeds EVERY key of the request before the loop that
+// captures a records() count, so by the time that window opens Apply() has
+// already recorded segment 0 -- the delta is zero and ObserveLlm below reports
+// "notrace" for it. Measured before this fix: 78.4% of segment 0s, which is
+// 11681 of 27245 segments over the corpus -- the single largest remaining blind
+// spot, and the exact population the Han-context gate acts on.
+//
+// Capturing the count EARLIER instead does not work: during key feeding Apply()
+// runs for every live segment on every keystroke, so Last() would name whatever
+// segment it ran for last -- a later one, in any multi-segment composition.
+// That is the misattribution this file's other comments exist to prevent.
+//
+// So: look the segment up by its span start. Segment 0's start is 0 under every
+// segmentation, so this needs no conversion between the tool's key positions
+// and librime's input offsets, and no guess at `end` (see TraceSpanOf's comment
+// on why `end` is not what a caller would guess).
+ObservedLlm ObserveSegmentZero(const WarmConfig& cfg, const std::string& context) {
+  if (cfg.traces) {
+    if (const auto* trace = cfg.traces->FindLatestByStart(0)) {
+      ObservedLlm out;
+      out.label = rime::llm_rerank::SkipReasonName(trace->llm_skip);
+      out.score_us = trace->score_us;
+      return out;
+    }
+  }
+  // No trace for segment 0 at all: Apply() took one of the three exits that
+  // record nothing (rerank disabled, no surrounding context, or
+  // AppliesToSegment declining a "copilot"-tagged segment). That is a real
+  // observation now, not an artifact of the window.
+  ObservedLlm out;
+  out.label = context.empty() ? "noctx" : "notrace";
+  return out;
+}
+
+ObservedLlm ObserveLlm(const WarmConfig& cfg, size_t records_before, const std::string& context) {
+  if (cfg.traces && cfg.traces->records() > records_before) {
     if (const auto* trace = cfg.traces->Last()) {
       ObservedLlm out;
       out.label = rime::llm_rerank::SkipReasonName(trace->llm_skip);
@@ -727,13 +772,12 @@ json ProcessRequest(RimeApi* rime, RimeSessionId session_id, const json& req, co
   bool first_iteration = true;
 
   while (key_pos < total_keys) {
-    const size_t traces_before = warm_cfg.traces ? warm_cfg.traces->size() : 0;
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::string> cands = WalkCandidates(rime, session_id, opts.max_scan);
     const auto t1 = std::chrono::steady_clock::now();
     const int64_t us_menu = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     if (opts.wait_for_warm && first_iteration) {
-      pending.observed = ObserveLlm(warm_cfg, traces_before, pending.context);
+      pending.observed = ObserveSegmentZero(warm_cfg, pending.context);
     }
     first_iteration = false;
 
@@ -787,7 +831,7 @@ json ProcessRequest(RimeApi* rime, RimeSessionId session_id, const json& req, co
     // and task-6-report.md), so this is the ONE call whose trace-store delta
     // can be trusted to belong to next_pending rather than to some earlier,
     // already-observed segment.
-    const size_t traces_before_select = warm_cfg.traces ? warm_cfg.traces->size() : 0;
+    const size_t traces_before_select = warm_cfg.traces ? warm_cfg.traces->records() : 0;
     rime->select_candidate(session_id, static_cast<size_t>(match.hit));
     if (has_next_segment && opts.wait_for_warm) {
       next_pending.observed = ObserveLlm(warm_cfg, traces_before_select, next_pending.context);

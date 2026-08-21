@@ -130,28 +130,66 @@ class RerankTraceStore {
   // The decision recorded for exactly this segment, or null.
   const RerankTrace* Find(const std::string& input, size_t start, size_t end) const;
 
-  // The most recently recorded entry, or null. Measurement-only consumer:
+  // The most recently recorded trace whose span STARTS at `start`, whatever
+  // input it was recorded under, or null.
+  //
+  // Measurement-only consumer, and a different question from Find(): the caller
+  // (replay_copilot.cc, segment 0) knows which segment it wants but not the
+  // `input` that was live when the decision was made, nor `end` -- Apply()
+  // re-records a segment on every keystroke, so both move while `start` does
+  // not. It is also the only query that works without an observation window at
+  // all, which is what segment 0 needs: ProcessRequest feeds every key of a
+  // request before the loop that could open one.
+  //
+  // Newest-first so a segment re-recorded across several keystrokes answers
+  // with its latest decision, and so a composition longer than kMaxEntries --
+  // where the segment's early entries have been evicted -- still answers from
+  // the entries the newest keystroke wrote.
+  const RerankTrace* FindLatestByStart(size_t start) const;
+
+  // The most recently recorded trace, or null. Measurement-only consumer:
   // replay_copilot.cc reads this immediately after the one call (the first
   // WalkCandidates() of a request, or a select_candidate()) it knows can
   // record at most one new trace on this single-threaded input path --
-  // paired with a size() check before/after to tell "a fresh trace landed"
+  // paired with a records() check before/after to tell "a fresh trace landed"
   // from "nothing changed", this sidesteps reconstructing the exact
   // (input, start, end) a segment was recorded under, which depends on
   // segmentation internals the tool has no other reason to model (see
   // TraceSpanOf's own comment on why `end` is not what a caller would guess).
-  const RerankTrace* Last() const { return entries_.empty() ? nullptr : &entries_.back(); }
+  //
+  // Held separately rather than read off entries_.back(): a re-record replaces
+  // in place, so the newest WRITE is frequently not the newest ENTRY, and
+  // back() then names a different segment entirely.
+  const RerankTrace* Last() const { return records_ ? &last_recorded_ : nullptr; }
 
   void Clear() { entries_.clear(); }
   size_t size() const { return entries_.size(); }
 
+  // Every Record() that actually recorded, counted for the lifetime of the
+  // store. NOT size(): that saturates at kMaxEntries and does not move for an
+  // in-place replacement either, so a size() delta cannot answer "did this call
+  // record anything". replay_copilot.cc asked it that way and went blind past
+  // the 16th entry -- measured on the real corpus, 100% of the 148 segments
+  // sitting past 16 fed keys came back "notrace", against 57% below it.
+  //
+  // Deliberately NOT reset by Clear(): the delta is read across a call that may
+  // contain a commit, and a commit clears the store. Resetting would make the
+  // delta negative and read as "nothing recorded" -- the very failure this
+  // exists to fix.
+  size_t records() const { return records_; }
+
  private:
   std::deque<RerankTrace> entries_;  // oldest first
+  RerankTrace last_recorded_;
+  size_t records_ = 0;
 };
 
 inline void RerankTraceStore::Record(const RerankTrace& trace) {
   if (!trace.valid) {
     return;
   }
+  last_recorded_ = trace;
+  ++records_;
   for (auto& entry : entries_) {
     if (TraceMatches(entry, trace.input, trace.start, trace.end)) {
       entry = trace;
@@ -162,6 +200,15 @@ inline void RerankTraceStore::Record(const RerankTrace& trace) {
   while (entries_.size() > kMaxEntries) {
     entries_.pop_front();
   }
+}
+
+inline const RerankTrace* RerankTraceStore::FindLatestByStart(size_t start) const {
+  for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+    if (it->valid && it->start == start) {
+      return &*it;
+    }
+  }
+  return nullptr;
 }
 
 inline const RerankTrace* RerankTraceStore::Find(const std::string& input, size_t start,

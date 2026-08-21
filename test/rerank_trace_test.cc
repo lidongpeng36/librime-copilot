@@ -275,3 +275,113 @@ TEST(RerankFilterTraceSpan, ANullSegmentClearsThePendingSpan) {
   EXPECT_TRUE(filter.AppliesToSegment(nullptr));
   EXPECT_FALSE(filter.pending_trace_span().has_value());
 }
+
+// `size()` saturates: the store is a bounded deque, so past kMaxEntries a
+// Record() drops the oldest and the count stops moving. replay_copilot.cc used
+// a size() DELTA to decide "a fresh trace landed during that call", which is
+// therefore blind from the 16th entry on -- measured on the real corpus, every
+// segment past 16 fed keys came back "notrace", 100% of 148. A monotonic count
+// of Record() calls is what that detector actually needs.
+TEST(RerankTraceStore, CountsEveryRecordEvenOnceSizeSaturates) {
+  RerankTraceStore store;
+  const size_t n = RerankTraceStore::kMaxEntries + 8;
+  for (size_t i = 0; i < n; ++i) {
+    store.Record(At("input", i, i + 1, "x"));
+  }
+  EXPECT_EQ(store.size(), RerankTraceStore::kMaxEntries);  // saturated, as before
+  EXPECT_EQ(store.records(), n);                           // and still counting
+}
+
+// The other half of the same blindness: Apply() rebuilds a segment's
+// translation on every keystroke, and re-recording the SAME (input, span)
+// replaces in place without growing the store at all -- so even below
+// kMaxEntries a size() delta misses it.
+TEST(RerankTraceStore, CountsAReRecordThatReplacesInPlace) {
+  RerankTraceStore store;
+  store.Record(At("nihao", 0, 2, "你"));
+  EXPECT_EQ(store.records(), 1u);
+  store.Record(At("nihao", 0, 2, "妮"));
+  EXPECT_EQ(store.size(), 1u);  // replaced, not appended
+  EXPECT_EQ(store.records(), 2u);
+}
+
+// An invalid trace is not recorded, so it must not be counted either -- a
+// caller reading the delta would otherwise be told a decision it cannot find.
+TEST(RerankTraceStore, DoesNotCountAnInvalidTrace) {
+  RerankTraceStore store;
+  RerankTrace invalid;
+  invalid.valid = false;
+  store.Record(invalid);
+  EXPECT_EQ(store.records(), 0u);
+  EXPECT_EQ(store.Last(), nullptr);
+}
+
+// Last() claims to be "the most recently recorded entry". With an in-place
+// replacement it was returning entries_.back() instead, which is a DIFFERENT
+// segment -- so replay_copilot attributed one segment's decision to another
+// whenever the newest write was a replacement.
+TEST(RerankTraceStore, LastIsTheMostRecentlyRecordedNotTheBackOfTheDeque) {
+  RerankTraceStore store;
+  store.Record(At("nihao", 0, 2, "你"));
+  store.Record(At("nihao", 2, 5, "好"));
+  store.Record(At("nihao", 0, 2, "妮"));  // replaces the FIRST entry in place
+  ASSERT_NE(store.Last(), nullptr);
+  EXPECT_EQ(store.Last()->start, 0u);
+  EXPECT_EQ(store.Last()->end, 2u);
+}
+
+// records() must not reset: the delta is read across calls that may contain a
+// commit, and a commit clears the store. Resetting would make the delta
+// negative and read as "nothing recorded" -- the exact failure being fixed.
+TEST(RerankTraceStore, ClearDropsEntriesButNotTheRecordCount) {
+  RerankTraceStore store;
+  store.Record(At("nihao", 0, 2, "你"));
+  store.Clear();
+  EXPECT_EQ(store.size(), 0u);
+  EXPECT_EQ(store.records(), 1u);
+}
+
+// Segment 0's blind spot (replay_copilot.cc): ProcessRequest feeds every key of
+// a request BEFORE the loop that captures the records() count, so segment 0's
+// trace is already written by the time that window opens and the delta is zero.
+// Moving the capture earlier would make Last() name whichever segment Apply()
+// ran for last on the final keystroke -- a later one, in any multi-segment
+// composition. Looking the segment up by its span start instead needs no
+// window at all, and start is 0 for segment 0 under every segmentation, so it
+// needs no unit conversion between the tool's key positions and librime's
+// input offsets either.
+TEST(RerankTraceStore, FindsTheLatestTraceForASpanStart) {
+  RerankTraceStore store;
+  store.Record(At("ni", 0, 2, "你"));
+  store.Record(At("niha", 0, 2, "妮"));  // same segment, later keystroke
+  store.Record(At("niha", 2, 4, "哈"));  // a LATER segment, recorded last
+  const RerankTrace* found = store.FindLatestByStart(0);
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->start, 0u);
+  EXPECT_EQ(found->input, "niha");  // the newest of the two, not the oldest
+}
+
+TEST(RerankTraceStore, FindLatestByStartIgnoresOtherSegments) {
+  RerankTraceStore store;
+  store.Record(At("niha", 2, 4, "哈"));
+  EXPECT_EQ(store.FindLatestByStart(0), nullptr);
+}
+
+// Every keystroke records a fresh (input, span) triple, so a composition longer
+// than kMaxEntries evicts segment 0's EARLY entries. Its latest one must
+// survive that -- which it does, because the newest keystroke re-records every
+// live segment. This is the case Last()-plus-delta could never reach.
+TEST(RerankTraceStore, FindLatestByStartSurvivesEviction) {
+  RerankTraceStore store;
+  for (size_t i = 0; i < RerankTraceStore::kMaxEntries + 8; ++i) {
+    store.Record(At("input" + std::to_string(i), 4, 6, "x"));
+  }
+  store.Record(At("final", 0, 2, "你"));  // segment 0, newest keystroke
+  ASSERT_NE(store.FindLatestByStart(0), nullptr);
+  EXPECT_EQ(store.FindLatestByStart(0)->input, "final");
+}
+
+TEST(RerankTraceStore, FindLatestByStartFindsNothingInAnEmptyStore) {
+  RerankTraceStore store;
+  EXPECT_EQ(store.FindLatestByStart(0), nullptr);
+}
