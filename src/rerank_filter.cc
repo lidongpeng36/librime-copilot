@@ -452,8 +452,9 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   const std::string before = surrounding->before + confirmed_prefix;
   // Two contexts, because the two scorers can use different things. The db is
   // keyed by Han sequences and can look up nothing else; the model reads
-  // whatever is there. Collapsing them was costing the model 68.2% of
-  // segments -- see ScoringContext in rerank.h.
+  // whatever is there. Collapsing them applies the db's gate to the model,
+  // which measured over 27245 replay segments blocks 42.9% of them -- see
+  // ScoringContext in rerank.h.
   const std::string context = TrailingCjkRun(before, options_.max_context_chars);
   const std::string llm_context = ScoringContext(before, options_.llm.context_chars);
 
@@ -497,29 +498,24 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
     llm_eligible = true;
   }
 
-  // Empty here means the DB has nothing to key on -- `context` is the Han-only
-  // tail -- and it ALSO ends the LLM path, which is a constraint the model
-  // does not have: it reads punctuation and Latin, and 68.2% of segments carry
-  // no trailing Han (`llm_skip=noctx`) purely because the harness splits
-  // requests at maximal Han runs.
-  //
-  // Lifting it was tried and reverted. Those newly-eligible segments are
-  // exactly the ones where RawInputFilter has put the raw keystrokes first,
-  // and promoting into them displaces that head: measured, bucket B+D fell
-  // from 43.8% to 13.4% of segments. `Decide` enforces "never touch bucket B"
-  // when choosing WHICH candidate wins (rerank_llm.h picks the first all-Han
-  // as incumbent) but nothing enforces it on where the winner is INSERTED.
-  // Reaching those segments needs that second half designed first; until then
-  // this stays, and `llm_skip=noctx` is the honest measure of what it costs.
-  if (context.empty()) {
+  // Empty `context` means the DB has nothing to key on -- it is the Han-only
+  // tail. Whether it also ends the LLM path is now the
+  // `copilot/rerank/llm/require_han_context` switch; the reasoning, the
+  // measurement that set it, and the change that invalidated that
+  // measurement's premise all live on BailOnEmptyDbContext (rerank_llm.h).
+  if (llm_rerank::BailOnEmptyDbContext(context.empty(), llm_eligible,
+                                       options_.llm.require_han_context)) {
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
                     SurroundingSourceName(surrounding->source),
                     llm_rerank::SkipForEmptyDbContext(llm_skip));
     return translation;
   }
-  // A missing db only takes the db branch down with it -- the LLM branch
-  // above needs no db at all, and is the primary scoring source now.
-  auto continuations = db_ ? LookupContinuations(context) : an<RerankContinuations>();
+  // A missing db only takes the db branch down with it -- the LLM branch above
+  // needs no db at all, and is the primary scoring source now. An empty
+  // `context` reaches here only with the gate lifted, and the db cannot key on
+  // it, so it is not asked.
+  auto continuations =
+      (db_ && !context.empty()) ? LookupContinuations(context) : an<RerankContinuations>();
   if (!llm_eligible && (!continuations || continuations->empty())) {
     // Nothing either path can act on: the db has no continuations for this
     // context (or no db loaded at all), and the LLM guard chain above already
@@ -561,6 +557,7 @@ CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) 
       config->GetBool("copilot/rerank/llm/enable", &options.llm.enable);
       config->GetString("copilot/rerank/llm/model", &options.llm.model);
       config->GetBool("copilot/rerank/llm/battery_active", &options.llm.battery_active);
+      config->GetBool("copilot/rerank/llm/require_han_context", &options.llm.require_han_context);
       config->GetInt("copilot/rerank/llm/top_n", &options.llm.top_n);
       config->GetInt("copilot/rerank/llm/context_chars", &options.llm.context_chars);
       // Config has GetDouble but no GetFloat (rime/config/config_component.h)

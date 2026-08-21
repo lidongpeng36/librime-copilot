@@ -43,10 +43,13 @@ inline bool IsHanIdeograph(uint32_t cp) {
 //
 // Deliberately NOT TrailingCjkRun. That trims to a Han-only tail because the
 // db is keyed by Han sequences and can look up nothing else -- a constraint of
-// the n-gram, not of the caret. Applying it to the model gated scoring on
-// "does the text before the caret end in Han", and measured on the replay
-// corpus that is false for 68.2% of segments (`llm_skip=noctx`), so the model
-// was consulted on 8.8% of them.
+// the n-gram, not of the caret. Applying it to the model gates scoring on
+// "does the text before the caret end in Han", which measured over 27245
+// replay segments blocks 42.9% of them outright (`llm_skip=noctx` is 16322 of
+// 27245, 59.9%; see BailOnEmptyDbContext in rerank_llm.h). Earlier versions of
+// this comment quoted 68.2%/8.8% from a replay run whose trace detector
+// saturated at 16 entries -- treat any pre-2026-08-21 engagement figure as
+// unusable, not merely approximate.
 //
 // The model has no such constraint: its training corpus keeps punctuation,
 // Latin and digits precisely because 0% of real scoring contexts end in a Han

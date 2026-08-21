@@ -197,3 +197,38 @@ TEST(SkipForEmptyDbContext, KeepsAnyReasonTheChainAlreadyEstablished) {
   EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kNoModel), SkipReason::kNoModel);
   EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kDisabled), SkipReason::kDisabled);
 }
+
+// The db-context gate itself, extracted from CopilotRerankFilter::Apply so it
+// can be driven without a Rime engine (the same move ComputeSpaceCommitText
+// made). `db_context_empty` is "the trailing Han run is empty", which is the
+// only thing the db can key on and is a condition the MODEL does not share --
+// it reads punctuation and Latin perfectly well.
+TEST(BailOnEmptyDbContext, NeverBailsWhenTheDbHasAContext) {
+  for (bool eligible : {true, false}) {
+    for (bool require : {true, false}) {
+      EXPECT_FALSE(BailOnEmptyDbContext(/*db_context_empty=*/false, eligible, require));
+    }
+  }
+}
+
+// Today's behaviour, and the default: an empty db context ends the segment
+// whatever the model could have done with it.
+TEST(BailOnEmptyDbContext, RequiringHanContextBailsEvenWhenTheModelIsReady) {
+  EXPECT_TRUE(BailOnEmptyDbContext(/*db_context_empty=*/true, /*llm_eligible=*/true,
+                                   /*require_han_context=*/true));
+}
+
+// The switch off: the model is allowed into the segments the db cannot key on.
+TEST(BailOnEmptyDbContext, LiftedGateLetsAnEligibleModelThrough) {
+  EXPECT_FALSE(BailOnEmptyDbContext(/*db_context_empty=*/true, /*llm_eligible=*/true,
+                                    /*require_han_context=*/false));
+}
+
+// Lifting the gate must NOT keep a segment alive that neither path can act on.
+// With no db context and no eligible model there is nothing left to do, and
+// falling through would reach LookupContinuations("") -- a db query on an empty
+// key, for a caller that has already been told the answer is nothing.
+TEST(BailOnEmptyDbContext, LiftedGateStillBailsWithNoEligibleModel) {
+  EXPECT_TRUE(BailOnEmptyDbContext(/*db_context_empty=*/true, /*llm_eligible=*/false,
+                                   /*require_han_context=*/false));
+}

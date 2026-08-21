@@ -30,6 +30,11 @@ struct LlmRerankOptions {
   // measured ~0.03 ms per token on this model, so 32 costs about 1 ms more
   // than 8.
   int context_chars = 32;
+  // Whether a segment needs a trailing HAN context before the model may be
+  // consulted. True is today's behaviour and is a db constraint the model does
+  // not share -- see BailOnEmptyDbContext below for what it costs and why
+  // lifting it is a measurement rather than an obvious win.
+  bool require_han_context = true;
 };
 
 namespace llm_rerank {
@@ -84,6 +89,47 @@ inline const char* SkipReasonName(SkipReason r) {
 // code could never produce).
 inline SkipReason SkipForEmptyDbContext(SkipReason chain_reason) {
   return chain_reason == SkipReason::kNone ? SkipReason::kNoContext : chain_reason;
+}
+
+// The db-context gate: should CopilotRerankFilter::Apply end this segment?
+//
+// `db_context_empty` means the trailing Han run is empty, which is the only
+// thing the db can key on. The MODEL has no such need -- it reads punctuation
+// and Latin -- so this gate costs it real segments.
+//
+// HOW MANY was re-measured on 2026-08-21 over 16322 requests / 27245 segments
+// (docs/superpowers/specs/2026-08-21-rerank-cost-and-gate-results.md): the gate
+// blocks 42.9% of all segments, and `noctx` is 16322 of 27245 (59.9%) --
+// exactly the request count, because the gate ends every request's segment 0
+// and nothing else. Any figure from before that date is unusable rather than
+// approximate: the replay harness's trace detector saturated at 16 entries, so
+// its surviving sample was biased toward short requests.
+//
+// Lifting it was tried once and reverted: those newly-eligible segments were
+// exactly the ones where RawInputFilter had put the raw keystrokes first, and
+// promoting into them displaced that head -- bucket B+D fell from 43.8% to
+// 13.4%. `Decide` enforces "never touch bucket B" when choosing WHICH candidate
+// wins, but nothing enforces it on where the winner is INSERTED.
+//
+// That danger is gone and the question is now settled -- on cost, not fear.
+// RawInputFilter no longer puts the raw keystrokes first in any segment
+// (b64ef1c -- they go to the last slot of the page, or nowhere), and bucket B
+// measured 4 segments of 27245 in BOTH arms. Lifting the gate is safe, and it
+// changes what the user sees on 75 of 27245 segments (GAIN 44 / LOSS 31,
+// McNemar p=0.17) for 2.07x the scorings. So it stays a switch, defaulting to
+// true because 2.07x the model runs buys nothing measurable -- not because the
+// answer is unknown.
+//
+// The `!llm_eligible` clause is not redundant with the caller's later check:
+// with the gate lifted and no eligible model there is nothing either path can
+// act on, and falling through would reach LookupContinuations("") -- a db query
+// on an empty key whose answer is already known.
+inline bool BailOnEmptyDbContext(bool db_context_empty, bool llm_eligible,
+                                 bool require_han_context) {
+  if (!db_context_empty) {
+    return false;
+  }
+  return require_han_context || !llm_eligible;
 }
 
 struct Decision {
