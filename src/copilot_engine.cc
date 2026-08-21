@@ -177,6 +177,7 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   bool rerank_enable = true;
   bool rerank_llm_enable = false;
   string rerank_llm_model;
+  LlmScorerOptions rerank_llm_scorer;
   if (auto* schema = ticket.schema) {
     auto* config = schema->config();
     if (config->GetString("copilot/db", &db_name)) {
@@ -202,6 +203,10 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     config->GetBool("copilot/rerank/enable", &rerank_enable);
     config->GetBool("copilot/rerank/llm/enable", &rerank_llm_enable);
     config->GetString("copilot/rerank/llm/model", &rerank_llm_model);
+    // Where the model runs. Absent, both keep the values that were hard-coded
+    // before tools/bench_scorer.cc made them measurable; see LlmScorerOptions.
+    config->GetInt("copilot/rerank/llm/n_gpu_layers", &rerank_llm_scorer.n_gpu_layers);
+    config->GetInt("copilot/rerank/llm/n_threads", &rerank_llm_scorer.n_threads);
   }
   std::shared_ptr<::copilot::History> history = std::make_shared<::copilot::History>(100);
   // `enable` gates CONSTRUCTION, not just output, and that distinction is the
@@ -251,7 +256,7 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
         the<ResourceResolver>(Service::instance().CreateResourceResolver(kCopilotLLMResourceType));
     auto model_path = r->ResolvePath(rerank_llm_model);
     if (std::filesystem::exists(model_path)) {
-      scorer = std::make_unique<LlmScorer>(model_path);
+      scorer = std::make_unique<LlmScorer>(model_path, rerank_llm_scorer);
     } else {
       LOG(ERROR) << "[copilot] rerank llm: model not found at " << model_path
                  << " (copilot/rerank/llm/model: " << rerank_llm_model << ")";

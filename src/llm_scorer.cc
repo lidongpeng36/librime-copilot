@@ -108,7 +108,8 @@ constexpr float kUnscoreable = -1e30f;
 }  // namespace
 
 struct LlmScorer::Impl {
-  explicit Impl(std::string model_path) : model_path_(std::move(model_path)) {
+  Impl(std::string model_path, LlmScorerOptions options)
+      : model_path_(std::move(model_path)), options_(options) {
     worker_ = std::thread([this] { WorkerLoop(); });
   }
 
@@ -268,7 +269,7 @@ struct LlmScorer::Impl {
     backend_inited_ = true;
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 99;
+    model_params.n_gpu_layers = options_.n_gpu_layers;
     model_ = llama_model_load_from_file(model_path_.c_str(), model_params);
     if (!model_) {
       LOG(ERROR) << "[copilot] llm_scorer: failed to load model '" << model_path_ << "'";
@@ -283,8 +284,16 @@ struct LlmScorer::Impl {
     ctx_params.n_batch = kNBatch;
     ctx_params.n_seq_max = kNSeqMax;
     ctx_params.no_perf = true;
-    ctx_params.n_threads = static_cast<int32_t>(std::thread::hardware_concurrency());
+    // 0 means "whatever the machine reports", which is what this always did.
+    // A configured value is taken as given -- including a value above the core
+    // count, which llama.cpp handles and which is the caller's business, not
+    // this function's to second-guess.
+    ctx_params.n_threads = options_.n_threads > 0
+                               ? static_cast<int32_t>(options_.n_threads)
+                               : static_cast<int32_t>(std::thread::hardware_concurrency());
     ctx_params.n_threads_batch = ctx_params.n_threads;
+    LOG(INFO) << "[copilot] llm_scorer: n_gpu_layers=" << options_.n_gpu_layers
+              << " n_threads=" << ctx_params.n_threads;
 
     ctx_ = llama_init_from_model(model_, ctx_params);
     if (!ctx_) {
@@ -516,10 +525,13 @@ struct LlmScorer::Impl {
   std::atomic<bool> loaded_{false};
   std::atomic<bool> load_failed_{false};
   bool backend_inited_ = false;
+  // Read only inside EnsureLoaded(), on the worker thread, before loaded_ is
+  // published -- so it needs no synchronization of its own.
+  LlmScorerOptions options_;
 };
 
-LlmScorer::LlmScorer(std::string model_path)
-    : impl_(std::make_unique<Impl>(std::move(model_path))) {}
+LlmScorer::LlmScorer(std::string model_path, LlmScorerOptions options)
+    : impl_(std::make_unique<Impl>(std::move(model_path), options)) {}
 
 LlmScorer::~LlmScorer() = default;
 

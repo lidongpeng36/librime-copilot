@@ -31,6 +31,13 @@ add_executable(score_candidates
 target_link_libraries(score_candidates
   ${LINK_LIBS})
 
+# Same linkage as score_candidates: llama.cpp only, no rime. It measures the
+# batched scoring path by replicating it, not by calling into the plugin.
+add_executable(bench_scorer
+  bench_scorer.cc)
+target_link_libraries(bench_scorer
+  ${LINK_LIBS})
+
 if(APPLE)
   find_library(APPSERVICES_LIBRARY ApplicationServices REQUIRED)
   find_library(APPKIT_LIBRARY AppKit REQUIRED)
