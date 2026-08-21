@@ -116,6 +116,22 @@ C++ tools, built when `BUILD_TOOLS=ON` (default):
 - `build_copilot` — builds the prediction DB. Reads stdin lines of
   `key text weight`, writes the DB file (arg 1, default `copilot.db`).
   Lands at `<librime>/build/plugins/copilot/bin/build_copilot`.
+- `bench_scorer` — what one re-ranking costs on THIS machine: prefill and
+  scoring timed separately, with the process's CPU time beside them. It exists
+  because the deployed batched path lives inside `LlmScorer`, behind a Rime
+  engine, and could not be timed through it; the file replicates that batch
+  geometry and must stay in step with `llm_scorer.cc`. Run it before touching
+  `n_gpu_layers`/`n_threads`, and on any new machine, rather than carrying this
+  one's numbers over. **Every phase must end on a `llama_get_logits_ith()`, not
+  on the `llama_decode()` before it** — on Metal the decode returns before the
+  GPU is done and reading the logits is what synchronizes. Two versions of this
+  tool got that wrong in opposite directions and each produced a confident
+  latency verdict that was an artifact of where the clock stopped; the score
+  phase must therefore also run the full `n_vocab` log-softmax `ScoreGroup`
+  runs, and submit `len - 1` tokens per candidate as it does. Corrected, the
+  two arms are within a millisecond on latency and the GPU wins on **core
+  time** (1.93 ms/iteration against 14.79), which is the real argument for the
+  default.
 - `dump_copilot` — read-only probe: prints a key's continuations with weights,
   ranks and duplicate counts. First stop when candidates come out in a
   surprising order (`dump_copilot <db> --find 议 -- 建`).
@@ -358,10 +374,33 @@ with no vault, or for trying a model before vaulting it.
 then patch the schema (both commands print the exact lines), build the plugin
 from a librime checkout, and copy the dylib into `Squirrel.app`.
 
-### The two switches, and why they are switches
+### The evaluation corpus is the binding constraint, and it has a lever
 
-Both answer questions no corpus can settle, so both default to today's
-behaviour and are left for real use to decide:
+Every question left open in this area — the `noctx` gate below, the two
+switches, any corpus or recipe change — is measured on the same replay corpus,
+and at 3287 scoring units near 70% accuracy its 95% interval is about **±1.6
+points**. Three corpora landing between 65% and 69% (S1) could not be told
+apart by it. So "inconclusive" here has usually meant "the eval set is too
+small", not "the change did nothing".
+
+`rime-corpus ingest --since-days N --max-items M` is the lever, and the numbers
+are worth knowing before the next person re-derives them: the DingTalk adapter
+defaults to a **90-day** window and 1000 items per conversation, which yielded
+996 of the user's own messages. At 730 days it yields **5712**. Harvesting that
+took the corpus from 1349 utterances to 5428 (4.0x) and 31k Han characters to
+95k (3.0x), which should bring the interval to roughly ±0.9 — confirmed by a
+replay run, not by this paragraph.
+
+An adapter with no time window (`adapters.claude`, which reads every local
+transcript) declares no `DEFAULT_WINDOW_DAYS`, and `_ingest` prints that the
+flag did not apply rather than dropping it silently. That distinction is the
+whole point: a run that reports success having never applied the window it was
+given is the failure mode this repo keeps meeting in other forms.
+
+### The switches, and why they are switches
+
+Each answers a question the corpus cannot settle, so each defaults to today's
+behaviour and is left for real use — or a better instrument — to decide:
 
 - **`copilot/rerank/llm/margin`** (default 2.0) — how much better a candidate
   must score before it is promoted. Swept on this model: harmful promotion
@@ -370,6 +409,28 @@ behaviour and are left for real use to decide:
   take a candidate covering a *different amount of input* than the one it
   displaces. False is worth +4.5 points of segments and costs p99 11.0ms →
   15.1ms, and changes how much input Space commits.
+- **`copilot/rerank/llm/require_han_context`** (default true) — the Han-context
+  gate. See "What is NOT built" below: it blocks 42.9% of all segments, lifting
+  it is safe, and lifting it changes the output on 75 of 27245. Stays true on
+  cost: 2.07x the scorings for no measurable gain.
+- **`copilot/rerank/llm/n_gpu_layers`** (default 99) and **`.../n_threads`**
+  (default 0 = `hardware_concurrency()`) — where the model runs. Both were
+  hard-coded on no measurement; both defaults measure right on an M4, but on
+  **core time, not latency**: 1.93ms of CPU per scoring on the GPU against
+  14.79 on four CPU threads, while score p50 is 2.55ms against 1.89 — i.e.
+  CPU-only is a shade *faster* and both are well inside the p99 < 10ms budget.
+  `n_threads` is **inert** while the layers are on the GPU and decisive once
+  they are not — 8 threads is worse than 4 on a 4-P-core machine, on both
+  latency and core time.
+
+**`copilot/rerank/llm/battery_active` (default false) is the one whose default
+is now known to be wrong.** Its README justification was "the model's CPU cost
+is exactly the kind of thing a laptop should shed on battery"; measured, one
+prefill-plus-scoring is ~3.9ms of GPU and ~1.9ms of CPU, so a dense 1000
+commits an hour is ~0.012 Wh/h against a laptop's 8-15W — about 0.1% of
+consumption, and the GPU is already awake rendering the candidate window at
+exactly those moments. `true` is the recommendation; the default stays `false`
+only because it is the shipped behaviour.
 
 ### What is NOT built
 
@@ -378,24 +439,68 @@ Whole-sentence decoding (Path A of
 and deliberately not implemented: the user's priority is candidate ordering
 given existing context, not long-sentence correctness.
 
-The model is consulted on 8.8% of the replay corpus's segments, 68.2% skipped
-as `llm_skip=noctx`. That is largely a corpus artifact — the harness splits
-requests at maximal Han runs, so the character before every run is by
-construction not Han, while real typing continues after committed Chinese.
-Lifting that gate was tried and reverted: it reaches exactly the segments
-where `RawInputFilter` had put the raw keystrokes first, and promoting there
-displaces that head (bucket B+D fell from 43.8% to 13.4%). `Decide` enforces
-"never touch bucket B" when choosing *which* candidate wins but nothing
-enforces it on where the winner is *inserted*. See the comment guarding the
-early return in `rerank_filter.cc`.
+The Han-context gate (`copilot/rerank/llm/require_han_context`, default true)
+ends any segment whose trailing **Han** run is empty — a db constraint the model
+does not share, since it reads punctuation and Latin. It was re-measured on
+2026-08-21; the full record is
+`docs/superpowers/specs/2026-08-21-rerank-cost-and-gate-results.md`.
 
-**That measurement's premise has since changed and the gate has not been
-re-measured.** `RawInputFilter` no longer puts the raw keystrokes first in any
-segment (`b64ef1c` — they go to the last slot of the page, or nowhere), so the
-head those promotions displaced is not there any more. Whether the gate is
-still earning its 68.2% is now an open question rather than a settled one; it
-was left in place deliberately, because re-deciding it needs its own numbers,
-not an inference from this paragraph.
+**Its safety question is settled: lifting it cannot repeat the 2026-08
+revert.** That revert happened because bucket B+D fell from 43.8% to 13.4% —
+promotions displaced the raw-input head `RawInputFilter` used to place first.
+`b64ef1c` moved those keystrokes to the last slot of the page or nowhere, and
+**bucket B is now 4 segments of 27245 (0.0%)**, identical in both arms across
+two independent full runs. The head is not there to displace.
+
+**What it costs is large, and what it buys is nothing.** With the gate on the
+model is consulted on 10923 of 27245 segments (40.1%); lifted, 22604 (83.0%).
+`noctx` with the gate on is **16322 — exactly the request count**: the gate
+blocks every request's segment 0 and nothing else. Lifting it recovers 11681 of
+those, exactly the requests that have preceding context; the other 4641 have
+none, so the model could not have used them either. **The gate blocks 42.9% of
+all segments.**
+
+Doubling the model's opportunities changes the output on 75 segments of 27245 —
+GAIN 44 / LOSS 31, net +13, McNemar p=0.17, every example at `pos: 0`. The
+corpus resolves ±0.59 points at segment level, so this is not a resolution
+problem: where the model newly gets to look, it agrees with the existing head.
+
+So the default stays `true` on a **cost** argument, and that is the first real
+reason it has ever had: lifting it costs 2.07x the scorings (10923 → 22604) at
+~3.9 ms of GPU and ~1.9 ms of CPU each, for no measurable change in output.
+Both earlier reasons
+are dead — "bucket B would collapse" is refuted above, and "we cannot see where
+it acts" was fixed in `421bda3`.
+
+### Numbers from replay before 2026-08-21 are biased, not merely noisy
+
+`ObserveLlm` decided "a fresh trace landed" from a `RerankTraceStore::size()`
+delta. That store is a bounded deque of `kMaxEntries = 16`, so `size()`
+saturates and **every segment past the 16th trace was labelled `notrace`** —
+measured, 100% of the 148 segments past 16 fed keys, against 57% below it. An
+in-place re-record (which `Apply()` does on every keystroke) blinds it below 16
+too. Fixed by a monotonic `records()` counter (`f54cec1`).
+
+This moved the engagement rate from **11.9% to 40.1%**, so the figure this file
+used to carry — "the model is consulted on 8.8% of segments" — was wrong by
+more than 4x. Worse than wrong: the surviving sample was biased toward SHORT
+requests, i.e. the ones carrying least context and where the model has least to
+offer. Treat any pre-2026-08-21 replay engagement or `llm_skip` number as
+unusable rather than approximate.
+
+Segment 0 was blind for a second reason and was fixed separately (`421bda3`):
+`ProcessRequest` feeds every key of a request before the loop that captures the
+count, so segment 0's trace is already written when the window opens. Capturing
+earlier is NOT the fix — during key feeding `Apply()` runs for every live
+segment on every keystroke, so `Last()` would name a later segment. The query
+that works needs no window: `RerankTraceStore::FindLatestByStart(start)`, valid
+for segment 0 because its span starts at 0 under every segmentation, so it needs
+no conversion between the tool's key positions and librime's input offsets and
+no guess at `end` (both move as a segment is re-recorded; `start` does not).
+
+**`notrace` is now zero** — every length bucket, both arms, the whole corpus.
+Any future replay number that shows a `notrace` bucket at all is a regression in
+this machinery, not a property of the data.
 
 ## Propagating a change to a machine that already has this
 
