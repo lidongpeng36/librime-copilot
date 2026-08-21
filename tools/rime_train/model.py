@@ -27,6 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from . import recipe
+
 
 @dataclass
 class Config:
@@ -124,6 +126,13 @@ class Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self.apply(self._init)
+        # The two projections that write into the residual stream once per
+        # layer, so their variance compounds with depth. Applied after the flat
+        # init above, which has already touched them.
+        std = recipe.residual_init_std(0.02, cfg.layers)
+        for block in self.blocks:
+            nn.init.normal_(block.wo.weight, mean=0.0, std=std)
+            nn.init.normal_(block.down.weight, mean=0.0, std=std)
 
     @staticmethod
     def _init(module):

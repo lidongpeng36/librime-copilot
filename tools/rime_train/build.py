@@ -35,6 +35,12 @@ def texts_from_line(line: str, source: Source) -> list[str]:
         record = json.loads(line)
     except json.JSONDecodeError:
         return []
+    if source.language_field:
+        # Absent is not the same as matching: an unlabelled record is dropped
+        # rather than admitted, which is what keeps mislabelled and unlabelled
+        # non-Chinese text out.
+        if not isinstance(record, dict) or record.get(source.language_field) != source.language:
+            return []
     value = record if not source.field else (
         record.get(source.field) if isinstance(record, dict) else None)
     if value is None:

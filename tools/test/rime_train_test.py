@@ -324,3 +324,159 @@ class TextSentences(unittest.TestCase):
     def test_a_chunk_with_no_han_is_dropped(self):
         # Latin is wanted as context, not as something to model.
         self.assertEqual(normalize.text_sentences("just english here. and more"), [])
+
+
+class LanguageFilterTest(unittest.TestCase):
+    """m-a-p/Matrix does not carry the language in the split name; the
+    `Language=` field does, and the two disagree. Measured 2026-08-21:
+    wiki_all and book_technology are English, and paper_science is labelled
+    `en` while actually being JAPANESE -- whose kanji pass a naive CJK regex
+    and would enter the corpus looking like Chinese. The trailing `=` in the
+    key is not a typo; it is the field's real name.
+    """
+
+    SRC = build.Source(name="m", url="http://x/m.jsonl", register="technical",
+                       field="text", language_field="Language=", language="zh")
+
+    def test_a_matching_language_passes(self):
+        line = '{"Language=": "zh", "text": "这是一段中文技术文字"}'
+        self.assertEqual(build.texts_from_line(line, self.SRC), ["这是一段中文技术文字"])
+
+    def test_a_different_language_is_dropped(self):
+        line = '{"Language=": "en", "text": "This is English prose"}'
+        self.assertEqual(build.texts_from_line(line, self.SRC), [])
+
+    def test_a_missing_language_field_is_dropped_not_admitted(self):
+        """Unlabelled is not the same as matching. Admitting it is how the
+        Japanese paper_science text would have got in."""
+        line = '{"text": "这是一段中文"}'
+        self.assertEqual(build.texts_from_line(line, self.SRC), [])
+
+    def test_a_source_with_no_language_field_is_unaffected(self):
+        plain = build.Source(name="s", url="http://x/s.jsonl", register="general",
+                             field="text")
+        line = '{"Language=": "en", "text": "这是一段中文"}'
+        self.assertEqual(build.texts_from_line(line, plain), ["这是一段中文"])
+
+
+class CcTechnologySourceTest(unittest.TestCase):
+    def test_it_is_registered_and_language_filtered(self):
+        from rime_train.sources import SOURCES
+        src = SOURCES["cc-technology"]
+        self.assertEqual(src.register, "technical")
+        self.assertEqual(src.field, "text")
+        self.assertEqual(src.language_field, "Language=")
+        self.assertEqual(src.language, "zh")
+        self.assertTrue(src.url.endswith(".jsonl"))
+
+    def test_it_is_upsampled(self):
+        """90 MB against a 12.6 GB corpus is 0.7% and contributes 0.26 points
+        of Latin density -- nothing. 8x is the dose the spec fixed."""
+        from rime_train.sources import SOURCES
+        self.assertEqual(SOURCES["cc-technology"].repeat, 8)
+
+
+class BuildRepeatTest(unittest.TestCase):
+    """Upsampling has to wrap build(), not live inside it.
+
+    build() ends in dedup.unique(), so repeating a sentence INSIDE that stream
+    would be deduplicated away and the repeat would silently do nothing. Each
+    repetition must be its own pass over the file.
+    """
+
+    def test_each_pass_yields_the_same_deduplicated_sentences(self):
+        import tempfile, json as _json
+        from rime_train import build as _build, charset as _charset
+        src = build.Source(name="t", url="http://x/t.jsonl", register="technical",
+                           field="text")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "t.jsonl"
+            with open(path, "w", encoding="utf-8") as h:
+                h.write(_json.dumps({"text": "这是第一句。这是第二句。"}) + "\n")
+                h.write(_json.dumps({"text": "这是第一句。"}) + "\n")  # duplicate
+            typeable = frozenset("这是第一句第二")
+            once = list(_build.build(path, src, typeable, None, han_only=False))
+            twice = list(_build.build(path, src, typeable, None, han_only=False))
+        self.assertEqual(once, twice)
+        self.assertEqual(len(once), len(set(once)), "build() must deduplicate within a pass")
+
+
+class BuildCmdRepeatTest(unittest.TestCase):
+    """Drives cmd_build itself: BuildRepeatTest above only pins the property
+    cmd_build relies on (build() is deterministic across passes), it does not
+    exercise the repeat loop. This does.
+    """
+
+    TEXT = "这是第一句。这是第二句。"  # 2 distinct sentences after build()
+    CHARS = "这是第一句二"
+
+    def _run_cmd_build(self, fake_source):
+        """Runs cmd_build against one fake source in an isolated cache dir.
+        Returns (lines written, captured stdout)."""
+        import argparse
+        import contextlib
+        import io
+        import json as _json
+        from rime_train import cli
+
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d)
+            with open(cache / "t.jsonl", "w", encoding="utf-8") as h:
+                h.write(_json.dumps({"text": self.TEXT}) + "\n")
+
+            charset_path = cache / "tiny.dict.yaml"
+            with open(charset_path, "w", encoding="utf-8") as h:
+                h.write("---\nname: tiny\n...\n")
+                for ch in self.CHARS:
+                    h.write(f"{ch}\tx\n")
+
+            args = argparse.Namespace(
+                charset=str(charset_path),
+                output=str(cache / "out.txt"),
+                source=["t"],
+                cache=str(cache),
+                limit_lines=None,
+                keep_punctuation=True,
+            )
+
+            old_sources = cli.SOURCES
+            cli.SOURCES = {"t": fake_source}
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = cli.cmd_build(args)
+            finally:
+                cli.SOURCES = old_sources
+
+            self.assertEqual(rc, 0)
+            lines = (cache / "out.txt").read_text(encoding="utf-8").splitlines()
+        return lines, out.getvalue()
+
+    def test_cmd_build_writes_each_source_repeat_times(self):
+        fake_source = build.Source(name="t", url="http://x/t.jsonl", register="technical",
+                                   field="text", repeat=3)
+        lines, stdout = self._run_cmd_build(fake_source)
+
+        # Repeat must be whole passes over the (deduplicated) source, not a
+        # duplicated-then-deduplicated stream: 3 passes of 2 distinct
+        # sentences is 6 lines, still only 2 distinct.
+        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(set(lines)), 2)
+        self.assertIn("t (technical) x3: 6 sentences", stdout)
+
+    def test_default_repeat_prints_no_suffix(self):
+        """Task 7 relies on repeat=1 sources printing exactly as before --
+        no `x1` suffix -- so this pins the other half of the contract."""
+        fake_source = build.Source(name="t", url="http://x/t.jsonl", register="technical",
+                                   field="text")  # repeat defaults to 1
+        lines, stdout = self._run_cmd_build(fake_source)
+
+        self.assertEqual(len(lines), 2)
+        self.assertIn("t (technical): 2 sentences", stdout)
+        # Assert against the summary line ALONE, not the whole capture: stdout
+        # also carries a tempfile.TemporaryDirectory() path, 8 characters from a
+        # 37-character alphabet, so a chance "x1" in it failed this roughly one
+        # run in 200.
+        summary = [line for line in stdout.splitlines() if line.strip().startswith("t (technical)")]
+        self.assertEqual(len(summary), 1, stdout)
+        self.assertNotIn("x1", summary[0])

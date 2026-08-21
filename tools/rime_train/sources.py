@@ -31,6 +31,19 @@ class Source:
     # Ships word-separated rather than as written; see normalize.join_han_tokens
     # for why leaving it alone silently empties the collocation table.
     pre_tokenized: bool = False
+    # Which JSON key carries the language, and which value keeps a record.
+    # Empty means the source is single-language and every record passes.
+    #
+    # m-a-p/Matrix needs this and its own split names actively mislead:
+    # `wiki_all` and `book_technology` are English, and `paper_science` is
+    # labelled `en` while actually being Japanese -- whose kanji pass a naive
+    # CJK regex, so it would enter the corpus looking like Chinese. The key's
+    # trailing `=` is the field's real name, verified against the file.
+    language_field: str = ""
+    language: str = ""
+    # How many times cmd_build writes this source's (deduplicated) sentences.
+    # Upsampling, for a source too small to matter at its natural weight.
+    repeat: int = 1
     note: str = ""
 
 
@@ -55,6 +68,24 @@ SOURCES = {
         is_dialogue=True,
         pre_tokenized=True,
         note="LCCC large: same cleaning, more of it",
+    ),
+    # The technical register `sources.py` has described since it was written and
+    # never shipped. Chinese prose around shell commands, paths and identifiers
+    # -- which is what the user's technical half looks like -- measured
+    # 2026-08-21 at 37.3% Latin and 32.9% Han against a corpus that is 2.3%
+    # Latin and an evaluation set whose contexts are 19.0%.
+    #
+    # 90 MB, so `repeat` rather than volume is what makes it count; see the
+    # dose argument in 2026-08-21-scorer-retrain-design.md.
+    "cc-technology": Source(
+        name="cc-technology",
+        url="https://huggingface.co/datasets/m-a-p/Matrix/resolve/main/cc_technology.0000.jsonl",
+        register="technical",
+        field="text",
+        language_field="Language=",
+        language="zh",
+        repeat=8,
+        note="m-a-p/Matrix cc_technology: Chinese technical writing",
     ),
 }
 

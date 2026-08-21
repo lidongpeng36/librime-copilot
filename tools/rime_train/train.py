@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import recipe
 from .model import Config, Model
 from .vocab import Vocab, build as build_vocab
 
@@ -58,14 +59,61 @@ def tokenize_corpus(corpus: Path, vocab: Vocab, out: Path, limit: int | None = N
 
 
 def batches(tokens: np.ndarray, batch: int, seq: int, device, seed: int = 0):
+    """Random training windows, skipping every held-out block.
+
+    Rejection rather than an index remap: the held-out blocks are 0.1% of the
+    corpus, so a redraw costs nothing measurable and the alternative (compacting
+    the index space) would silently shift what every offset means.
+
+    The stripe geometry is read straight from recipe, NOT taken as a parameter:
+    this function decides what the model may train on and validation_loss below
+    decides what it is scored on, from the same two constants. They were once a
+    parameter here and a hard-coded `recipe.DEFAULT_*` there, which is a pair
+    that can disagree -- and a disagreement means the validation set is data the
+    model trained on, with nothing in the loss curve to show it.
+    """
+    block, period = recipe.DEFAULT_BLOCK, recipe.DEFAULT_PERIOD
     rng = np.random.default_rng(seed)
     n = len(tokens) - seq - 1
     while True:
-        idx = rng.integers(0, n, size=batch)
+        idx = []
+        while len(idx) < batch:
+            candidate = int(rng.integers(0, n))
+            if recipe.overlaps_validation(candidate, recipe.training_footprint(seq), block, period):
+                continue
+            idx.append(candidate)
         x = np.stack([tokens[i:i + seq] for i in idx]).astype(np.int64)
         y = np.stack([tokens[i + 1:i + 1 + seq] for i in idx]).astype(np.int64)
         yield (torch.from_numpy(x).to(device, non_blocking=True),
                torch.from_numpy(y).to(device, non_blocking=True))
+
+
+@torch.no_grad()
+def validation_loss(model, tokens: np.ndarray, seq: int, device,
+                    n_windows: int = 64) -> float:
+    """Mean loss over the held-out blocks, on a fixed set of windows.
+
+    Fixed, not sampled: a validation loss that moves because its own sample
+    moved cannot rank two recipes, which is the only reason it is here.
+
+    Same two constants `batches` rejects against, for the reason given there.
+    """
+    starts = recipe.validation_starts(len(tokens), recipe.DEFAULT_BLOCK,
+                                      recipe.DEFAULT_PERIOD, seq, n_windows)
+    if not starts:
+        return float("nan")
+    model.eval()
+    try:
+        total = 0.0
+        for start in starts:
+            x = torch.from_numpy(tokens[start:start + seq].astype(np.int64))[None].to(device)
+            y = torch.from_numpy(tokens[start + 1:start + 1 + seq].astype(np.int64))[None].to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                _, loss = model(x, y)
+            total += loss.item()
+    finally:
+        model.train()
+    return total / len(starts)
 
 
 def main() -> int:
@@ -81,12 +129,16 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=48)
     ap.add_argument("--accum", type=int, default=4)
     ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr", type=float, default=6e-4,
+                    help="3e-4 was the first run's value and is conservative for "
+                         "40.9M parameters at 49152 tokens per step")
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the model; small models are launch-bound "
                          "and this is where most of the MFU is")
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--val-every", type=int, default=1000,
+                    help="steps between held-out validation loss reports")
     ap.add_argument("--save-every", type=int, default=2000)
     args = ap.parse_args()
 
@@ -107,8 +159,20 @@ def main() -> int:
     if args.compile:
         model = torch.compile(model)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                            weight_decay=0.1)
+    # Weight decay on projections only. It used to hit every parameter,
+    # including RMSNorm gains -- decaying a norm's gain pulls it toward zero,
+    # which the norm then fights with its own scale. recipe.decays_weight is
+    # the rule, tested without torch.
+    decay, no_decay = [], []
+    for name, param in getattr(model, "_orig_mod", model).named_parameters():
+        if not param.requires_grad:
+            continue
+        (decay if recipe.decays_weight(name, param.dim()) else no_decay).append(param)
+    print(f"weight decay on {len(decay)} tensors, off on {len(no_decay)}", flush=True)
+    opt = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": 0.1},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=args.lr, betas=(0.9, 0.95))
     # No GradScaler: it exists for fp16's narrow exponent range, and bf16 has
     # fp32's. Keeping it would add an unscale pass and a host sync per step for
     # nothing -- and on a model this small the step is short enough that the
@@ -143,6 +207,9 @@ def main() -> int:
             elapsed = time.time() - start
             print(f"step {step:6}/{args.steps}  loss {total:.4f}  lr {lr:.2e}  "
                   f"{seen/1e6:.0f}M tokens  {seen/elapsed/1e3:.0f}k tok/s", flush=True)
+        if step % args.val_every == 0 or step == args.steps:
+            print(f"  val {validation_loss(getattr(model, '_orig_mod', model), tokens, args.seq, device):.4f}",
+                  flush=True)
         if step % args.save_every == 0 or step == args.steps:
             # Unwrap torch.compile: an OptimizedModule's state_dict prefixes
             # every key with `_orig_mod.`, which then will not load into the

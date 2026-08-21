@@ -11,6 +11,7 @@ import json
 import re
 import sys
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -29,6 +30,33 @@ _SUSPECT = [
 ]
 
 
+def _harvest_window(adapter, args: argparse.Namespace) -> dict:
+    """The window arguments this adapter can honour, and nothing else.
+
+    Presence of `DEFAULT_WINDOW_DAYS` IS the declaration that a source has a
+    time window; there is no second registry to keep in step with it. A source
+    without one reads everything it can see (adapters.claude walks every local
+    transcript), so handing it `start=` is a TypeError -- and quietly dropping
+    the flag instead would be worse, because the run would report success
+    having harvested a window it never applied. Hence the note on stderr.
+    """
+    if not hasattr(adapter, "DEFAULT_WINDOW_DAYS"):
+        if args.since_days is not None or args.max_items is not None:
+            print(f"{adapter.SOURCE}: no time window -- --since-days/--max-items "
+                  f"do not apply to this source", file=sys.stderr)
+        return {}
+    window: dict = {}
+    if args.since_days is not None:
+        # Offset-aware, because dws is handed this string as-is and real ISO
+        # 8601 does not allow a naive one (see adapters.dingtalk's _CREATE_TIME).
+        window["start"] = (
+            datetime.now(timezone.utc) - timedelta(days=args.since_days)
+        ).isoformat()
+    if args.max_items is not None:
+        window["max_items"] = args.max_items
+    return window
+
+
 def _ingest(args: argparse.Namespace) -> int:
     directory = corpus.corpus_dir(args.corpus_dir)
     total = 0
@@ -36,7 +64,7 @@ def _ingest(args: argparse.Namespace) -> int:
         adapter = REGISTRY[name]
         records = (
             corpus.make_record(adapter.SOURCE, ts, text)
-            for ts, text in adapter.iter_utterances()
+            for ts, text in adapter.iter_utterances(**_harvest_window(adapter, args))
         )
         written = corpus.append(directory / f"{adapter.SOURCE}.jsonl", records)
         print(f"{adapter.SOURCE}: +{written}")
@@ -45,6 +73,41 @@ def _ingest(args: argparse.Namespace) -> int:
     # Always 0: an empty harvest is a legitimate result (re-running ingest
     # after the corpus is built adds nothing), and `stats` is where an empty
     # corpus is reported as a problem.
+    return 0
+
+
+def _split_time(args: argparse.Namespace) -> int:
+    """Write the two halves as directories of the same shape as the corpus.
+
+    Same layout on both sides (one <source>.jsonl per source) so every existing
+    tool -- stats, oracle, compare_rerank, export-evalset -- takes either half
+    through --corpus-dir with no change.
+    """
+    from . import split as _split
+
+    directory = corpus.corpus_dir(args.corpus_dir)
+    files = sorted(directory.glob("*.jsonl"))
+    # Same guard _stats keeps, for the same reason: with no corpus the loop
+    # below writes nothing, prints `train 0, eval 0` and returns 0 -- a run
+    # reporting success having done nothing, and the caller goes on to train on
+    # an empty split.
+    if not files:
+        print(f"no corpus at {directory}", file=sys.stderr)
+        return 1
+    out = Path(args.out)
+    totals = {}
+    for path in files:
+        train, evaluation = _split.partition_by_time(corpus.iter_records(path), args.cut)
+        for half, records in (("train", train), ("eval", evaluation)):
+            target = out / half / path.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            totals[(path.name, half)] = len(records)
+        print(f"{path.name}: train {len(train)}, eval {len(evaluation)}")
+    print(f"\ntrain {sum(v for (_, h), v in totals.items() if h == 'train')}, "
+          f"eval {sum(v for (_, h), v in totals.items() if h == 'eval')} -> {out}")
     return 0
 
 
@@ -504,7 +567,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ingest = sub.add_parser("ingest", help="harvest utterances into the corpus")
     ingest.add_argument("source", nargs="*", default=list(REGISTRY), choices=list(REGISTRY))
+    # Both default to None, meaning "whatever the adapter's own default is".
+    # An int here would override dingtalk's 90 on every plain `ingest`, moving
+    # ownership of that number out of the adapter that documents it.
+    ingest.add_argument(
+        "--since-days", type=int, default=None,
+        help="harvest this far back, for sources that have a time window "
+             "(dingtalk defaults to 90). The evaluation corpus was built at 90; "
+             "730 measured 5712 of the user's own messages against 996, and the "
+             "corpus's confidence interval scales as 1/sqrt(n)")
+    ingest.add_argument(
+        "--max-items", type=int, default=None,
+        help="per-conversation cap, for windowed sources (dingtalk defaults to "
+             "1000 -- too low once --since-days is wide)")
     ingest.set_defaults(func=_ingest)
+
+    split_time = sub.add_parser(
+        "split-time", help="partition the corpus into train/eval halves by timestamp")
+    split_time.add_argument(
+        "--cut", required=True,
+        help="YYYY-MM-DD. Records before it train; on or after it evaluate.")
+    split_time.add_argument(
+        "--out", required=True,
+        help="directory to write train/ and eval/ into, one file per source")
+    split_time.set_defaults(func=_split_time)
 
     stats = sub.add_parser("stats", help="corpus size and redaction residue")
     stats.set_defaults(func=_stats)

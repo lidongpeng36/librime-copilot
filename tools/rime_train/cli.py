@@ -57,11 +57,17 @@ def cmd_build(args) -> int:
             if not path.is_file():
                 print(f"{name}: not fetched ({path})", file=sys.stderr)
                 return 1
-            for sentence in _build.build(path, source, typeable, args.limit_lines,
-                                         han_only=not args.keep_punctuation):
-                handle.write(sentence + "\n")
-                per_source[name] += 1
-            print(f"  {name} ({source.register}): {per_source[name]} sentences")
+            # Upsampling wraps build() rather than living inside it: build()
+            # ends in dedup.unique(), so a repeat emitted within that stream
+            # would be deduplicated away and do nothing at all. Each repetition
+            # is its own pass over the file.
+            for pass_index in range(source.repeat):
+                for sentence in _build.build(path, source, typeable, args.limit_lines,
+                                             han_only=not args.keep_punctuation):
+                    handle.write(sentence + "\n")
+                    per_source[name] += 1
+            suffix = f" x{source.repeat}" if source.repeat > 1 else ""
+            print(f"  {name} ({source.register}){suffix}: {per_source[name]} sentences")
     print(f"{sum(per_source.values())} sentences -> {out}")
     return 0
 
@@ -77,7 +83,9 @@ def cmd_isolate(args) -> int:
     from rime_corpus import corpus, replay
 
     evals = []
-    for path in sorted(corpus.corpus_dir().glob("*.jsonl")):
+    eval_dir = corpus.corpus_dir(getattr(args, "eval_corpus_dir", None))
+    print(f"evaluation corpus dir: {eval_dir}")
+    for path in sorted(eval_dir.glob("*.jsonl")):
         for record in corpus.iter_records(path):
             evals.extend(run for _, run in replay.han_runs(record["text"]))
     marks = isolation.fingerprints(evals, args.span)
@@ -167,6 +175,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     isolate = sub.add_parser("isolate", help="check a built corpus against the eval set")
     isolate.add_argument("--corpus", required=True)
     isolate.add_argument("--span", type=int, default=isolation.MIN_SHARED_SPAN)
+    isolate.add_argument(
+        "--eval-corpus-dir", default=None,
+        help="which evaluation corpus to fingerprint against. Under a train/eval "
+             "split this MUST be the eval half; the default directory holds both, "
+             "and checking against both reports the training half as an overlap "
+             "and means nothing.")
     isolate.set_defaults(func=cmd_isolate)
 
     count = sub.add_parser("count", help="count collocations into build_grammar's input")
