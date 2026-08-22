@@ -706,9 +706,10 @@ behaviour and is left for real use — or a better instrument — to decide:
 - **`copilot/rerank/llm/n_gpu_layers`** (default 99) and **`.../n_threads`**
   (default 0 = `hardware_concurrency()`) — where the model runs. Both were
   hard-coded on no measurement; both defaults measure right on an M4, but on
-  **core time, not latency**: 1.93ms of CPU per scoring on the GPU against
-  14.79 on four CPU threads, while score p50 is 2.55ms against 1.89 — i.e.
-  CPU-only is a shade *faster* and both are well inside the p99 < 10ms budget.
+  **core time, not latency**: 1.93ms of CPU per prefill-plus-scoring on the
+  GPU against 14.79 on four CPU threads, while score p50 is 2.55ms against
+  1.89 — i.e. CPU-only is a shade *faster* and both are well inside the
+  p99 < 10ms budget.
   `n_threads` is **inert** while the layers are on the GPU and decisive once
   they are not — 8 threads is worse than 4 on a 4-P-core machine, on both
   latency and core time.
@@ -758,9 +759,8 @@ problem: where the model newly gets to look, it agrees with the existing head.
 So the default stays `true` on a **cost** argument, and that is the first real
 reason it has ever had: lifting it costs 2.07x the scorings (10923 → 22604) at
 ~3.9 ms of GPU and ~1.9 ms of CPU each, for no measurable change in output.
-Both earlier reasons
-are dead — "bucket B would collapse" is refuted above, and "we cannot see where
-it acts" was fixed in `421bda3`.
+Both earlier reasons are dead — "bucket B would collapse" is refuted above, and
+"we cannot see where it acts" was fixed in `421bda3`.
 
 ### Numbers from replay before 2026-08-21 are biased, not merely noisy
 

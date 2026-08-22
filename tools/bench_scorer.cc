@@ -292,7 +292,12 @@ int main(int argc, char** argv) {
   // inside the loop. Production chunks its prefill across kNBatch-sized batches
   // and guards the total against the derived per-sequence budget
   // (llama_n_ctx_seq, NOT kNCtx -- see llm_scorer.cc's kNCtx comment); this
-  // tool submits the context in one batch, so kNBatch binds first.
+  // tool submits the context in one batch, so BOTH bounds apply and the min
+  // below is what enforces them. With these constants it is the per-sequence
+  // budget that binds, not kNBatch: n_ctx_seq is pad_to_256(4096/9) = 512, so
+  // the limit is 512 - 64 = 448 against kNBatch's 512. Change kNCtx, kNSeqMax
+  // or kCandidateHeadroom and the other term can take over -- which is why the
+  // guard is a min and not a single comparison.
   {
     const std::vector<llama_token> probe = Tokenize(vocab, context, /*add_special=*/true);
     const int n_ctx_seq = (int)llama_n_ctx_seq(ctx);
