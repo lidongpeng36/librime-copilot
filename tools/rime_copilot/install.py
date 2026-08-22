@@ -235,9 +235,12 @@ class Requirement:
 RUNTIME_REQUIREMENTS = (
     Requirement("pypinyin", "pypinyin",
                 "`build` and `update` on any dictionary without a pinyin column "
-                "(e.g. tencent.dict.yaml)"),
+                "(e.g. tencent.dict.yaml), and `personal`/`update` for any "
+                "corpus-mined word (it has no pinyin column either)"),
     Requirement("jieba", "jieba",
-                "`clean` (telling a real word from a Sogou sentence fragment)"),
+                "`clean` (telling a real word from a Sogou sentence fragment), "
+                "and `personal`/`update` for the same oracle (personal.py's "
+                "load_lexicon)"),
     Requirement("requests", "requests", "`fetch` (downloading .scel cell dictionaries)"),
     Requirement("bs4", "beautifulsoup4", "`fetch` (finding the .scel download links)"),
 )

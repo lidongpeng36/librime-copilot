@@ -63,7 +63,7 @@ class ReadEntries(unittest.TestCase):
 
     def test_two_columns_numeric_second_is_a_weight(self):
         # word+weight (tencent.dict.yaml's shape) has no pinyin column, so
-        # this exercises _auto_pinyin -> pypinyin. Stub the real package
+        # this exercises auto_pinyin -> pypinyin. Stub the real package
         # (per test_missing_pypinyin_raises_an_actionable_error below) so
         # this test does not require pypinyin to actually be installed --
         # the suite must pass on a stock interpreter, not just one CI
@@ -164,7 +164,7 @@ class ReadEntries(unittest.TestCase):
         self.assertEqual([Entry("建议", "jian yi", 500)], entries)
 
         # tencent.dict.yaml-shaped input (word, weight) has no pinyin column,
-        # so it must hit _auto_pinyin and fail actionably rather than with
+        # so it must hit auto_pinyin and fail actionably rather than with
         # the raw ModuleNotFoundError traceback.
         with self.assertRaises(ImportError) as caught:
             read_entries(self.write("建议\t500\n"))

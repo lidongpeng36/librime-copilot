@@ -26,6 +26,7 @@ CONFIG_NAME = "dict.json"
 SHRINK_FLOOR = 0.9
 CLEAN_DIR_NAME = "clean_out"
 CUSTOM_DICT_NAME = "custom.dict.yaml"
+PERSONAL_DICT_NAME = "personal.dict.yaml"
 RAW_SUFFIX = ".raw"
 CLEAN_STAMP_NAME = ".copilot_clean_stamp.json"
 
@@ -558,6 +559,60 @@ def _print_grammar_status(rime_dir: Path) -> None:
         print("          `rime-copilot fetch-grammar` downloads it")
 
 
+# `\S+` stops at the first space, so a trailing `# comment` (every real entry
+# in private.dict.yaml carries one) is not swallowed into the table name.
+# Same shape rime_corpus.lattice.import_tables uses on this exact file.
+_IMPORT_LIST_ITEM = re.compile(r"^\s+-\s+(\S+)")
+
+
+def _import_tables(dict_path: Path) -> "list[str]":
+    """The `import_tables:` list of a Rime .dict.yaml, or [] if it has none.
+
+    A deliberately narrow parser -- an `import_tables:` key followed by
+    `  - name` items, terminated by the first line that is neither. No YAML
+    dependency: this package's promise of importing on a stock interpreter
+    would break for a six-line list.
+    """
+    if not dict_path.is_file():
+        return []
+    tables: "list[str]" = []
+    collecting = False
+    for raw in dict_path.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not collecting:
+            if stripped.startswith("import_tables:"):
+                collecting = True
+            continue
+        if stripped.startswith("#") or not stripped:
+            continue
+        item = _IMPORT_LIST_ITEM.match(raw)
+        if not item:
+            break
+        tables.append(item.group(1))
+    return tables
+
+
+def _report_missing_import_tables(rime_dir: Path) -> None:
+    """Any import table `private.dict.yaml` names that is not on disk.
+
+    Not cosmetic: dict_compiler.cc:54 returns false on the first missing path,
+    so this state is not a degraded dictionary but no dictionary at all -- the
+    input method stops converting. It is reachable by ordinary means (a
+    `restore` that brought private.dict.yaml before the CLI that generates
+    private/personal.dict.yaml), so status must name it.
+    """
+    dict_path = rime_dir / "private.dict.yaml"
+    missing = [name for name in _import_tables(dict_path)
+               if not (rime_dir / f"{name}.dict.yaml").is_file()]
+    if not missing:
+        return
+    for name in missing:
+        print(f"import table: {name} is named by {dict_path.name} but "
+              f"{name}.dict.yaml is not on disk -- the dictionary build will fail")
+    if any(name.endswith("personal") for name in missing):
+        print("  fix: rime-copilot personal")
+
+
 def cmd_status(args) -> int:
     rime_dir = args.rime_dir
     print(f"rime dir: {rime_dir}")
@@ -593,6 +648,8 @@ def cmd_status(args) -> int:
                       f"hand before backup or restore --force")
     except (FileNotFoundError, LookupError) as exc:
         print(f"vault:    unavailable ({exc})")
+
+    _report_missing_import_tables(rime_dir)
 
     config = _private(rime_dir) / CONFIG_NAME
     output = _private(rime_dir) / PREDICT_DB_NAME
@@ -1144,6 +1201,67 @@ def _write_clean_stamp(rime_dir, raw, source, part, surviving, thresholds) -> No
     path.write_text(json.dumps(stamp, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def cmd_personal(args) -> int:
+    """Regenerate the derived personal dictionary.
+
+    Reads custom.dict.yaml and the harvested corpus; writes
+    private/personal.dict.yaml, which private.dict.yaml imports. Does NOT feed
+    the prediction database -- dict.json already reads custom.dict.yaml as a
+    `top` source with `boost: "log"`, and listing a file derived from it would
+    stack that offset twice.
+    """
+    from . import personal as personal_dict
+    from .clean import CHART_NAME
+
+    rime_dir = args.rime_dir
+    custom = _private(rime_dir) / CUSTOM_DICT_NAME
+    output = _private(rime_dir) / PERSONAL_DICT_NAME
+    corpus = personal_dict.corpus_dir(args.corpus_dir)
+    chart = rime_dir / CHART_NAME
+
+    if not custom.is_file() and not corpus.is_dir():
+        print(f"nothing to build from: no {custom} and no corpus at {corpus}")
+        return 1
+
+    if not corpus.is_dir() and output.is_file():
+        # Regenerating from custom.dict.yaml alone is strictly worse than a
+        # corpus-mined file already on disk -- it forgets every corpus-mined
+        # word -- and this command cannot tell "no corpus, ever" from "the
+        # corpus that produced this file just isn't HERE"
+        # (~/.local/share/rime-corpus is not synced; see vault.py's
+        # VAULTED_FILES comment on private/personal.dict.yaml). The safe read
+        # is to leave the good file alone rather than silently downgrade it --
+        # this is the ordinary state of a machine that only ever consumes the
+        # vault, not a failure.
+        print(f"leaving {output} alone: no corpus at {corpus}, and rebuilding "
+              f"from {custom.name} alone would replace it with a dictionary "
+              f"missing every corpus-mined word")
+        print("          expected on a machine that only consumes the vault -- "
+              "`restore` already brought the good copy down")
+        print("          to regenerate it here for real, harvest a corpus "
+              "first: rime-corpus ingest")
+        return 0
+
+    if args.dry_run:
+        print(f"would write {output} from {custom} and {corpus}")
+        return 0
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    version = personal_dict.compute_version(custom, corpus)
+    count = personal_dict.generate(custom_path=custom, corpus=corpus,
+                                   chart_path=chart if chart.is_file() else None,
+                                   output=output, version=version)
+    if count == 0:
+        print(f"wrote {output}: 0 entries -- an empty import table; nothing in "
+              f"{custom.name} or the corpus survived to contribute a word")
+    else:
+        print(f"wrote {output}: {count} entries")
+    if not corpus.is_dir():
+        print(f"note: no corpus at {corpus} -- built from {custom.name} alone. "
+              f"Harvest one with: rime-corpus ingest")
+    return 0
+
+
 def _git_commit(source_root: Path) -> "str | None":
     # Best-effort only: install must still work when git is unavailable or
     # source_root is not a git repo (e.g. a tarball checkout).
@@ -1285,6 +1403,13 @@ def cmd_update(args) -> int:
             print(f"fetch failed and no existing {existing} to fall back on")
             return fetch_code
 
+    # Before build/deploy: private.dict.yaml imports private/personal, and a
+    # missing import table fails the whole dictionary build
+    # (dict_compiler.cc:54) rather than degrading quietly.
+    code = cmd_personal(args)
+    if code != 0:
+        return code
+
     for step in (cmd_build, cmd_deploy):
         code = step(args)
         if code != 0:
@@ -1356,6 +1481,16 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--output",
                                  help="where to write the built db (default: <rime-dir>/"
                                       f"private/{PREDICT_DB_NAME})")
+        if name == "update":
+            # update chains cmd_personal (build does not), and without this
+            # the corpus location is only reachable through the environment
+            # -- a test (or a run) that does not name it reads the
+            # developer's real corpus at $RIME_CORPUS_DIR, or the
+            # ~/.local/share/rime-corpus default.
+            command.add_argument(
+                "--corpus-dir",
+                help="harvested corpus (default: $RIME_CORPUS_DIR, else "
+                     "~/.local/share/rime-corpus)")
         command.set_defaults(func=func)
 
     clean_cmd = sub.add_parser("clean",
@@ -1370,6 +1505,15 @@ def build_parser() -> argparse.ArgumentParser:
                            help="regenerate review.tsv even though one already exists "
                                 "(discards any hand-annotated decisions in it)")
     clean_cmd.set_defaults(func=cmd_clean)
+
+    personal_cmd = sub.add_parser(
+        "personal",
+        help="regenerate private/personal.dict.yaml from custom.dict.yaml + the corpus")
+    personal_cmd.add_argument(
+        "--corpus-dir",
+        help="harvested corpus (default: $RIME_CORPUS_DIR, else "
+             "~/.local/share/rime-corpus)")
+    personal_cmd.set_defaults(func=cmd_personal)
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("--squirrel")
@@ -1398,7 +1542,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
                                ("squirrel", None), ("config", None), ("output", None),
                                ("url", None), ("name", None),
                                ("apply", False), ("threshold_high", 100),
-                               ("threshold_low", 3)):
+                               ("threshold_low", 3), ("corpus_dir", None)):
         if not hasattr(args, attribute):
             setattr(args, attribute, default)
     return args.func(args)

@@ -35,7 +35,42 @@ from rime_copilot.freshness import STAMP_NAME
 INSTALLATION = 'installation_id: "TestMac"\nsync_dir: "{sync}"\n'
 
 
+@contextlib.contextmanager
+def stub_personal_lexicon():
+    """Avoid the real, jieba- and pypinyin-backed oracles `personal.generate()`
+    reaches for whenever a caller (`cmd_personal`, hence `cmd_update` too)
+    does not inject its own.
+
+    `generate()` builds a `clean.Lexicon` via `clean.load_lexicon()`
+    unconditionally when not given one -- not only when a mined word actually
+    needs the segmenter -- so ANY test that reaches `cmd_personal` needs jieba
+    unless this is patched, even one whose corpus mines nothing at all. Same
+    fix as `CleanFixture.run_clean` applies to `clean.load_lexicon` for
+    `clean`, below. `dictfile.auto_pinyin` is patched alongside it for the
+    same reason: `generate()` never lets the CLI inject a `reading` function,
+    so any mined word that survives to become an entry is read through the
+    real pypinyin unless this is stubbed too.
+    """
+    from rime_copilot.clean import Lexicon
+
+    def fake_reading(word: str) -> str:
+        return " ".join(f"py{index}" for index, _ in enumerate(word))
+
+    fake_lexicon = Lexicon(known={}, chart=None, segment=lambda word: [word],
+                           tags=lambda word: [])
+    with mock.patch("rime_copilot.clean.load_lexicon", return_value=fake_lexicon), \
+         mock.patch("rime_copilot.dictfile.auto_pinyin", side_effect=fake_reading):
+        yield
+
+
 class CliBase(unittest.TestCase):
+    # A real, tab-separated dictionary row -- not the generic
+    # "content of <rel>" placeholder every other vaulted file gets -- so
+    # dictfile.read_entries (which cmd_personal calls) never has to fall back
+    # to auto_pinyin (pypinyin) just to parse the fixture. See setUp below.
+    CUSTOM_DICT_NAME = "custom.dict.yaml"
+    CUSTOM_DICT_FIXTURE_BODY = "词条\tci tiao\t7\n"
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -49,6 +84,14 @@ class CliBase(unittest.TestCase):
             target = self.rime / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(f"content of {rel}\n", encoding="utf-8")
+        # custom.dict.yaml is not just any vaulted file: cmd_personal parses it
+        # with dictfile.read_entries, and a one-column placeholder line forces
+        # every reader through auto_pinyin (pypinyin) before being dropped for
+        # containing whitespace -- pypinyin then becomes a hard dependency of
+        # every CliBase test, not just the ones that mean to exercise it.
+        # Real tab-separated content sidesteps that entirely.
+        (self.rime / "private" / self.CUSTOM_DICT_NAME).write_text(
+            self.CUSTOM_DICT_FIXTURE_BODY, encoding="utf-8")
         base = self.rime / "cn_dicts" / "base.dict.yaml"
         base.write_text("建议\tjian yi\t500\n", encoding="utf-8")
         (self.rime / "private" / "dict.json").write_text(
@@ -143,7 +186,7 @@ class Backup(CliBase):
         (self.rime / "private/custom.dict.yaml").write_text("stale\n", encoding="utf-8")
         self.run_cli("backup")
         stored = self.sync / "copilot_vault" / "files" / "private/custom.dict.yaml"
-        self.assertEqual("content of private/custom.dict.yaml\n",
+        self.assertEqual(self.CUSTOM_DICT_FIXTURE_BODY,
                          stored.read_text(encoding="utf-8"))
 
     def test_force_backs_up_over_another_machines_copy(self):
@@ -480,7 +523,8 @@ class Update(CliBase):
                         side_effect=RuntimeError("network unreachable")):
             code, out = self.run_cli("update",
                                      "--builder", str(self.fake_builder_that_writes()),
-                                     "--squirrel", str(self.fake_squirrel()))
+                                     "--squirrel", str(self.fake_squirrel()),
+                                     "--corpus-dir", str(self.rime.parent / "corpus"))
         self.assertNotEqual(0, code)
         self.assertFalse((self.rime / "private" / "private.predict.db").exists())
 
@@ -488,10 +532,12 @@ class Update(CliBase):
         (self.rime / "private" / SOGOU_DICT_NAME).write_text(
             "existing\txian you\t1\n", encoding="utf-8")
         with mock.patch("rime_copilot.cli.scel.download_all",
-                        side_effect=RuntimeError("network unreachable")):
+                        side_effect=RuntimeError("network unreachable")), \
+             stub_personal_lexicon():
             code, out = self.run_cli("update",
                                      "--builder", str(self.fake_builder_that_writes()),
-                                     "--squirrel", str(self.fake_squirrel()))
+                                     "--squirrel", str(self.fake_squirrel()),
+                                     "--corpus-dir", str(self.rime.parent / "corpus"))
         # Distinguishes the fix from the pre-fix behaviour: before the fix
         # `update` dies on the RuntimeError regardless of whether a good
         # sogou.dict.yaml is sitting right there, so this assertion is false
@@ -751,8 +797,10 @@ class BuildWithoutConfig(CliBase):
         # actually stops on for a freshly installed machine.
         self.run_cli("backup")
         self.remove_config()
-        with mock.patch("rime_copilot.cli.cmd_fetch", return_value=0):
-            code, out = self.run_cli("update", "--builder", str(self.fake_builder()))
+        with mock.patch("rime_copilot.cli.cmd_fetch", return_value=0), \
+             stub_personal_lexicon():
+            code, out = self.run_cli("update", "--builder", str(self.fake_builder()),
+                                     "--corpus-dir", str(self.rime.parent / "corpus"))
         self.assertEqual(1, code)
         self.assertIn("restore", out)
 
@@ -1637,3 +1685,174 @@ class DisabledSchemasAreNotScanned(unittest.TestCase):
         (self.dir / "default.custom.yaml").write_text(
             "patch:\n  grammar/language: private/zh-hans\n", encoding="utf-8")
         self.assertEqual(cli.grammar_state(self.dir)[0], "missing")
+
+
+class PersonalCommandTest(unittest.TestCase):
+    def test_writes_the_dictionary_into_private(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            (rime_dir / "private" / "custom.dict.yaml").write_text(
+                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+            corpus = rime_dir / "corpus"
+            corpus.mkdir()
+            with stub_personal_lexicon():
+                code = cli.main(["--rime-dir", str(rime_dir), "personal",
+                                 "--corpus-dir", str(corpus)])
+            self.assertEqual(code, 0)
+            written = rime_dir / "private" / "personal.dict.yaml"
+            self.assertTrue(written.is_file())
+            self.assertIn("name: personal", written.read_text(encoding="utf-8"))
+
+    def test_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            (rime_dir / "private" / "custom.dict.yaml").write_text(
+                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+            code = cli.main(["--rime-dir", str(rime_dir), "--dry-run", "personal",
+                             "--corpus-dir", str(rime_dir / "corpus")])
+            self.assertEqual(code, 0)
+            self.assertFalse((rime_dir / "private" / "personal.dict.yaml").exists())
+
+    def test_refuses_when_there_is_neither_a_lexicon_nor_a_corpus(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            code = cli.main(["--rime-dir", str(rime_dir), "personal",
+                             "--corpus-dir", str(rime_dir / "corpus")])
+            self.assertEqual(code, 1)
+
+    def test_creates_private_when_only_the_corpus_exists(self):
+        # A machine can have a corpus but no private/ yet (custom.dict.yaml
+        # absent) -- cmd_personal must create the directory write_dict needs
+        # rather than raise a bare FileNotFoundError.
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            corpus = rime_dir / "corpus"
+            corpus.mkdir()
+            (corpus / "a.jsonl").write_text(
+                json.dumps({"id": "1", "text": "车端联调"}, ensure_ascii=False) + "\n"
+                + json.dumps({"id": "2", "text": "车端联调"}, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+            self.assertFalse((rime_dir / "private").exists())
+            with stub_personal_lexicon():
+                code = cli.main(["--rime-dir", str(rime_dir), "personal",
+                                 "--corpus-dir", str(corpus)])
+            self.assertEqual(code, 0)
+            self.assertTrue((rime_dir / "private" / "personal.dict.yaml").is_file())
+
+    def test_no_corpus_and_an_existing_dictionary_is_left_alone(self):
+        # Finding 2: a machine with no corpus that already holds a
+        # corpus-mined personal.dict.yaml (brought down by `restore`) must
+        # not have `update` silently overwrite it with a strictly worse,
+        # custom-only rebuild.
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            (rime_dir / "private" / "custom.dict.yaml").write_text(
+                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+            output = rime_dir / "private" / "personal.dict.yaml"
+            good_content = "---\nname: personal\n...\n\n辅堂\tfu tang\t123456\n"
+            output.write_text(good_content, encoding="utf-8")
+
+            code, out = self.run_cli(rime_dir, "personal",
+                                     "--corpus-dir", str(rime_dir / "corpus"))
+            self.assertEqual(code, 0)
+            self.assertEqual(good_content, output.read_text(encoding="utf-8"))
+            self.assertIn("leaving", out)
+            self.assertIn(str(output), out)
+
+    def test_no_corpus_and_no_existing_dictionary_still_builds_from_custom(self):
+        # The other half of Finding 2: a genuinely first run (no corpus, no
+        # personal.dict.yaml yet) is not the hazard, and must still work.
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            (rime_dir / "private" / "custom.dict.yaml").write_text(
+                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+            with stub_personal_lexicon():
+                code, out = self.run_cli(rime_dir, "personal",
+                                         "--corpus-dir", str(rime_dir / "corpus"))
+            self.assertEqual(code, 0)
+            self.assertTrue((rime_dir / "private" / "personal.dict.yaml").is_file())
+            self.assertIn("note:", out)
+
+    def test_the_version_is_stable_across_identical_regenerations(self):
+        # Finding 1: a date-derived version churned on the first `update` of
+        # every calendar day even though the vocabulary never changed. The
+        # generated file (including its version line) must be byte-identical
+        # across repeated runs against unchanged inputs.
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            (rime_dir / "private" / "custom.dict.yaml").write_text(
+                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+            output = rime_dir / "private" / "personal.dict.yaml"
+
+            with stub_personal_lexicon():
+                self.run_cli(rime_dir, "personal",
+                            "--corpus-dir", str(rime_dir / "corpus"))
+            first = output.read_bytes()
+            output.unlink()
+            with stub_personal_lexicon():
+                self.run_cli(rime_dir, "personal",
+                            "--corpus-dir", str(rime_dir / "corpus"))
+            second = output.read_bytes()
+            self.assertEqual(first, second)
+
+    def run_cli(self, rime_dir: Path, *args) -> "tuple[int, str]":
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = cli.main(["--rime-dir", str(rime_dir), *args])
+        return code, buffer.getvalue()
+
+
+class StatusImportTableTest(unittest.TestCase):
+    def test_status_names_an_import_table_that_is_not_on_disk(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            (rime_dir / "private.dict.yaml").write_text(
+                "---\nname: private\nimport_tables:\n"
+                "  - private/personal\n...\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                cli.main(["--rime-dir", str(rime_dir), "status"])
+            printed = output.getvalue()
+            self.assertIn("private/personal", printed)
+            self.assertIn("dictionary build will fail", printed)
+
+    def test_status_is_quiet_when_every_import_table_exists(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            (rime_dir / "private" / "personal.dict.yaml").write_text(
+                "---\nname: personal\n...\n", encoding="utf-8")
+            (rime_dir / "private.dict.yaml").write_text(
+                "---\nname: private\nimport_tables:\n"
+                "  - private/personal\n...\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                cli.main(["--rime-dir", str(rime_dir), "status"])
+            self.assertNotIn("dictionary build will fail", output.getvalue())
+
+    def test_import_table_entries_with_trailing_comments_are_parsed_bare(self):
+        # The real private.dict.yaml writes every entry with a trailing
+        # `# comment` (e.g. `- cn_dicts/8105     # 字表`). A parser that
+        # slices off the leading `- ` and keeps the rest (`stripped[2:]`)
+        # returns the comment text along with the name, so every table
+        # compares unequal to the file on disk and status raises a false
+        # alarm on a perfectly healthy machine.
+        with tempfile.TemporaryDirectory() as raw:
+            rime_dir = Path(raw)
+            (rime_dir / "private").mkdir()
+            (rime_dir / "private" / "personal.dict.yaml").write_text(
+                "---\nname: personal\n...\n", encoding="utf-8")
+            (rime_dir / "private.dict.yaml").write_text(
+                "---\nname: private\nimport_tables:\n"
+                "  - private/personal     # 个人词库\n...\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                cli.main(["--rime-dir", str(rime_dir), "status"])
+            self.assertNotIn("dictionary build will fail", output.getvalue())

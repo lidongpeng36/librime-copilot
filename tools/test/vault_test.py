@@ -62,6 +62,14 @@ class VaultedList(unittest.TestCase):
     def test_includes_the_irreplaceable_export(self):
         self.assertIn("private/custom.dict.yaml", V.VAULTED_FILES)
 
+    def test_the_generated_personal_dictionary_is_vaulted(self):
+        # private.dict.yaml is vaulted and names private/personal, and a
+        # missing import table fails the whole dictionary build
+        # (dict_compiler.cc:54) rather than degrading. The pair must travel
+        # together, so this is asserted rather than left incidental.
+        self.assertIn("private/personal.dict.yaml", V.VAULTED_FILES)
+        self.assertIn("private.dict.yaml", V.VAULTED_FILES)
+
 
 class RoundTrip(unittest.TestCase):
     def setUp(self):

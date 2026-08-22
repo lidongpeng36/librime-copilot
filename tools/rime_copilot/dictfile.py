@@ -52,7 +52,7 @@ def read_entries(path: Path, *, keep: Callable[[str], bool] | None = None) -> li
 
     The filter is applied to the word before anything else about the line is
     decided, so a caller that needs part of a dictionary never pays
-    `_auto_pinyin`'s pypinyin call for the rest. On `cn_dicts/tencent` --
+    `auto_pinyin`'s pypinyin call for the rest. On `cn_dicts/tencent` --
     981k entries, no reading column, so every one of them would otherwise be
     read by pypinyin -- that is essentially the entire cost of loading it.
     """
@@ -73,11 +73,11 @@ def read_entries(path: Path, *, keep: Callable[[str], bool] | None = None) -> li
                 # (others). An integer second column is a weight.
                 word, second = parts
                 if second.strip().isdigit():
-                    pinyin, weight = _auto_pinyin(word), second
+                    pinyin, weight = auto_pinyin(word), second
                 else:
                     pinyin, weight = second, str(DEFAULT_WEIGHT)
             elif len(parts) == 1:
-                word, pinyin, weight = parts[0], _auto_pinyin(parts[0]), str(DEFAULT_WEIGHT)
+                word, pinyin, weight = parts[0], auto_pinyin(parts[0]), str(DEFAULT_WEIGHT)
             else:
                 continue
 
@@ -118,7 +118,7 @@ def count_vocabulary_lines(path: Path) -> int:
     return count
 
 
-def _auto_pinyin(word: str) -> str:
+def auto_pinyin(word: str) -> str:
     # lazy: only dictionaries missing a pinyin column pay for this import
     try:
         from pypinyin import lazy_pinyin
