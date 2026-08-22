@@ -150,12 +150,55 @@ package in `tools/rime_copilot/`:
 | `freshness.py` | the content-hash rebuild decision |
 | `install.py` | copying the CLI + `build_copilot` into `<rime_dir>/private/bin` so it runs standalone, and detecting drift in that copy |
 | `clean.py` | pruning the Sogou-exported personal lexicon; the rule chain and the review file |
+| `personal.py` | generating `private/personal.dict.yaml` from the cleaned lexicon plus the harvested corpus |
 | `cli.py` | orchestration |
 
 Subcommands: `status`, `restore`, `backup`, `fetch`, `build`, `deploy`,
-`update`, `install`, `clean`. A new machine builds `build_copilot` from a
-librime checkout, runs `install` once, then `restore` and `update` from the
-installed `private/bin/rime-copilot` — no checkout needed after that.
+`update`, `install`, `clean`, `personal`. A new machine builds `build_copilot`
+from a librime checkout, runs `install` once, then `restore` and `update` from
+the installed `private/bin/rime-copilot` — no checkout needed after that.
+
+**The personal dictionary, and why it is a second file rather than a rewrite
+of `custom.dict.yaml`.** `private.dict.yaml` imports `private/personal`, which
+`rime-copilot personal` generates (and `update` regenerates). It exists because
+personal *frequency* had no way to reach candidate ordering at all:
+`entry_collector.cc` de-duplicates only single-syllable entries and
+`vocabulary.cc:61` sorts a code's homophones by weight descending, so for any
+`(text, code)` a public table also carries, the larger weight wins — and
+`custom.dict.yaml`'s weights are raw commit counts, 3..2877 with a median of 7,
+against a flat 100 shared by 1.47M `ext`/`tencent`/`sogou` entries. 92% of the
+personal lexicon was invisible; the rest ranked below the floor. Measured
+held-out: **+1.45 points of first-candidate accuracy** (`docs/superpowers/specs/
+2026-08-22-lexicon-phase1-results.md`).
+
+`custom.dict.yaml` is not rewritten because it is vaulted, its sha256 is what
+`.copilot_clean_stamp.json` describes, and `dict.json` reads it expecting
+**commit counts**, which `boost: "log"` then compresses. Rewriting its weights
+would silently change the predict db too. For the same reason
+`personal.dict.yaml` is mounted in `private.dict.yaml` **only, never in
+`dict.json`** — the predict db already reads `custom` as a `top` source, and a
+file derived from it would stack that offset twice.
+
+Two properties of the generator are load-bearing:
+
+- **`version:` is a hash of the inputs, not a date.** The file is vaulted and
+  regenerated on every `update`; a date would make it differ from the vault
+  every new day and `status` would print a `conflict` on a file whose
+  vocabulary is byte-identical — forever. In a repo whose discipline is "read
+  every line of `status`", an always-on meaningless line is how that discipline
+  dies.
+- **`personal` refuses to regenerate when the corpus is absent and the file
+  already exists.** The corpus is not vaulted, so a second machine would mine
+  whatever fragment it happens to hold, overwrite the ~8,800-entry file
+  `restore` just brought down with an ~8,200-entry one, lose every
+  corpus-mined word, and report success.
+
+**Known limit of the mined half:** readings come from `pypinyin`, which has no
+context for an out-of-vocabulary word and takes the commonest reading — `联调`
+is annotated `lian tiao`, not `lian diao`. Such an entry is unreachable rather
+than harmful, and the +1.45 was measured with these readings in place, so the
+cost is already priced in. Fixing it needs a heteronym pass, not a bigger
+corpus.
 
 **Drift-detection contract:** `install` records a manifest
 (`private/bin/.installed.json`: source commit, source path, content hash per
@@ -194,9 +237,10 @@ before `restore` and `update`. The same applies to any future `dict.json`
 key: adding one is a silent-divergence hazard across machines until every
 machine has the code that reads it.
 
-**What travels where.** The lexicon, its pristine `.raw`, the clean stamp and
-`dict.json` are vaulted (`vault.py:VAULTED_FILES`) and move by iCloud;
-`private.predict.db` and `sogou.dict.yaml` are derived and rebuilt locally;
+**What travels where.** The lexicon, its pristine `.raw`, the clean stamp,
+`dict.json`, `private.dict.yaml` and `private/personal.dict.yaml` are vaulted
+(`vault.py:VAULTED_FILES`) and move by iCloud; `private.predict.db` and
+`sogou.dict.yaml` are derived and rebuilt locally;
 the CLI moves by git plus `install`; `jieba` and `pypinyin` move by neither —
 `status` names any that are missing, what they break, and the `pip` command.
 `.copilot_clean_stamp.json` is vaulted while `.copilot_build_stamp.json` is
@@ -205,6 +249,15 @@ built database, the clean stamp describes a shared file. Without the clean
 stamp in the vault a second machine reports `lexicon: not cleaned`, and
 acting on that report replaces the pristine export with an already-cleaned
 copy and then pushes it over the genuine one.
+
+**`personal.dict.yaml` is vaulted despite being derived, and it must travel
+with `private.dict.yaml`.** Two files, one valid state. `private.dict.yaml`
+names `private/personal` in `import_tables`, and a missing import table is not
+a degradation: `get_dict_files_from_settings` (`dict_compiler.cc:47-62`)
+returns false on the first path that does not exist, failing the **whole**
+dictionary build — that machine stops converting. Regenerating locally is not
+a fallback either, for the reason above: the corpus is not synced. This is the
+same exception `rime40m-q8.gguf` takes, on a stronger argument.
 
 **Both directions of the vault refuse to clobber, and the clean stamp is
 checked against the file it describes.** `restore` always protected local
@@ -512,7 +565,7 @@ other**, and most changes touch more than one:
 | --- | --- |
 | `tools/` (the CLI) | git, then `install` |
 | `src/` (the plugin) | git, then a **rebuild and a hand-copied dylib** |
-| `*.custom.yaml`, the lexicon, `dict.json`, the model | the vault, via `backup` / `restore` |
+| `*.custom.yaml`, the lexicon, `dict.json`, `private.dict.yaml` + `private/personal.dict.yaml`, the model | the vault, via `backup` / `restore` |
 
 The dylib is the channel with no automation, and it is the one carrying every
 C++ change. `git pull` and `restore` both succeeding says nothing about
@@ -525,9 +578,16 @@ plugins/copilot/tools/rime-copilot install   # BEFORE restore -- see below
 ~/Library/Rime/private/bin/rime-copilot restore
 sudo cp build/lib/rime-plugins/librime-copilot.dylib \
   "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/"
-rime-copilot deploy
+rime-copilot update                          # regenerates private/personal.dict.yaml,
+                                             # then rebuilds and deploys
 rime-copilot status                          # read every line
 ```
+
+`update` rather than a bare `deploy` since `private.dict.yaml` began naming
+`private/personal`: on a machine that restored the pair, `update` is a no-op
+for that file (it refuses to regenerate without a corpus — see above) and
+still rebuilds the predict db. On the machine that *has* the corpus it is what
+keeps the vocabulary current.
 
 `install` before `restore`, for the same reason it comes first on a new
 machine: a restored file can name things an older CLI does not understand.
