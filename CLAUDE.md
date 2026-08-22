@@ -427,6 +427,26 @@ with no vault, or for trying a model before vaulting it.
 then patch the schema (both commands print the exact lines), build the plugin
 from a librime checkout, and copy the dylib into `Squirrel.app`.
 
+### Held-out validation loss does NOT rank scorer checkpoints
+
+Measured over ten trained arms on 2026-08-22, the correlation between held-out
+validation loss and downstream re-ranking hit rate is **r = -0.081**. A perfect
+proxy would be -1.00. The arm with the WORST validation loss placed second on
+hit rate; the arm with the best placed fourth. Full table:
+`docs/superpowers/specs/2026-08-22-scorer-retrain-results.md`.
+
+So a validation loss is worth having -- it says a run converged, and it costs
+nothing -- but **selecting a checkpoint by it is selecting on noise**. The only
+ruler that counts is `rime-corpus export-evalset` into `score_candidates`,
+scored on buckets A and C together, paired against the incumbent on the SAME
+exported file. A hit rate without a false-promotion rate is not a result.
+
+This cost a full sweep's worth of wrong conclusions: "size is worth +0.117
+nats", "6.0B tokens is worth +0.058", "lr 6e-4 beats 3e-4". On the real metric
+lr 3e-4 wins at both sizes, 6.0B tokens is catastrophic at 40.9M (hit 49.8%)
+while helping at 83.9M, and doubling the parameters buys +0.27 points at
+p = 0.669 for 1.8x the p99 latency.
+
 ### The evaluation corpus is the binding constraint, and it has a lever
 
 Every question left open in this area — the `noctx` gate below, the two
