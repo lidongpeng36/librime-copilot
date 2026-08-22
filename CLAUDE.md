@@ -559,6 +559,46 @@ sudo cp build/lib/rime-plugins/librime-copilot.dylib \
 rime-copilot status                               # the check, not a formality
 ```
 
+### And if that machine is also a development machine
+
+Every machine here is. Four more things, none of which travel by git:
+
+```sh
+# 1. the pinned interpreter -- see "tools/requirements.txt is generated" above.
+#    .python-version is gitignored and MACHINE-LOCAL; name the venv what you like.
+pyenv virtualenv system rime-copilot
+~/.pyenv/versions/rime-copilot/bin/pip install -r tools/requirements.txt
+echo rime-copilot > plugins/copilot/.python-version
+
+# 2. the design records, which are gitignored (see "Where the design records live")
+ln -s ~/Library/Mobile\ Documents/com~apple~CloudDocs/config/rime-copilot/superpowers-docs \
+      plugins/copilot/docs/superpowers
+
+# 3. confirm the setup, all four suites
+ctest --test-dir build -R copilot_test --output-on-failure
+python3 -m unittest discover -s plugins/copilot/tools/test -p '*_test.py'
+nvim -l plugins/copilot/clients/neovim/test/endpoint_spec.lua
+nvim -l plugins/copilot/clients/neovim/test/verify_spec.lua
+```
+
+**Fourth: the evaluation corpus does not travel at all.** It lives at
+`~/.local/share/rime-corpus`, it is the author's private messages, and nothing
+syncs it. So a second development machine can build, test and change anything,
+but it **cannot reproduce any measurement in this file** — `rime-corpus kbest`,
+`compare_rerank`, `compare_warmed` and `replay_copilot` all need it, and
+`rime-copilot personal` deliberately refuses to regenerate without it rather
+than mining whatever fragment happens to be local. Do measurement work on the
+machine that has the corpus, or harvest one there first (`rime-corpus ingest`).
+
+**And a hazard that only exists once there is more than one of these.** Two
+machines — or two agent sessions in one checkout — committing to the same
+branch will interleave, and a `git add -A` on either sweeps up the other's
+uncommitted files. That happened on 2026-08-22: a concurrent session's commit
+absorbed 144 lines of an unrelated document under a message about something
+else. `git worktree list` does not reveal it, because the other party is a
+session, not a worktree. Check who else is working in a checkout before
+assuming it is yours alone.
+
 **Run `status` and read every line.** A full review of this on 2026-08-20
 found five gaps on a machine that looked fine, four of which were silent:
 unpushed commits, an installed CLI stale enough to miss the model, a vault
