@@ -740,10 +740,42 @@ other**, and most changes touch more than one:
 | `tools/` (the CLI) | git, then `install` |
 | `src/` (the plugin) | git, then a **rebuild and a hand-copied dylib** |
 | `*.custom.yaml`, the lexicon, `dict.json`, `private.dict.yaml` + `private/personal.dict.yaml`, the model | the vault, via `backup` / `restore` |
+| the **user dictionary** (`private.userdb`) | Rime's own user-data sync, from Squirrel's menu — NOT the vault |
+| the design records (`docs/superpowers/`) | iCloud, plus a symlink made by hand |
+
+The user dictionary is the one people get wrong, because it has its own
+channel and its own precondition: syncing brings the merged history down, but
+a machine still running a dylib from before 2026-08-22 **will not add to it** —
+AutoSpacer's commits never reach `Memory::OnCommit` there. Sync on such a
+machine produces a dictionary that looks populated and then never grows, which
+reads as "already working". Copy the dylib first, confirm learning is live
+(see "AutoSpacer's commits and Rime's user dictionary"), and sync after.
 
 The dylib is the channel with no automation, and it is the one carrying every
 C++ change. `git pull` and `restore` both succeeding says nothing about
 whether the plugin's behaviour changed on that machine.
+
+**One-off, for any checkout made before 2026-08-22: `git pull` will not work.**
+The remote's history was rewritten and the repository deleted and recreated on
+that date (`docs/superpowers/` carried the corpus verbatim into a public repo —
+see "Where the design records live"). An old clone shares no commit with the
+new remote, so `pull` refuses to merge unrelated histories.
+
+Check for local work first, because the recovery discards it:
+
+```sh
+git log --oneline origin/master..HEAD   # anything here is about to be lost
+git fetch origin && git reset --hard origin/master
+```
+
+Then recreate the docs symlink, which is gitignored and so does not travel:
+
+```sh
+ln -s ~/Library/Mobile\ Documents/com~apple~CloudDocs/config/rime-copilot/superpowers-docs \
+      <librime>/plugins/copilot/docs/superpowers
+```
+
+After that, the ordinary recipe:
 
 ```sh
 cd <librime>/plugins/copilot && git pull
