@@ -509,6 +509,21 @@ void Copilot::WarmRerankContext(Context* ctx, const string& extra_committed) {
 }
 
 void Copilot::OnCommit(Context* ctx) {
+  // A `dumb` commit emits no text -- it exists only to notify. AutoSpacer
+  // raises it (NotifyForLearning) after it has already emitted the decorated
+  // text itself and already called on_commit_, which is where this function's
+  // two jobs have just been done. Running them again would write a duplicate
+  // telemetry line per commit, and warm the scorer with GetCommitText(),
+  // which under `dumb` is the empty string -- so the duplicate would also be
+  // the wrong one.
+  //
+  // Keying on the option rather than an in-flight flag owned by AutoSpacer:
+  // `dumb` already means "not going to commit anything" (switcher.cc:24), so
+  // this is the existing contract rather than new cross-object state.
+  if (ctx && ctx->get_option("dumb")) {
+    return;
+  }
+
   // Context::Commit() fires this notifier before Clear() (librime
   // src/rime/context.cc:18-26), so the composition, its menus and every
   // selected_index are still readable here -- the same requirement

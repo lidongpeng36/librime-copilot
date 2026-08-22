@@ -273,6 +273,66 @@ std::string ComputeSpaceCommitText(Context* ctx, const std::string& before,
   return DecorateCommitText(text, before, after, content_is_ascii, enable_right_space);
 }
 
+bool NotifyForLearning(Context* ctx) {
+  // Same guard Context::Commit() itself uses (context.cc:19-20) -- notifying
+  // Memory::OnCommit with nothing composed is pointless work, not a bug, but
+  // there is no reason to pay for it.
+  if (!ctx->IsComposing()) {
+    return false;
+  }
+  // Mark the segment the user just confirmed as confirmed, or Memory will
+  // queue it and never save it.
+  //
+  // ScriptTranslator::ProcessSegmentOnCommit (script_translator.cc:273-287)
+  // pushes each recognized phrase into a MEMBER queue_ and flushes it only
+  // when `!recognized || seg.status >= Segment::kConfirmed`. That status is
+  // assigned in exactly one place in all of librime -- ConcreteEngine::OnSelect
+  // (engine.cc:264) -- reached only through select_notifier_, and AutoSpacer's
+  // commit paths go through neither Context::Select() nor
+  // ConfirmCurrentSelection() (the number-key site assigns seg.selected_index
+  // directly, precisely to avoid Rime's select path). Rime's own Space handling
+  // does confirm, which is why the machine predating the surrounding-text
+  // sources learned normally.
+  //
+  // Left unmarked the phrase is not merely unsaved: it sits in the queue until
+  // some later commit has an unrecognized candidate, and is then written as ONE
+  // entry spanning several unrelated commits -- the cross-word-boundary
+  // fragment class tools/rime_copilot/clean.py exists to prune, generated into
+  // the user dictionary rather than imported into it. Measured before this
+  // line existed: two single-segment Space commits produced two EMPTY LevelDB
+  // WriteBatches and learned nothing, while an earlier multi-commit sentence
+  // was memorised as a single 30-character run.
+  //
+  // Setting the flag rather than calling ConfirmCurrentSelection() is
+  // deliberate: that fires select_notifier_ -> ConcreteEngine::OnSelect, which
+  // also runs seg.Close() and composition().Forward(), and under `_auto_commit`
+  // calls ctx->Commit() -- committing again text the caller has already emitted
+  // itself. The flag is the whole of what Memory reads, and it is true: Space
+  // IS the user confirming this segment.
+  if (!ctx->composition().empty()) {
+    Segment& last = ctx->composition().back();
+    if (last.status < Segment::kConfirmed) {
+      last.status = Segment::kConfirmed;
+    }
+  }
+  // Restored by scope exit, not by a trailing statement: the notifier reaches
+  // Memory::Memorize and through it LevelDB, and if anything there throws, a
+  // `dumb` left set makes Context::GetCommitText() return "" for the life of
+  // the context -- the input method would stop committing text, silently and
+  // with no symptom pointing here.
+  struct DumbRestorer {
+    Context* ctx;
+    bool previous;
+    ~DumbRestorer() { ctx->set_option("dumb", previous); }
+  } restorer{ctx, ctx->get_option("dumb")};
+  ctx->set_option("dumb", true);
+  // Deliberately NOT ctx->Commit(): see the declaration comment in
+  // auto_spacer.h for why this stops short of the Clear() that Commit() would
+  // perform, and leaves it to the caller.
+  ctx->commit_notifier()(ctx);
+  return true;
+}
+
 // Path 1: Process with real surrounding context (completely independent)
 ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyEvent& key_event,
                                                         const SurroundingText& surrounding,
@@ -385,6 +445,11 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     // is a bail-out -- the user committed raw ASCII input, discarding
     // whatever candidate the composition still shows as highlighted.
     if (on_commit_) on_commit_(ctx, decorated_text, false);
+    // No NotifyForLearning here, deliberately. `false` above means the user
+    // discarded every candidate and committed raw ASCII; the composition
+    // still shows a highlighted one, and Memory::ProcessSegmentOnCommit
+    // memorises exactly that (memory.cc:111-126). Learning here would train
+    // the user dictionary on the answers its owner turned down.
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -402,14 +467,29 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     }
     auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
     engine_->CommitText(decorated_text);
-    if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
-    // Same bypass as Enter above -- Space is the dominant commit key in this
-    // configuration, so this is the one that matters most. `true`: this
-    // commits the actual selected candidate(s) (ComputeSpaceCommitText), not
-    // a bail-out -- when there is no selected candidate at all it falls back
-    // to raw input, but BuildCommitEvents already skips a segment with no
-    // GetSelectedCandidate(), so that case cannot be misreported either way.
+    // `true`: this commits the actual selected candidate(s)
+    // (ComputeSpaceCommitText), not a bail-out -- when there is no selected
+    // candidate at all it falls back to raw input, but BuildCommitEvents
+    // already skips a segment with no GetSelectedCandidate(), so that case
+    // cannot be misreported either way.
+    //
+    // Before NotifyForLearning: this callback's telemetry reads
+    // GetSelectedCandidate() off the live composition (see the CommitCallback
+    // contract in auto_spacer.h), and NotifyForLearning does not clear.
     if (on_commit_) on_commit_(ctx, decorated_text, true);
+    // Space is the dominant commit key in this configuration, so this is the
+    // site that matters most for learning. `true` above is exactly the
+    // predicate learning needs: on a bail-out the composition still shows a
+    // highlighted candidate the user rejected, and Memory::OnCommit would
+    // memorise it (memory.cc:111-126). Still before the history push and the
+    // Clear() below: Memory::OnCommit also reads the live composition.
+    NotifyForLearning(ctx);
+    // After NotifyForLearning, before Clear(): NotifyForLearning does not
+    // clear (deliberately -- see its declaration comment), so the decorated
+    // record pushed here is still what Clear()'s update_notifier_ sees at
+    // back() -- not the undecorated per-segment record
+    // ConcreteEngine::OnCommit would otherwise have left there.
+    if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -436,6 +516,11 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     // range or the candidate at that slot did not exist, so whatever the
     // composition still shows highlighted was never committed.
     if (on_commit_) on_commit_(ctx, decorated_text, false);
+    // No NotifyForLearning here, deliberately. `false` above means the user
+    // discarded every candidate and committed raw ASCII; the composition
+    // still shows a highlighted one, and Memory::ProcessSegmentOnCommit
+    // memorises exactly that (memory.cc:111-126). Learning here would train
+    // the user dictionary on the answers its owner turned down.
     ctx->Clear();
     client_state.before.clear();
     client_state.after.clear();
@@ -471,10 +556,19 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   seg.selected_index = idx;
   auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
   engine_->CommitText(decorated_text);
-  if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
   // `true`: the number key just selected `cand` above, so this genuinely
-  // commits the candidate the user picked -- not a bail-out.
+  // commits the candidate the user picked -- not a bail-out. Before
+  // NotifyForLearning for the same reason as the Space site: this callback
+  // reads the live composition, and NotifyForLearning does not clear it.
   if (on_commit_) on_commit_(ctx, decorated_text, true);
+  // Still before the history push and Clear() below: Memory::OnCommit also
+  // reads the live composition.
+  NotifyForLearning(ctx);
+  // After NotifyForLearning, before Clear(): so AutoSpacer's decorated record
+  // is still what's at back() when Clear()'s update_notifier_ fires, not the
+  // undecorated per-segment one ConcreteEngine::OnCommit would otherwise have
+  // left there.
+  if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
   ctx->Clear();
   client_state.before.clear();
   client_state.after.clear();

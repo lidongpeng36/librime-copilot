@@ -35,6 +35,54 @@ bool SelectionLeavesUnconvertedInput(Context* ctx, const an<Candidate>& cand);
 std::string ComputeSpaceCommitText(Context* ctx, const std::string& before,
                                    const std::string& after, bool enable_right_space);
 
+// Fire Context::commit_notifier_ for a commit AutoSpacer has already emitted
+// itself, so Rime's user dictionary learns from it -- WITHOUT clearing the
+// context. The caller clears.
+//
+// AutoSpacer commits with engine_->CommitText() + ctx->Clear() and never
+// ctx->Commit(), so commit_notifier_ never fires -- and that notifier is the
+// only route to Memory::OnCommit, which is the only thing that writes to
+// private.userdb. Measured consequence: 220 bytes and /tick 0 after a week of
+// daily use.
+//
+// The text must not be emitted twice, and `dumb` is how Rime already says
+// "notify, but do not commit anything" -- Switcher sets it for the same
+// reason (switcher.cc:24). Under it Context::GetCommitText() returns "", so
+// ConcreteEngine::OnCommit's sink_(text) appends nothing and
+// Session::HasCommit() stays false (service.cc:56, :42), while
+// Memory::OnCommit reads ctx->composition() and is unaffected.
+//
+// The previous value of `dumb` is restored rather than hard-set to false:
+// this function does not own that flag.
+//
+// This does NOT call ctx->Commit(): that is commit_notifier_(this) followed
+// by Clear() (context.cc:18-26), and Clear() fires update_notifier_
+// SYNCHRONOUSLY (context.cc:106-111) -- before this function, or the caller,
+// has pushed the caller's own decorated record onto commit_history(). A
+// consumer of update_notifier_ that reads commit_history().back() at that
+// instant (Copilot::OnContextUpdate does) would see whatever
+// ConcreteEngine::OnCommit's per-segment push left there instead, and act on
+// the wrong, undecorated text. So this fires commit_notifier_ directly and
+// leaves Clear() to the caller, to run after the caller's own push. See each
+// call site for the exact ordering this requires.
+//
+// PRECONDITION, and the one a new caller is most likely to miss: call this
+// only where the user actually chose the candidate being committed -- where
+// `on_commit_`'s `selection_commit` is true. Memory memorises
+// seg.GetSelectedCandidate(), the still-highlighted one, so on a bail-out
+// (Enter's raw commit, the number-key fallback) this would memorise the
+// candidate the user just rejected. Language::intelligible does not save you:
+// that candidate is usually a perfectly legitimate Han phrase.
+//
+// Marks the last segment kConfirmed before notifying -- see the definition for
+// why the notification is inert without it. Returns whether it notified
+// (false when the context was not composing); both current callers ignore the
+// result, since they clear unconditionally either way.
+//
+// Declared here rather than kept file-local so it can be unit-tested with a
+// hand-built Context, without standing up a full Rime engine.
+bool NotifyForLearning(Context* ctx);
+
 class AutoSpacer : public CopilotPlugin<AutoSpacer> {
  public:
   // `on_commit` fires for every commit AutoSpacer itself performs (Space,
