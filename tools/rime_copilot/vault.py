@@ -61,6 +61,12 @@ VAULTED_FILES = (
     # names the file the schema asked for, rather than silently running an
     # older model that happens to still be there.
     "private/rime40m-q8.gguf",
+    # The 2026-08-22 retrain. Both names are carried on purpose: the schema
+    # patch and the model both travel by vault, but a machine can restore
+    # them in either order, and a schema naming a file the vault does not
+    # hold is a silent fallback to the db path. Drop the old entry only
+    # once every machine reports the new one in `status`.
+    "private/rime40m-v2-q8.gguf",
     "default.custom.yaml",
     "double_pinyin_flypy.custom.yaml",
     "squirrel.custom.yaml",
