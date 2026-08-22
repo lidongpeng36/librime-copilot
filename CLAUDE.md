@@ -110,6 +110,127 @@ so sub-plugins just define a `Process` method and don't touch the `Processor` bo
 
 All three can be turned off via `copilot/disabled_plugins` in the schema config.
 
+### AutoSpacer's commits and Rime's user dictionary
+
+AutoSpacer emits its own commits (`engine_->CommitText()`), so for a long time
+none of them reached `Context::Commit()` — the only thing that fires
+`commit_notifier_`, which is the only route to `Memory::OnCommit`, which is the
+only thing that writes to `private.userdb`. **Rime's user dictionary therefore
+learned nothing on any machine using the surrounding-text path**: measured, 220
+bytes and `/tick 0` after a week of daily use, against 5,226 entries on the
+machine that predates those sources (its `ProcessWithCommitHistory` has no
+Space branch, so Space there falls through to Rime's own path and always
+learned).
+
+`NotifyForLearning` (`auto_spacer.h`) closes it: it sets the `dumb` option —
+which is how Rime already says "notify, but do not commit anything"
+(`switcher.cc:24`) — fires `ctx->commit_notifier()(ctx)` **directly**, and
+restores `dumb`. Under `dumb`, `GetCommitText()` returns `""`, so
+`ConcreteEngine::OnCommit`'s `sink_(text)` appends nothing and
+`Session::HasCommit()` stays false; `Memory::OnCommit` reads
+`ctx->composition()` and is unaffected.
+
+Four things about it are load-bearing, and each is easy to get wrong:
+
+- **It marks the last segment `kConfirmed` before notifying, and firing the
+  notifier is useless without that.** `ScriptTranslator::ProcessSegmentOnCommit`
+  (`script_translator.cc:273-287`) pushes each recognized phrase into a
+  **member** `queue_` and flushes it only when
+  `!recognized || seg.status >= Segment::kConfirmed`; that status is assigned in
+  exactly one place in all of librime — `ConcreteEngine::OnSelect`
+  (`engine.cc:264`), reached only through `select_notifier_` — and these paths
+  go through neither `Context::Select()` nor `ConfirmCurrentSelection()`. Left
+  unmarked the phrase is not merely unsaved: it waits in the queue until some
+  later commit has an unrecognized candidate and is then written as **one entry
+  spanning several unrelated commits**, which is the fragment class `clean.py`
+  exists to prune — generated here rather than imported. Measured live: two
+  single-segment Space commits produced two *empty* LevelDB WriteBatches, and a
+  sentence typed over several commits became one 30-character entry. The flag,
+  not `ConfirmCurrentSelection()` — that also runs `seg.Close()`,
+  `composition().Forward()`, and under `_auto_commit` a second `ctx->Commit()`.
+
+- **It fires at exactly two sites — Space and the number-key select — never on
+  the two bail-outs.** `Memory::ProcessSegmentOnCommit` memorises
+  `seg.GetSelectedCandidate()`, the *still-highlighted* candidate. On Enter's
+  raw commit or the number-key fallback the user discarded every candidate, but
+  the composition still shows one; learning there would memorise exactly what
+  they rejected, and `Language::intelligible` does not save you — that
+  candidate is usually a legitimate Han phrase. `on_commit_`'s existing
+  `selection_commit` bool is precisely this predicate.
+- **It deliberately stops short of `Clear()`.** `Context::Commit()` is the
+  notifier followed by `Clear()`, and `Clear()` fires `update_notifier_`
+  *synchronously* — reaching `Copilot::OnContextUpdate`, which reads
+  `commit_history().back()`. If the caller's decorated record has not been
+  pushed by then, `back()` is the undecorated per-segment record
+  `ConcreteEngine::OnCommit` just pushed, the `type == "raw"` early return is
+  missed, and every Space commit kicks off a spurious prediction cycle on the
+  wrong text. So the order at both sites is: `CommitText` → `on_commit_` →
+  `NotifyForLearning` → `push_back(decorated)` → `ctx->Clear()`.
+- **`Copilot::OnCommit` returns early under `dumb`.** It subscribes to
+  `commit_notifier_` too, and `on_commit_` has already done its two jobs by
+  then; without the guard every commit warms the scorer with an empty
+  `GetCommitText()` and writes a duplicate telemetry line.
+
+One accepted consequence: each such commit now leaves **`2 + N`** records in
+the bounded 20-entry `CommitHistory` — `engine_->CommitText()` pushes one
+(`engine.cc:245`), `ConcreteEngine::OnCommit` pushes one *per segment* with
+adjacent same-type runs joined (`commit_history.cc:32-58`), and AutoSpacer
+pushes its own decorated one last. Every reader in this tree uses only
+`.back()`/`.empty()`/`latest_text()` (`copilot.cc:409,413`, `filters.cc:58,61`,
+`auto_spacer.cc:160,572`) and none iterates, so it is inert — it only shortens
+the window's effective depth, and by more than "two" would suggest.
+
+**How to tell whether it is working, and how not to.** Byte counts are not the
+criterion: before this fix the same two commits produced *writes* (two empty
+WriteBatches) and a 30-character concatenation that read like success. Decode
+the WAL and count entries. One commit should produce one entry with its own
+`c=` count and its own `t=` tick:
+
+```
+/tick 32799   ce shi  <TAB> 测试   c=74 d=2.53609 t=32799
+/tick 32800   tian qi <TAB> 天气   c=5  d=1       t=32800
+```
+
+Expect a **one-commit lag**: `Memory::StartSession` opens a transaction that
+`ScriptTranslator::Query`'s `FinishSession` closes on the next translation, so
+commit N lands when commit N+1 is typed.
+
+**The replay harness cannot verify any of this.** `replay_copilot` feeds only
+double-pinyin letters to `process_key` and commits through
+`rime->select_candidate` — Rime's own path — so the AutoSpacer branches above
+never execute under it. Learning already worked there before this change, which
+is why `replay.py`'s docstring records top-1 running 32.8% → 99.2% across two
+consecutive passes and why `restore_pristine_userdb` exists. Verification is
+the GTests in `test/learning_commit_test.cc` plus watching `private.userdb`
+grow in live use — decisive, because it stayed at 0 bytes through a week of
+daily use before.
+
+**Every `replay_copilot` figure in this repository self-trains within its own
+run.** `restore_pristine_userdb` runs before and after each *arm*, not between
+requests, so request N benefits from what requests 1..N−1 just committed —
+measured directly, a "pristine" arm wrote 10,209 Han runs into its own user
+dictionary purely from the eval half it was measuring. `replay.run_warmed_arm`
+is the one deliberate exception to the pristine rule (it warms on one request
+list, then measures another without a reset in between) and it refuses when the
+warm pass wrote nothing, because a warm pass that silently learned nothing
+would report the unwarmed number as though it were warmed.
+
+`rime_corpus/compare_warmed.py` is its driver, and the reason it exists as a
+committed module rather than the ad-hoc script that first produced
+`2026-08-22-lexicon-phase2-results.md` is that this file is largely a list of
+measurements that later turned out to be wrong — an unreproducible one cannot
+be re-examined when the next one contradicts it. Like `compare_rerank.py` it is
+deliberately **not** a `cli.py` subcommand (it needs a second rime-dir the
+other subcommands have no use for), so it runs the same way:
+
+```sh
+python3 -c "from rime_corpus import compare_warmed; raise SystemExit(compare_warmed.main())" \
+    --rime-dir-warm  ~/.local/share/rime-corpus/p2-warm \
+    --rime-dir-cold  ~/.local/share/rime-corpus/p1-both \
+    --eval-corpus-dir /tmp/lexicon-split/eval \
+    --warm-corpus-dir /tmp/lexicon-split/train
+```
+
 ## Tools (`tools/`)
 
 C++ tools, built when `BUILD_TOOLS=ON` (default):
