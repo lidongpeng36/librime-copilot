@@ -152,3 +152,58 @@ class ResidualInitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ValidationCoverageTest(unittest.TestCase):
+    """The held-out windows must be spread over the WHOLE token file.
+
+    `validation_starts` walked k = 0, 1, 2, ... and stopped at `limit`, so with
+    64 windows and a 4,096,000-token period it only ever sampled the first
+    258M tokens -- 5.4% of the real 4.79B corpus. That is a head, just a sparse
+    one, and the corpus is written source by source with LCCC first: decoded,
+    those windows were Weibo chat almost to the last one, so the validation loss
+    measured one register and called it the corpus.
+
+    The striping in `overlaps_validation` was never the problem -- blocks are
+    excluded from training at every k*period across all 4.79B tokens, about 1170
+    of them. Only 64 were ever read, and they were the first 64.
+    """
+
+    CORPUS = 4_792_021_514  # the real token count, so the numbers here are not toy
+
+    def _starts(self, limit=64):
+        return recipe.validation_starts(self.CORPUS, recipe.DEFAULT_BLOCK,
+                                        recipe.DEFAULT_PERIOD, 256, limit)
+
+    def test_windows_span_most_of_the_corpus(self):
+        starts = self._starts()
+        self.assertEqual(len(starts), 64)
+        span = (starts[-1] - starts[0]) / self.CORPUS
+        self.assertGreater(span, 0.9, f"windows cover only {span:.1%} of the corpus")
+
+    def test_every_window_still_lands_in_a_held_out_block(self):
+        """Coverage must not be bought by sampling tokens the trainer saw."""
+        for s in self._starts():
+            self.assertTrue(
+                recipe.overlaps_validation(s, recipe.training_footprint(256),
+                                           recipe.DEFAULT_BLOCK, recipe.DEFAULT_PERIOD),
+                f"window at {s} is not inside a held-out block")
+
+    def test_windows_are_distinct(self):
+        starts = self._starts()
+        self.assertEqual(len(set(starts)), len(starts))
+
+    def test_still_deterministic(self):
+        self.assertEqual(self._starts(), self._starts())
+
+    def test_never_runs_past_the_end(self):
+        for s in self._starts():
+            self.assertLessEqual(s + 256 + 1, self.CORPUS)
+
+    def test_a_short_file_still_yields_what_it_can(self):
+        """A file with room for only one block must not raise or return junk."""
+        starts = recipe.validation_starts(5_000_000, recipe.DEFAULT_BLOCK,
+                                          recipe.DEFAULT_PERIOD, 256, 64)
+        self.assertGreaterEqual(len(starts), 1)
+        for s in starts:
+            self.assertLessEqual(s + 257, 5_000_000)

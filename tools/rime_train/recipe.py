@@ -32,10 +32,21 @@ def overlaps_validation(start: int, length: int, block: int, period: int) -> boo
 
 def validation_starts(n_tokens: int, block: int, period: int, seq: int,
                       limit: int) -> list[int]:
-    """Deterministic window starts inside the held-out blocks.
+    """Deterministic window starts, spread across the WHOLE token file.
 
     Deterministic on purpose: a validation loss that moves because its own
     sample moved cannot rank two recipes, which is the whole reason this exists.
+
+    Spread on purpose too, and this was wrong for the first six training runs.
+    The blocks themselves are striped correctly -- `overlaps_validation` excludes
+    one every `period` tokens across the entire corpus, about 1170 of them at
+    4.79B -- but this walked k = 0, 1, 2, ... and stopped at `limit`, so it only
+    ever read the FIRST 64: the first 258M tokens, 5.4% of the file. That is a
+    head, just a sparse one. The corpus is written source by source with LCCC
+    first, so decoding those windows showed Weibo chat almost to the last one --
+    the validation loss was measuring one register and reporting it as the
+    corpus. Comparisons made under the old behaviour stay internally valid
+    (every arm read the same windows); their absolute values describe the head.
 
     `block` is not decoration. Each window is anchored at a block's start and
     runs `seq + 1` tokens (see training_footprint), so with `seq + 1 > block`
@@ -54,14 +65,17 @@ def validation_starts(n_tokens: int, block: int, period: int, seq: int,
             f"in a held-out block of {block}; it would extend past the block into "
             f"trained tokens"
         )
+    usable = (n_tokens - seq - 1) // period + 1  # blocks whose whole window fits
+    if usable < 1:
+        return []
+    take = min(limit, usable)
+    # Evenly spaced block indices, first and last included whenever take > 1.
+    indices = [0] if take == 1 else [i * (usable - 1) // (take - 1) for i in range(take)]
     starts: list[int] = []
-    k = 0
-    while len(starts) < limit:
+    for k in indices:
         start = k * period
-        if start + seq + 1 > n_tokens:
-            break
-        starts.append(start)
-        k += 1
+        if start + seq + 1 <= n_tokens and start not in starts:
+            starts.append(start)
     return starts
 
 
