@@ -65,21 +65,21 @@ class CorpusReaderTest(unittest.TestCase):
 
 class MineTest(unittest.TestCase):
     def test_counts_words_the_segmenter_produces(self):
-        counts = personal.mine(["车端|联调", "车端|重构"], fake_segment, min_count=1)
-        self.assertEqual(counts, {"车端": 2, "联调": 1, "重构": 1})
+        counts = personal.mine(["词库|联调", "词库|重构"], fake_segment, min_count=1)
+        self.assertEqual(counts, {"词库": 2, "联调": 1, "重构": 1})
 
     def test_min_count_drops_the_singletons(self):
-        counts = personal.mine(["车端|联调", "车端|重构"], fake_segment, min_count=2)
-        self.assertEqual(counts, {"车端": 2})
+        counts = personal.mine(["词库|联调", "词库|重构"], fake_segment, min_count=2)
+        self.assertEqual(counts, {"词库": 2})
 
     def test_rejects_words_shorter_than_min_chars(self):
-        counts = personal.mine(["的|车端", "的|车端"], fake_segment, min_count=1)
-        self.assertEqual(counts, {"车端": 2})
+        counts = personal.mine(["的|词库", "的|词库"], fake_segment, min_count=1)
+        self.assertEqual(counts, {"词库": 2})
 
     def test_rejects_words_longer_than_max_chars(self):
         long_word = "一" * 9
-        counts = personal.mine([f"{long_word}|车端"], fake_segment, min_count=1)
-        self.assertEqual(counts, {"车端": 1})
+        counts = personal.mine([f"{long_word}|词库"], fake_segment, min_count=1)
+        self.assertEqual(counts, {"词库": 1})
 
     def test_rejects_anything_not_entirely_han(self):
         # Latin, digits and punctuation reach the segmenter; only Han runs are
@@ -87,8 +87,8 @@ class MineTest(unittest.TestCase):
         # `你好，` is REJECTED rather than trimmed to `你好`: a piece carrying
         # punctuation is a piece the segmenter got wrong, and trimming it would
         # invent a word nobody wrote.
-        counts = personal.mine(["udeer|车端|3D|你好，|车端"], fake_segment, min_count=1)
-        self.assertEqual(counts, {"车端": 2})
+        counts = personal.mine(["latin|词库|3D|你好，|词库"], fake_segment, min_count=1)
+        self.assertEqual(counts, {"词库": 2})
 
 
 class NormaliseTest(unittest.TestCase):
@@ -154,16 +154,16 @@ def fake_reading(word: str) -> str:
 class BuildEntriesTest(unittest.TestCase):
     def test_a_custom_entry_keeps_its_own_pinyin(self):
         entries = personal.build_entries(
-            [Entry("车端", "che duan", 40)], {}, oracle(), fake_reading)
-        self.assertEqual([(e.word, e.pinyin) for e in entries], [("车端", "che duan")])
+            [Entry("词库", "che duan", 40)], {}, oracle(), fake_reading)
+        self.assertEqual([(e.word, e.pinyin) for e in entries], [("词库", "che duan")])
 
     def test_a_mined_word_gets_a_generated_reading(self):
-        entries = personal.build_entries([], {"辅堂": 35}, oracle(), fake_reading)
-        self.assertEqual([(e.word, e.pinyin) for e in entries], [("辅堂", "py0 py1")])
+        entries = personal.build_entries([], {"笔记": 35}, oracle(), fake_reading)
+        self.assertEqual([(e.word, e.pinyin) for e in entries], [("笔记", "py0 py1")])
 
     def test_a_word_in_both_sources_produces_exactly_one_entry(self):
         entries = personal.build_entries(
-            [Entry("车端", "che duan", 40)], {"车端": 16}, oracle(), fake_reading)
+            [Entry("词库", "che duan", 40)], {"词库": 16}, oracle(), fake_reading)
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].pinyin, "che duan")
 
@@ -247,7 +247,7 @@ class BuildEntriesTest(unittest.TestCase):
 
     def test_a_character_outside_the_chart_is_dropped(self):
         entries = personal.build_entries(
-            [], {"車端": 5}, oracle(chart=set("车端")), fake_reading)
+            [], {"車端": 5}, oracle(chart=set("词库")), fake_reading)
         self.assertEqual(entries, [])
 
     def test_output_is_ordered_by_first_character_then_weight_descending(self):
@@ -276,7 +276,7 @@ class ComputeVersionTest(unittest.TestCase):
     def test_stable_across_repeated_calls_on_unchanged_inputs(self):
         root = Path(tempfile.mkdtemp())
         custom = root / "custom.dict.yaml"
-        custom.write_text("车端\tche duan\t40\n", encoding="utf-8")
+        custom.write_text("词库\tche duan\t40\n", encoding="utf-8")
         corpus = root / "corpus"
         corpus.mkdir()
         (corpus / "a.jsonl").write_text(
@@ -289,16 +289,16 @@ class ComputeVersionTest(unittest.TestCase):
     def test_changes_when_the_custom_dictionary_changes(self):
         root = Path(tempfile.mkdtemp())
         custom = root / "custom.dict.yaml"
-        custom.write_text("车端\tche duan\t40\n", encoding="utf-8")
+        custom.write_text("词库\tche duan\t40\n", encoding="utf-8")
         before = personal.compute_version(custom, root / "no-corpus")
-        custom.write_text("车端\tche duan\t41\n", encoding="utf-8")
+        custom.write_text("词库\tche duan\t41\n", encoding="utf-8")
         after = personal.compute_version(custom, root / "no-corpus")
         self.assertNotEqual(before, after)
 
     def test_changes_when_the_corpus_changes(self):
         root = Path(tempfile.mkdtemp())
         custom = root / "custom.dict.yaml"
-        custom.write_text("车端\tche duan\t40\n", encoding="utf-8")
+        custom.write_text("词库\tche duan\t40\n", encoding="utf-8")
         corpus = root / "corpus"
         corpus.mkdir()
         before = personal.compute_version(custom, corpus)
@@ -320,12 +320,12 @@ class GenerateTest(unittest.TestCase):
     def test_writes_a_dictionary_with_a_header_and_entries(self):
         root = Path(tempfile.mkdtemp())
         custom = root / "custom.dict.yaml"
-        custom.write_text("---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+        custom.write_text("---\nname: custom\n...\n\n词库\tche duan\t40\n", encoding="utf-8")
         corpus = root / "corpus"
         corpus.mkdir()
         (corpus / "a.jsonl").write_text(
-            json.dumps({"id": "1", "text": "车端联调"}, ensure_ascii=False) + "\n"
-            + json.dumps({"id": "2", "text": "车端联调"}, ensure_ascii=False) + "\n",
+            json.dumps({"id": "1", "text": "词库联调"}, ensure_ascii=False) + "\n"
+            + json.dumps({"id": "2", "text": "词库联调"}, ensure_ascii=False) + "\n",
             encoding="utf-8")
         output = root / "personal.dict.yaml"
 
@@ -339,12 +339,12 @@ class GenerateTest(unittest.TestCase):
         self.assertIn("name: personal", text)
         self.assertIn("sort: by_weight", text)
         self.assertIn('version: "2026-08-22"', text)
-        self.assertIn("车端\tche duan\t", text)
+        self.assertIn("词库\tche duan\t", text)
 
     def test_no_corpus_still_produces_the_custom_half(self):
         root = Path(tempfile.mkdtemp())
         custom = root / "custom.dict.yaml"
-        custom.write_text("---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+        custom.write_text("---\nname: custom\n...\n\n词库\tche duan\t40\n", encoding="utf-8")
         output = root / "personal.dict.yaml"
         count = personal.generate(
             custom_path=custom, corpus=root / "absent", chart_path=None,
@@ -358,13 +358,13 @@ class GenerateTest(unittest.TestCase):
         from rime_copilot.dictfile import read_entries
         root = Path(tempfile.mkdtemp())
         custom = root / "custom.dict.yaml"
-        custom.write_text("---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+        custom.write_text("---\nname: custom\n...\n\n词库\tche duan\t40\n", encoding="utf-8")
         output = root / "personal.dict.yaml"
         personal.generate(custom_path=custom, corpus=root / "absent", chart_path=None,
                           output=output, version="2026-08-22",
                           segment=fake_segment_by_char, reading=fake_reading, known={})
         entries = read_entries(output)
-        self.assertEqual([(e.word, e.pinyin) for e in entries], [("车端", "che duan")])
+        self.assertEqual([(e.word, e.pinyin) for e in entries], [("词库", "che duan")])
         self.assertGreater(entries[0].weight, 100)
 
     def test_a_half_injected_oracle_is_refused(self):

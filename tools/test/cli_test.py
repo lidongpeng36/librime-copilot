@@ -1693,7 +1693,7 @@ class PersonalCommandTest(unittest.TestCase):
             rime_dir = Path(raw)
             (rime_dir / "private").mkdir()
             (rime_dir / "private" / "custom.dict.yaml").write_text(
-                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+                "---\nname: custom\n...\n\n词库\tche duan\t40\n", encoding="utf-8")
             corpus = rime_dir / "corpus"
             corpus.mkdir()
             with stub_personal_lexicon():
@@ -1709,7 +1709,7 @@ class PersonalCommandTest(unittest.TestCase):
             rime_dir = Path(raw)
             (rime_dir / "private").mkdir()
             (rime_dir / "private" / "custom.dict.yaml").write_text(
-                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+                "---\nname: custom\n...\n\n词库\tche duan\t40\n", encoding="utf-8")
             code = cli.main(["--rime-dir", str(rime_dir), "--dry-run", "personal",
                              "--corpus-dir", str(rime_dir / "corpus")])
             self.assertEqual(code, 0)
@@ -1732,8 +1732,8 @@ class PersonalCommandTest(unittest.TestCase):
             corpus = rime_dir / "corpus"
             corpus.mkdir()
             (corpus / "a.jsonl").write_text(
-                json.dumps({"id": "1", "text": "车端联调"}, ensure_ascii=False) + "\n"
-                + json.dumps({"id": "2", "text": "车端联调"}, ensure_ascii=False) + "\n",
+                json.dumps({"id": "1", "text": "词库联调"}, ensure_ascii=False) + "\n"
+                + json.dumps({"id": "2", "text": "词库联调"}, ensure_ascii=False) + "\n",
                 encoding="utf-8")
             self.assertFalse((rime_dir / "private").exists())
             with stub_personal_lexicon():
@@ -1751,9 +1751,9 @@ class PersonalCommandTest(unittest.TestCase):
             rime_dir = Path(raw)
             (rime_dir / "private").mkdir()
             (rime_dir / "private" / "custom.dict.yaml").write_text(
-                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+                "---\nname: custom\n...\n\n词库\tche duan\t40\n", encoding="utf-8")
             output = rime_dir / "private" / "personal.dict.yaml"
-            good_content = "---\nname: personal\n...\n\n辅堂\tfu tang\t123456\n"
+            good_content = "---\nname: personal\n...\n\n笔记\tbi ji\t123456\n"
             output.write_text(good_content, encoding="utf-8")
 
             code, out = self.run_cli(rime_dir, "personal",
@@ -1770,7 +1770,7 @@ class PersonalCommandTest(unittest.TestCase):
             rime_dir = Path(raw)
             (rime_dir / "private").mkdir()
             (rime_dir / "private" / "custom.dict.yaml").write_text(
-                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+                "---\nname: custom\n...\n\n词库\tche duan\t40\n", encoding="utf-8")
             with stub_personal_lexicon():
                 code, out = self.run_cli(rime_dir, "personal",
                                          "--corpus-dir", str(rime_dir / "corpus"))
@@ -1787,7 +1787,7 @@ class PersonalCommandTest(unittest.TestCase):
             rime_dir = Path(raw)
             (rime_dir / "private").mkdir()
             (rime_dir / "private" / "custom.dict.yaml").write_text(
-                "---\nname: custom\n...\n\n车端\tche duan\t40\n", encoding="utf-8")
+                "---\nname: custom\n...\n\n词库\tche duan\t40\n", encoding="utf-8")
             output = rime_dir / "private" / "personal.dict.yaml"
 
             with stub_personal_lexicon():

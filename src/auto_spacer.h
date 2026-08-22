@@ -15,7 +15,7 @@ class Context;
 
 // True when `cand` — the candidate the user just picked — converts only a
 // PREFIX of the current input, so Rime would confirm that segment and keep
-// composing the rest (typing 云枢 as "yyuu" and picking 云, which spans "yy").
+// composing the rest (typing 电脑 as "dmnc" and picking 电, which spans "dm").
 //
 // The AutoSpacer must defer to Rime's Selector in that state instead of
 // committing: Composition::GetCommitText() appends the unconverted tail

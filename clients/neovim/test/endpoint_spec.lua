@@ -444,7 +444,7 @@ end
 -- that is not ours to delete.
 
 do
-  check(endpoint.is_tunnel("/tmp/rime-ime-lidongpeng-udeer.sock"),
+  check(endpoint.is_tunnel("/tmp/rime-ime-alice-host1.sock"),
         "a forwarded tunnel socket is recognised")
   check(endpoint.is_tunnel("/tmp/rime-ime-a.sock"), "a one-character id counts")
 

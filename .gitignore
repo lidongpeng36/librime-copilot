@@ -14,3 +14,10 @@ __pycache__
 # back to the ambient interpreter. Declare dependencies in
 # tools/requirements.txt; let each machine name its own environment.
 .python-version
+
+# Design records, plans and measurement results. A symlink to the copy in
+# iCloud (config/rime-copilot/superpowers-docs), kept OUT of this repository
+# on purpose: they quote the corpus verbatim -- real messages, colleagues
+# names, internal project names -- and this remote is public. CLAUDE.md's
+# "Where the design records live" section has the path and the reasoning.
+docs/superpowers

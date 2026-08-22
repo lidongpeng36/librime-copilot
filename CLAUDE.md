@@ -13,6 +13,39 @@ The repo lives at `librime/plugins/copilot` and is compiled *inside* a librime b
 it cannot be built on its own. `CMakeLists.txt` here is included by librime's plugin
 mechanism and exports `plugin_objs`/`plugin_modules` to the parent scope.
 
+### Where the design records live, and why they are not here
+
+Every measurement in this file rests on a design or results document —
+`2026-08-22-lexicon-phase1-results.md`, `2026-08-21-rerank-cost-and-gate-results.md`
+and about thirty others. They are **deliberately not in this repository**, and
+`docs/superpowers/` is gitignored.
+
+Every one of them quotes the evaluation corpus, and that corpus is the
+author's own private messages: real sentences, colleagues' names beside how
+often each appears, internal project names. That is other people's data as
+much as the author's, and this remote is public. Redacting them would have
+gutted the arguments — "the coverage gap is colleagues' names and company
+jargon no public dictionary can hold" is an assertion without its examples —
+so they live on the machine that has the corpus instead.
+
+What that costs, stated plainly: **the figures in this file cannot be
+independently checked from this repository alone.** The tooling that produced
+them is all here (`rime-corpus kbest`, `compare_rerank`, `compare_warmed`,
+`replay_copilot`), so anyone with their own corpus can rerun the same
+measurements; nobody can audit the author's. Treat the numbers as this
+project's own records, not as published results.
+
+They live in iCloud so every machine has them:
+
+```
+~/Library/Mobile Documents/com~apple~CloudDocs/config/rime-copilot/superpowers-docs/
+```
+
+`docs/superpowers` in a checkout is a **symlink** to that directory, and is
+gitignored — one copy, reachable at the path every reference above uses. A
+machine without it set up will find the reference dangling; recreate the
+symlink rather than copying, or the two diverge.
+
 ## Build & lint
 
 Mirror CI (`.github/workflows/ci.yml`) — check out librime and nest this repo under `plugins/copilot`:
@@ -289,8 +322,8 @@ personal *frequency* had no way to reach candidate ordering at all:
 `custom.dict.yaml`'s weights are raw commit counts, 3..2877 with a median of 7,
 against a flat 100 shared by 1.47M `ext`/`tencent`/`sogou` entries. 92% of the
 personal lexicon was invisible; the rest ranked below the floor. Measured
-held-out: **+1.45 points of first-candidate accuracy** (`docs/superpowers/specs/
-2026-08-22-lexicon-phase1-results.md`).
+held-out: **+1.45 points of first-candidate accuracy** (the Phase 1 results
+record, kept locally -- see "Where the design records live").
 
 `custom.dict.yaml` is not rewritten because it is vaulted, its sha256 is what
 `.copilot_clean_stamp.json` describes, and `dict.json` reads it expecting
@@ -487,7 +520,7 @@ that, and a stale database will otherwise be reported as fresh.
 `copilot/rerank/llm` orders the candidate list with a 40.9M-parameter model
 trained for this input method rather than with the db's n-gram, using the real
 text before the caret. Trained from scratch on 4.5B tokens of Chinese
-(`tools/rime_train/`, see `docs/superpowers/specs/2026-08-19-corpus-pipeline-design.md`);
+(`tools/rime_train/`, and the corpus-pipeline design record kept locally);
 42MB at Q8_0, p50 4.7ms / p99 11.0ms per scoring.
 
 Three artifacts have to be present:
@@ -554,7 +587,7 @@ Measured over ten trained arms on 2026-08-22, the correlation between held-out
 validation loss and downstream re-ranking hit rate is **r = -0.081**. A perfect
 proxy would be -1.00. The arm with the WORST validation loss placed second on
 hit rate; the arm with the best placed fourth. Full table:
-`docs/superpowers/specs/2026-08-22-scorer-retrain-results.md`.
+the scorer-retrain results record, kept locally.
 
 So a validation loss is worth having -- it says a run converged, and it costs
 nothing -- but **selecting a checkpoint by it is selecting on noise**. The only
@@ -629,7 +662,7 @@ only because it is the shipped behaviour.
 ### What is NOT built
 
 Whole-sentence decoding (Path A of
-`docs/superpowers/specs/2026-08-20-neural-integration-design.md`) is designed
+the neural-integration design record, kept locally) is designed
 and deliberately not implemented: the user's priority is candidate ordering
 given existing context, not long-sentence correctness.
 
@@ -637,7 +670,7 @@ The Han-context gate (`copilot/rerank/llm/require_han_context`, default true)
 ends any segment whose trailing **Han** run is empty — a db constraint the model
 does not share, since it reads punctuation and Latin. It was re-measured on
 2026-08-21; the full record is
-`docs/superpowers/specs/2026-08-21-rerank-cost-and-gate-results.md`.
+the rerank cost-and-gate results record, kept locally.
 
 **Its safety question is settled: lifting it cannot repeat the 2026-08
 revert.** That revert happened because bucket B+D fell from 43.8% to 13.4% —
@@ -757,7 +790,7 @@ the June-2025 lexicon incident above.
 ### Remote Neovim, and why the client verifies who answers
 The client can run on a machine that is not the one Rime is on, reached through
 `RemoteForward` in the user's `~/.ssh/config`. Two facts drive the design, both
-measured (see `docs/superpowers/specs/2026-08-05-nvim-remote-identity-design.md`
+measured (see the nvim-remote-identity design record, kept locally,
 for the full record and the alternatives that were eliminated):
 
 - **sshd never unlinks a forwarded socket file** — not on `ssh -O exit`, not on
