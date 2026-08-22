@@ -184,6 +184,100 @@ def run_arm(
         restore_pristine_userdb(rime_dir, pristine_dir)
 
 
+# Han characters are what a memorised phrase is made of, and LevelDB stores
+# keys as plain bytes -- so a phrase the user dictionary learned is literally
+# present in these files. Anything shorter than two characters is noise from
+# the surrounding binary. Named distinctly from the module's other _HAN_RUN
+# (used by han_runs()): both are module-level, and a second `_HAN_RUN` here
+# once silently rebound that name, narrowing han_runs() to this pattern for
+# the rest of the module's lifetime -- dropping every single-character run
+# and every extended-CJK-block run from every replay request, with nothing
+# in the suite catching it.
+# Built from corpus.HAN_CLASS for the same reason _HAN_RUN above is: a fourth
+# private definition of "what counts as Chinese" is how the shadowing incident
+# this comment block describes happened in the first place, and that pattern
+# was basic-block-only too. `{2,}` is the one deliberate difference -- a single
+# Han character is too common in surrounding binary to be evidence of learning.
+_USERDB_HAN_RUN = re.compile(f"[{corpus.HAN_CLASS}]{{2,}}")
+
+
+def userdb_fingerprint(rime_dir: Path) -> "set[str]":
+    """Every multi-character Han run found in the user dictionaries' bytes.
+
+    Used to prove a warm pass actually wrote something. A size or mtime check
+    cannot: opening a LevelDB creates a fresh MANIFEST and log even with no
+    writes -- the live userdb carries MANIFEST-000040 from forty openings and
+    still reports /tick 0.
+
+    Blind spot: a warm pass whose learned text is pure Latin, digits, or
+    punctuation leaves no Han run and is indistinguishable from one that
+    learned nothing. Acceptable in a Chinese-input harness, but worth having
+    written down rather than rediscovered.
+    """
+    rime_dir = Path(rime_dir)
+    found: "set[str]" = set()
+    for name in USERDB_NAMES:
+        directory = rime_dir / name
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if not path.is_file():
+                continue
+            text = path.read_bytes().decode("utf-8", errors="ignore")
+            found.update(_USERDB_HAN_RUN.findall(text))
+    return found
+
+
+def run_warmed_arm(
+    warm_requests: Sequence[dict],
+    requests: Sequence[dict],
+    replayer: str,
+    rime_dir: str,
+    pristine_dir: str,
+    window: int | None = None,
+    wait_for_warm: bool = False,
+    plugins: Sequence[str] = (),
+    require_learning: bool = True,
+) -> list[dict]:
+    """restore -> warm -> measure -> restore, for arms where learning is the
+    thing under test.
+
+    `run_arm` resets the user dictionary before every pass, which is what makes
+    ordinary measurements reproducible and also what makes them blind to
+    Rime's user dictionary entirely. This is the deliberate exception: the warm
+    pass trains the dictionary on `warm_requests`, and `requests` is then
+    measured against it without a reset in between.
+
+    The reproducibility `run_arm` was protecting does not come back for free.
+    A warmed result depends on what the warm pass saw, so two arms are
+    comparable only when warmed from the same pristine snapshot over the same
+    warm list -- the caller's job, and the reason `compare_rerank` generates
+    one request list and shares it.
+
+    `require_learning` is the guard that makes this honest. A warm pass that
+    silently wrote nothing would report the UNWARMED number as though it were
+    warmed, and every arm would agree with every other. Pass False only for an
+    arm that is meant to be cold.
+    """
+    restore_pristine_userdb(rime_dir, pristine_dir)
+    try:
+        before = userdb_fingerprint(Path(rime_dir))
+        if warm_requests:
+            run(warm_requests, replayer, rime_dir, window, wait_for_warm, plugins)
+        after = userdb_fingerprint(Path(rime_dir))
+        if require_learning and after <= before:
+            raise RuntimeError(
+                f"the warm pass over {len(warm_requests)} request(s) learned nothing: "
+                f"{rime_dir}'s user dictionary is unchanged. Either the plugin's "
+                f"learning path is not in the dylib this replayer loaded, or the warm "
+                f"list produced no committed candidates. Measuring now would report "
+                f"the UNWARMED result as though it were warmed."
+            )
+        return run(requests, replayer, rime_dir, window, wait_for_warm, plugins)
+    finally:
+        restore_pristine_userdb(rime_dir, pristine_dir)
+
+
 def strip_timings(responses: Iterable[dict]) -> list[dict]:
     """Responses with the per-segment `us` wall-clock fields removed.
 

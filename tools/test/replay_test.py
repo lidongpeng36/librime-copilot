@@ -39,6 +39,18 @@ class HanRunsTest(unittest.TestCase):
             [("", "发到"), ("发到 ⟦EMAIL⟧ ", "这个邮箱")],
         )
 
+    def test_a_single_han_character_is_a_run(self):
+        # Regression guard: a second module-level `_HAN_RUN` once shadowed the
+        # one han_runs uses, narrowing it to `{2,}` and silently dropping every
+        # single-character run from every replay request.
+        self.assertEqual([("", "字")], replay.han_runs("字"))
+
+    def test_extended_cjk_is_a_run(self):
+        # corpus.HAN_CLASS covers Ext-A, compatibility ideographs and Ext-B/C/D.
+        # The shadowing pattern was the basic block only, so this is the other
+        # half of the same regression.
+        self.assertEqual([("", "㐀")], replay.han_runs("㐀"))
+
 
 class BuildRequestsTest(unittest.TestCase):
     @classmethod
@@ -177,6 +189,125 @@ class AssertDeterministicTest(unittest.TestCase):
         # silently called `run` (no restore) instead.
         for call in run_arm.call_args_list:
             self.assertEqual(call.args, (["req"], "replayer", "rime-dir", "pristine", 32, False))
+
+
+class UserdbFingerprintTest(unittest.TestCase):
+    def _userdb(self, root: Path, name: str, payload: bytes) -> None:
+        directory = root / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "000005.ldb").write_bytes(payload)
+
+    def test_finds_a_committed_phrase_in_the_raw_bytes(self):
+        # LevelDB stores keys as plain bytes, so a memorised phrase is
+        # literally present in the file.
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self._userdb(root, "private.userdb", "ran hou\t然后\tc=70".encode("utf-8"))
+            found = replay.userdb_fingerprint(root)
+            self.assertIn("然后", found)
+
+    def test_an_untouched_snapshot_yields_nothing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self._userdb(root, "private.userdb", b"\x00\x11\x07\x01/db_name\x01private")
+            self.assertEqual(set(), replay.userdb_fingerprint(root))
+
+    def test_a_missing_userdb_directory_yields_nothing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self.assertEqual(set(), replay.userdb_fingerprint(Path(raw)))
+
+
+class RunWarmedArmTest(unittest.TestCase):
+    """The warm-then-measure pass, with the harness's own moving parts faked.
+
+    replay.run is patched: the real one shells out to replay_copilot, which
+    needs a deployed Rime directory. What this class checks is the ORDER and
+    the guard, which is where a warmed arm goes wrong.
+    """
+
+    def _pristine(self, root: Path) -> Path:
+        pristine = root / "pristine"
+        (pristine / "private.userdb").mkdir(parents=True)
+        (pristine / "private.userdb" / "000005.ldb").write_bytes(b"empty")
+        (pristine / "melt_eng.userdb").mkdir(parents=True)
+        (pristine / "melt_eng.userdb" / "000005.ldb").write_bytes(b"empty")
+        return pristine
+
+    def test_warm_requests_run_before_the_measured_ones(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            pristine = self._pristine(root)
+            rime_dir = root / "rime"
+            rime_dir.mkdir()
+            seen = []
+
+            def fake_run(requests, *args, **kwargs):
+                seen.append([r["id"] for r in requests])
+                # Simulate learning: the warm pass writes a phrase.
+                (rime_dir / "private.userdb" / "000041.log").write_bytes(
+                    "然后".encode("utf-8"))
+                return [{"id": r["id"]} for r in requests]
+
+            with mock.patch.object(replay, "run", side_effect=fake_run):
+                out = replay.run_warmed_arm(
+                    [{"id": "warm-1"}], [{"id": "eval-1"}],
+                    replayer="x", rime_dir=str(rime_dir), pristine_dir=str(pristine))
+
+            self.assertEqual([["warm-1"], ["eval-1"]], seen)
+            self.assertEqual([{"id": "eval-1"}], out)
+
+    def test_the_userdb_is_restored_before_warming_and_after_measuring(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            pristine = self._pristine(root)
+            rime_dir = root / "rime"
+            rime_dir.mkdir()
+            (rime_dir / "private.userdb").mkdir()
+            (rime_dir / "private.userdb" / "stale.ldb").write_bytes(b"contamination")
+
+            def fake_run(requests, *args, **kwargs):
+                (rime_dir / "private.userdb" / "000041.log").write_bytes(
+                    "然后".encode("utf-8"))
+                return []
+
+            with mock.patch.object(replay, "run", side_effect=fake_run):
+                replay.run_warmed_arm(
+                    [{"id": "w"}], [{"id": "e"}],
+                    replayer="x", rime_dir=str(rime_dir), pristine_dir=str(pristine))
+
+            self.assertFalse((rime_dir / "private.userdb" / "stale.ldb").exists())
+            self.assertFalse((rime_dir / "private.userdb" / "000041.log").exists())
+
+    def test_a_warm_phase_that_learned_nothing_is_refused(self):
+        # The failure this guard exists for: the warm pass runs, writes
+        # nothing, and the arm silently reports the UNWARMED number as though
+        # it were warmed.
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            pristine = self._pristine(root)
+            rime_dir = root / "rime"
+            rime_dir.mkdir()
+
+            with mock.patch.object(replay, "run", side_effect=lambda *a, **k: []):
+                with self.assertRaises(RuntimeError) as caught:
+                    replay.run_warmed_arm(
+                        [{"id": "w"}], [{"id": "e"}],
+                        replayer="x", rime_dir=str(rime_dir), pristine_dir=str(pristine))
+            self.assertIn("learned nothing", str(caught.exception))
+
+    def test_the_guard_can_be_turned_off_for_a_deliberately_cold_arm(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            pristine = self._pristine(root)
+            rime_dir = root / "rime"
+            rime_dir.mkdir()
+
+            with mock.patch.object(replay, "run", side_effect=lambda *a, **k: [{"id": "e"}]):
+                out = replay.run_warmed_arm(
+                    [], [{"id": "e"}],
+                    replayer="x", rime_dir=str(rime_dir), pristine_dir=str(pristine),
+                    require_learning=False)
+            self.assertEqual([{"id": "e"}], out)
 
 
 if __name__ == "__main__":
