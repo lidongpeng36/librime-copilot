@@ -44,10 +44,12 @@ VAULTED_FILES = (
     # import table does not degrade: get_dict_files_from_settings
     # (dict_compiler.cc:47-62) returns false on the first path that does not
     # exist, failing the whole dictionary build. The two files are only valid
-    # as a pair. Regenerating locally is also not a fallback: the corpus it
-    # derives from lives at ~/.local/share/rime-corpus and is NOT synced, so a
-    # second machine would mine whatever fragment it happens to hold and
-    # report success.
+    # as a pair, and that -- not the possibility of regenerating -- is what
+    # earns the exception. The corpus does travel (iCloud, symlinked into
+    # ~/.local/share/rime-corpus), but a machine whose symlinks are not set up
+    # or whose iCloud has not finished downloading has none, and would rebuild
+    # from custom.dict.yaml alone and report success. cmd_personal guards that
+    # case; vaulting the file means restore does not depend on the guard.
     "private/personal.dict.yaml",
     # The neural re-ranking model. A derived artifact, and a large one, so it
     # sits oddly beside the rest of this list -- but deriving it again costs

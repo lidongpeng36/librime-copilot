@@ -342,10 +342,12 @@ Two properties of the generator are load-bearing:
   every line of `status`", an always-on meaningless line is how that discipline
   dies.
 - **`personal` refuses to regenerate when the corpus is absent and the file
-  already exists.** The corpus is not vaulted, so a second machine would mine
-  whatever fragment it happens to hold, overwrite the ~8,800-entry file
-  `restore` just brought down with an ~8,200-entry one, lose every
-  corpus-mined word, and report success.
+  already exists.** The corpus travels by iCloud now, but "travels" is not
+  "is here": a machine whose symlinks are not set up, or whose iCloud has not
+  finished downloading, has none. Without the guard it would build from
+  `custom.dict.yaml` alone, overwrite the ~8,800-entry file `restore` just
+  brought down with an ~8,200-entry one, lose every corpus-mined word, and
+  report success.
 
 **Known limit of the mined half:** readings come from `pypinyin`, which has no
 context for an out-of-vocabulary word and takes the commonest reading — `联调`
@@ -410,8 +412,9 @@ names `private/personal` in `import_tables`, and a missing import table is not
 a degradation: `get_dict_files_from_settings` (`dict_compiler.cc:47-62`)
 returns false on the first path that does not exist, failing the **whole**
 dictionary build — that machine stops converting. Regenerating locally is not
-a fallback either, for the reason above: the corpus is not synced. This is the
-same exception `rime40m-q8.gguf` takes, on a stronger argument.
+a reliable fallback either: it needs the corpus to be present, not merely
+synced. This is the same exception `rime40m-q8.gguf` takes, on a stronger
+argument — the pair, not the regeneration, is what carries it.
 
 **Both directions of the vault refuse to clobber, and the clean stamp is
 checked against the file it describes.** `restore` always protected local
@@ -581,14 +584,34 @@ nvim -l plugins/copilot/clients/neovim/test/endpoint_spec.lua
 nvim -l plugins/copilot/clients/neovim/test/verify_spec.lua
 ```
 
-**Fourth: the evaluation corpus does not travel at all.** It lives at
-`~/.local/share/rime-corpus`, it is the author's private messages, and nothing
-syncs it. So a second development machine can build, test and change anything,
-but it **cannot reproduce any measurement in this file** — `rime-corpus kbest`,
-`compare_rerank`, `compare_warmed` and `replay_copilot` all need it, and
-`rime-copilot personal` deliberately refuses to regenerate without it rather
-than mining whatever fragment happens to be local. Do measurement work on the
-machine that has the corpus, or harvest one there first (`rime-corpus ingest`).
+**Fourth: the corpus travels by iCloud, and only the corpus does.**
+
+```sh
+mkdir -p ~/.local/share/rime-corpus
+cd ~/.local/share/rime-corpus
+ln -s ~/Library/Mobile\ Documents/com~apple~CloudDocs/config/rime-copilot/corpus/claude.jsonl .
+ln -s ~/Library/Mobile\ Documents/com~apple~CloudDocs/config/rime-copilot/corpus/dingtalk.jsonl .
+```
+
+The split is deliberate and worth keeping. `~/.local/share/rime-corpus` also
+holds every replay arm ever built — **9.8 GB** of derived rime-dirs, models and
+binaries — while the corpus itself is two files totalling **972 KB**. Only
+those two are irreplaceable, and only those two are synced; the arms are
+rebuilt from `p1-both` or `rime-dir` whenever a measurement needs them.
+`rime-corpus ingest` appends through the symlink, so a harvest on any machine
+reaches all of them.
+
+It is in iCloud rather than in git for the same reason the design records are:
+it is the author's private messages, and the remote is public. `.jsonl` under
+`~/.local/share/` was never in danger of being committed, but keeping the two
+private things in one place, under one decision, is what stops the next one
+from being got wrong.
+
+Without those symlinks a machine can still build, test and change anything,
+but **cannot reproduce any measurement in this file** — `rime-corpus kbest`,
+`compare_rerank`, `compare_warmed` and `replay_copilot` all need the corpus,
+and `rime-copilot personal` deliberately refuses to regenerate without it
+rather than mining whatever fragment happens to be local.
 
 **And a hazard that only exists once there is more than one of these.** Two
 machines — or two agent sessions in one checkout — committing to the same

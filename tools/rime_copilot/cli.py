@@ -1227,9 +1227,11 @@ def cmd_personal(args) -> int:
         # Regenerating from custom.dict.yaml alone is strictly worse than a
         # corpus-mined file already on disk -- it forgets every corpus-mined
         # word -- and this command cannot tell "no corpus, ever" from "the
-        # corpus that produced this file just isn't HERE"
-        # (~/.local/share/rime-corpus is not synced; see vault.py's
-        # VAULTED_FILES comment on private/personal.dict.yaml). The safe read
+        # corpus that produced this file just isn't HERE" (it travels by
+        # iCloud, symlinked into ~/.local/share/rime-corpus, so "not here"
+        # means the symlinks are absent or iCloud has not finished
+        # downloading; see vault.py's VAULTED_FILES comment on
+        # private/personal.dict.yaml). The safe read
         # is to leave the good file alone rather than silently downgrade it --
         # this is the ordinary state of a machine that only ever consumes the
         # vault, not a failure.
