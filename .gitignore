@@ -21,3 +21,13 @@ __pycache__
 # names, internal project names -- and this remote is public. CLAUDE.md's
 # "Where the design records live" section has the path and the reasoning.
 docs/superpowers
+
+# A cmake configure run from INSIDE the plugin (rather than from the librime
+# root) drops these here. That is never a working build -- the plugin cannot be
+# built on its own, see CLAUDE.md "What this is" -- but the attempt still leaves
+# ~900MB of llama.cpp _deps sitting in the worktree, and this repo has already
+# been bitten once by a concurrent session's `git add -A` sweeping up files it
+# did not own (CLAUDE.md, "a hazard that only exists once there is more than one
+# of these"). Ignore them so the next sweep cannot pick them up.
+/build/
+/.cache/

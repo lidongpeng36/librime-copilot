@@ -291,6 +291,37 @@ C++ tools, built when `BUILD_TOOLS=ON` (default):
   surprising order (`dump_copilot <db> --find 议 -- 建`).
 - `ax_poc.mm` — macOS Accessibility API proof-of-concept (Apple-only).
 
+**`score_candidates` links llama.cpp and nlohmann_json only — no `rime_library`,
+no glog — and that is a linkage invariant, not a build-standalone claim: the
+tool is still configured from inside the librime tree like everything else
+here (this repo "cannot be built on its own" — see "What this is" above).**
+It is the scorer behind the checkpoint-selection ruler named below (`rime-corpus
+export-evalset` into `score_candidates` — see "Held-out validation loss does
+NOT rank scorer checkpoints"); that is a narrower job than the lexicon figures
+(`rime-corpus kbest`) or the replay figures (`replay_copilot`) quoted
+elsewhere in this file, neither of which touches this tool.
+`src/scoring_form.h` (context alignment, `AlignToTrainingForm`) exists as a
+header separate from `src/rerank.h` specifically so this target can reach it
+without pulling in `rerank.h`'s `<rime/candidate.h>`; `src/utf8_index.h`
+(`copilot::UTF8`, `SplitU8`, `CharCount`) was extracted out of
+`src/history.{h,cc}` on the 2026-08-23 surrounding-context branch for the same
+reason, after a real regression. That branch briefly added `../src/history.cc`
+to `score_candidates`'s CMake target to reach `copilot::UTF8` for the new
+alignment code, and that made the target's *link* silently depend on
+`CMAKE_BUILD_TYPE`: `history.cc` calls glog's `DLOG(INFO)`, which expands to a
+real, glog-linking `LOG()` whenever `NDEBUG` is undefined. This file's own
+"Build & lint" command does not reproduce it, and neither does CI — both pass
+`-DCMAKE_BUILD_TYPE=Release`, which defines `NDEBUG`. The failure needs a
+configure with **no** `CMAKE_BUILD_TYPE` at all, which is what a plain
+`cmake -B build` gives and nothing documented here ever passes — precisely why
+it went unnoticed until someone deviated from the documented command. It was
+caught not by running any documented build but by extracting the real compile
+and link commands `cmake --build` had used and re-running them by hand with
+`-UNDEBUG`. Keep `score_candidates` and `bench_scorer` off every `.cc` under
+`../src` that is not itself header-only with no glog dependency; if one needs
+a helper from `src/`, that is a sign the helper belongs in a header-only file
+like `utf8_index.h`, not a reason to link `history.cc`.
+
 `rime-copilot` — the data pipeline that feeds `build_copilot`. One CLI over the
 package in `tools/rime_copilot/`:
 
@@ -534,6 +565,19 @@ Three artifacts have to be present:
 | `private/zh-hans-t-essay-bgw.gram` | `rime-copilot fetch-grammar` (public download) | `rime-copilot status` → `grammar:` |
 | `librime-copilot.dylib` | built from a librime checkout, copied into `Squirrel.app` by hand | — |
 
+`copilot/rerank/llm/context_chars` is a **consumer declaration**, not an
+independent knob: `CopilotRerankFilter` truncates the scoring context with it and
+`Copilot::WarmRerankContext` keys the warm cache with it, and the two must be the
+same value or every warm lands on a string nobody asks about. Both now read the
+same config key and assemble the string through the single
+`BuildScoringContextFor` (`src/rerank.h`); it used to be a hard-coded 32 in
+`copilot.h` against a filter that read config, agreeing only by coincidence. It
+is NOT yet a term in the `prefix_chars` max in `copilot.cc`, so the three
+surrounding sources still fetch at most 8 characters whatever it says. How the
+deployed scorer actually responds to a longer context than that is measured in
+the context-length results record, kept locally — it bears on raising that
+ceiling, which is a later step and not built here.
+
 **`status` is the check, and it exists because none of these fail loudly.**
 A schema naming a `.gram` that is absent decodes as though no grammar were
 configured (`octagram.cc:110` returns a constant); a schema naming a model
@@ -646,6 +690,17 @@ from a librime checkout, and copy the dylib into `Squirrel.app`.
 
 ### Held-out validation loss does NOT rank scorer checkpoints
 
+**Every figure in this section is from the pre-2026-08-23 régime**, the same
+one annotated in "The switches, and why they are switches" below:
+`score_candidates` used to read `ctx` verbatim (unlimited, mean 28.4
+characters) and prepend BOS. It now truncates to `--context-chars` (default
+64) and aligns to the training form, dropping BOS, so a fresh run of this
+ruler is not directly comparable with `hit 49.8%`, `+0.27 points at p =
+0.669`, or any other number below — though the incumbent-pairing method
+itself is unaffected. The confound here is alignment/BOS, not length: the
+same 2×2 factorial that dated this annotation measured 64-vs-unlimited
+context at +0.00, p=1.0 (the context-length results record, kept locally).
+
 Measured over ten trained arms on 2026-08-22, the correlation between held-out
 validation loss and downstream re-ranking hit rate is **r = -0.081**. A perfect
 proxy would be -1.00. The arm with the WORST validation loss placed second on
@@ -688,6 +743,13 @@ whole point: a run that reports success having never applied the window it was
 given is the failure mode this repo keeps meeting in other forms.
 
 ### The switches, and why they are switches
+
+**Every swept figure below is from the pre-2026-08-23 régime** — measured with a
+BOS-prefixed, sentence-EOS-free context, the same way the pre-2026-08-21 replay
+engagement figures are separately annotated as unusable in "Numbers from replay
+before 2026-08-21 are biased, not merely noisy" below. The scoring form changed
+on 2026-08-23 (`AlignToTrainingForm`); the relative order of these results is
+unlikely to invert, the absolute numbers no longer hold.
 
 Each answers a question the corpus cannot settle, so each defaults to today's
 behaviour and is left for real use — or a better instrument — to decide:
@@ -791,6 +853,24 @@ no guess at `end` (both move as a segment is re-recorded; `start` does not).
 **`notrace` is now zero** — every length bucket, both arms, the whole corpus.
 Any future replay number that shows a `notrace` bucket at all is a regression in
 this machinery, not a property of the data.
+
+### The scoring form has two implementations and one truth
+
+`rime_train/normalize.py`'s `scoring_form` is the Python side, checked by
+`rime_train_test.py` against the real training chain (`normalize` +
+`text_sentences`); `src/scoring_form.h`'s `AlignToTrainingForm` is the C++ side,
+checked by `test/scoring_form_test.cc` against a committed golden fixture that
+`rime-train scoring-form` emits. The two functions do not have the same shape —
+one folds a string, the other splits and discards — so they cannot be diffed
+directly, which is why the agreement is pinned in two hops rather than one.
+**The fixture's inputs are hand-written in `tools/rime_train/goldens.py` and must
+stay that way**: generating them from the evaluation corpus would commit the
+author's private messages to a public remote.
+
+Why `src/scoring_form.h` is a header separate from `rerank.h` — so that
+`score_candidates` can reach it without pulling in `rerank.h`'s
+`<rime/candidate.h>` — is explained in full in "Tools (`tools/`)" above,
+alongside the linkage invariant that requires it.
 
 ## Propagating a change to a machine that already has this
 
