@@ -5,22 +5,9 @@
 #include <string_view>
 #include <vector>
 
+#include "utf8_index.h"  // copilot::UTF8, copilot::SplitU8, copilot::CharCount
+
 namespace copilot {
-
-class UTF8 {
- public:
-  explicit UTF8(const std::string& data);
-  size_t size() const;
-  std::string_view operator[](int i) const;
-  std::string_view operator()(int start, int end) const;
-
-  std::string_view left() const;
-  std::string_view right() const;
-
- private:
-  std::string_view data_;
-  std::vector<size_t> pos_;
-};
 
 class History {
  public:

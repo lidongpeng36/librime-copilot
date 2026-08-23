@@ -12,6 +12,7 @@
 
 #include <glog/logging.h>
 
+#include "scoring_form.h"  // BuildScoringContext, TokenizeScoringForm
 #include "warm_cache.h"
 
 // This is a port of tools/score_candidates.cc (read that file first -- in
@@ -26,7 +27,10 @@ namespace {
 
 // Same shape as llama::Backend::Tokenize (src/llm.cc) and the PoC's own
 // Tokenize (tools/score_candidates.cc:44): add_special controls whether BOS
-// is inserted (true for the context, false for a candidate continuing it).
+// is inserted. Every call site here passes false -- BOS never occurs in the
+// training stream (see scoring_form.h), so this is used only to tokenize the
+// pieces TokenizeScoringForm splits the context into around each EOS
+// carrier, and to tokenize a candidate continuing it.
 std::vector<llama_token> Tokenize(const llama_vocab* vocab, const std::string& text,
                                   bool add_special) {
   int n = -llama_tokenize(vocab, text.data(), (int)text.size(), nullptr, 0, add_special, true);
@@ -327,7 +331,15 @@ struct LlmScorer::Impl {
       return;
     }
 
-    std::vector<llama_token> ctx_tokens = Tokenize(vocab_, context, /*add_special=*/true);
+    // add_special = false: BOS never occurs in the training stream (train.py
+    // writes `sentence + EOS` repeated, so token 1 is neither input nor target
+    // and its embedding sits at initialization). The carrier splice is what
+    // turns the aligned string's 0x02 bytes into real EOS tokens --
+    // llama_tokenize's parse_special would byte-fall-back on them. See
+    // src/scoring_form.h.
+    std::vector<llama_token> ctx_tokens = TokenizeScoringForm(
+        context, llama_vocab_eos(vocab_),
+        [this](const std::string& run) { return Tokenize(vocab_, run, /*add_special=*/false); });
     // Guard against n_ctx_seq_ (the real per-sequence budget llama.cpp
     // derived), not kNCtx (the total physical cache size) -- see kNCtx's
     // comment. Getting this wrong lets an over-long context pass here and

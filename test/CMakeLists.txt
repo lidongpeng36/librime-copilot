@@ -17,6 +17,7 @@ set(copilot_test_src
   rerank_llm_test.cc
   rerank_test.cc
   rerank_trace_test.cc
+  scoring_form_test.cc
   spacing_matrix_test.cc
   surrounding_source_test.cc
   telemetry_commit_test.cc
@@ -76,3 +77,9 @@ if(APPLE)
 endif()
 
 add_test(NAME copilot_test COMMAND copilot_test)
+
+# The scoring-form golden fixture is read at run time. Passing the SOURCE path
+# rather than copying the file keeps exactly one copy: a stale copy in the build
+# tree is precisely the drift this fixture exists to prevent.
+target_compile_definitions(copilot_test PRIVATE
+  COPILOT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")

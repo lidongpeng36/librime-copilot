@@ -13,7 +13,8 @@
 #include <vector>
 
 #include "auto_spacer_util.h"  // Utf8SequenceLength, Utf8ToCodepoint
-#include "history.h"           // copilot::UTF8
+#include "history.h"           // copilot::UTF8, copilot::CharCount
+#include "imk_client.h"        // Truncation
 
 namespace rime {
 namespace tmux_detail {
@@ -80,6 +81,9 @@ struct Snapshot {
 struct Context {
   std::string before;
   std::string after;
+  int before_depth = 0;
+  int after_depth = 0;
+  Truncation truncation = Truncation::kUnknown;
 };
 
 // Upper bound on a plausible `pane_width`. Real terminals top out in the low
@@ -595,10 +599,20 @@ inline std::optional<Context> ExtractContext(const Snapshot& snap, int prefix_ch
   const bool after_continues_before = has_left_cell && !IsDeEmphasized(caret_style, left_style);
 
   Context ctx;
+  // Measured BEFORE the tail is taken: whether the config cut anything is a
+  // statement about what the row held, not about what we kept.
+  const int available = ::copilot::CharCount(before);
   ctx.before = NormalizeBlanks(TailChars(before, prefix_chars));
+  ctx.before_depth = ::copilot::CharCount(ctx.before);
+  // tmux never reports kFull in this step: it has no idea where the user's own
+  // text starts, so the only thing that ever ends `before` other than the
+  // budget is the beginning of the row -- a screen limit, not the end of an
+  // input region. Step (c)'s style test is what makes kFull reachable here.
+  ctx.truncation = (available > prefix_chars) ? Truncation::kByConfig : Truncation::kByScreen;
   ctx.after = after_continues_before ? NormalizeBlanks(auto_spacer_detail::GetFirstUtf8Char(
                                            SliceAfterColumn(row, snap.cursor_x)))
                                      : "";
+  ctx.after_depth = ::copilot::CharCount(ctx.after);
   return ctx;
 }
 

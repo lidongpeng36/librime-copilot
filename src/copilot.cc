@@ -103,6 +103,17 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
     config->GetBool("copilot/rerank/enable", &rerank_enable);
     config->GetInt("copilot/rerank/max_context_chars", &rerank_chars);
     rerank_max_context_chars_ = std::clamp(rerank_chars, 1, 64);
+    // The SCORER's own context length -- a different and longer string than the
+    // db's Han-only tail. Read here because WarmRerankContext keys the warm
+    // cache on it while CopilotRerankFilter reads the same key for Apply(); it
+    // was a hard-coded 32 (copilot.h) against a filter that read config, and
+    // the two agreed only because the schema happened to say 32 and the
+    // 8-character source ceiling made every value above 8 indistinguishable.
+    //
+    // Deliberately NOT folded into `prefix_chars` below. That term is what
+    // raises the fetch depth from 8, which is step (c) of the design and a
+    // behaviour change; this is the bug fix, which is a defect at any length.
+    config->GetInt("copilot/rerank/llm/context_chars", &rerank_llm_context_chars_);
     config->GetBool("copilot/rerank/llm/battery_active", &rerank_llm_battery_active_);
     if (rerank_enable) {
       prefix_chars = std::max(prefix_chars, rerank_max_context_chars_);
@@ -496,12 +507,13 @@ void Copilot::WarmRerankContext(Context* ctx, const string& extra_committed) {
   if (!surrounding) {
     return;  // no real surrounding text -- same guard the filter applies
   }
-  // ScoringContext, not TrailingCjkRun: the warm cache is keyed by the exact
-  // string, and CopilotRerankFilter asks it about ScoringContext's result.
-  // Warming a different string does not fail loudly -- every warm succeeds and
-  // every Apply() finds the cache cold, so the feature silently never runs.
+  // BuildScoringContextFor, not TrailingCjkRun: the warm cache is keyed by the
+  // exact string, and CopilotRerankFilter asks it about the same function's
+  // result. Warming a different string does not fail loudly -- every warm
+  // succeeds and every Apply() finds the cache cold, so the feature silently
+  // never runs.
   const string context =
-      ScoringContext(surrounding->before + extra_committed, rerank_llm_context_chars_);
+      BuildScoringContextFor(*surrounding, extra_committed, rerank_llm_context_chars_);
   if (context.empty()) {
     return;
   }

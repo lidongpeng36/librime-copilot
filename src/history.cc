@@ -1,6 +1,5 @@
 #include "history.h"
 
-#include <algorithm>
 #include <cassert>
 #include <string>
 #include <unordered_set>
@@ -74,129 +73,9 @@ bool IsValidSyllable(const std::string& syllable) {
 }
 }  // namespace
 
-namespace {
-
-inline std::vector<size_t> SplitU8(const std::string& input) {
-  std::vector<size_t> result;
-  size_t i = 0;
-  const size_t n = input.size();
-
-  while (i < n) {
-    unsigned char c = static_cast<unsigned char>(input[i]);
-    size_t char_len = 1;
-
-    if ((c & 0x80) == 0x00) {  // 0xxxxxxx, ASCII
-      char_len = 1;
-    } else if ((c & 0xE0) == 0xC0) {  // 110xxxxx, 2 bytes
-      char_len = 2;
-    } else if ((c & 0xF0) == 0xE0) {  // 1110xxxx, 3 bytes
-      char_len = 3;
-    } else if ((c & 0xF8) == 0xF0) {  // 11110xxx, 4 bytes
-      char_len = 4;
-    } else {
-      // 遇到非法 utf8 字节，直接跳过1字节
-      char_len = 1;
-    }
-
-    if (i + char_len <= n) {
-      result.emplace_back(char_len);
-    } else {
-      result.emplace_back(n - i);
-      break;
-    }
-    i += char_len;
-  }
-
-  return result;
-}
-}  // namespace
-
-namespace copilot {
-UTF8::UTF8(const std::string& data) {
-  data_ = data;
-  auto lens = SplitU8(data);  // 每个字符的长度
-  pos_.reserve(lens.size() + 1);
-
-  size_t offset = 0;
-  pos_.push_back(offset);  // 第0个字符起始位置是0
-  for (size_t len : lens) {
-    offset += len;
-    pos_.push_back(offset);  // 第i+1个字符的起始位置
-  }
-}
-
-size_t UTF8::size() const { return pos_.size() - 1; }
-
-std::string_view UTF8::operator[](int i) const {
-  int n = size();
-  if (i < 0) i += n;
-  if (i < 0 || i >= n) return {};
-
-  return std::string_view(data_.data() + pos_[i], pos_[i + 1] - pos_[i]);
-}
-
-std::string_view UTF8::operator()(int start, int end) const {
-  int n = size();
-
-  if (start < 0) start += n;
-  if (end < 0) end += n;
-
-  // Clamp to [0, n - 1]（闭区间索引）
-  start = std::clamp(start, 0, n - 1);
-  end = std::clamp(end, 0, n - 1);
-
-  if (start > end) return {};
-
-  return std::string_view(data_.data() + pos_[start], pos_[end + 1] - pos_[start]);
-}
-// clang-format off
-static const std::vector<std::string_view> chinese_punct = {
-    "，", "。", "！", "？", "；", "：", "（", "）",
-    "【", "】", "《", "》", "、", "——", "……", "“", "”", "‘", "’"
-};
-// clang-format on
-
-std::string_view UTF8::left() const {
-  int n = size();
-  for (int i = 0; i < n; ++i) {
-    std::string_view ch = (*this)[i];
-    // 英文/ASCII 标点（仅单字节）或 中文/全角标点
-    const bool is_punct =
-        (ch.size() == 1 && std::ispunct(static_cast<unsigned char>(ch[0]))) ||
-        std::find(chinese_punct.begin(), chinese_punct.end(), ch) != chinese_punct.end();
-    if (is_punct) {
-      // 标点在首位时前面什么都没有: (0, -1) 会被负索引解释成"整段",
-      // 反而把标点本身也带出来.
-      if (i == 0) return {};
-      return (*this)(0, i - 1);
-    }
-  }
-
-  // 没有遇到标点，返u整段
-  return (*this)(0, -2);
-}
-
-std::string_view UTF8::right() const {
-  int n = size();
-  for (int i = 0; i < n; ++i) {
-    std::string_view ch = (*this)[i];
-    // ASCII 英文标点 或 中文/全角标点
-    const bool is_punct =
-        (ch.size() == 1 && std::ispunct(static_cast<unsigned char>(ch[0]))) ||
-        std::find(chinese_punct.begin(), chinese_punct.end(), ch) != chinese_punct.end();
-    if (is_punct) {
-      // 标点在末位时后面什么都没有: (n, -1) 的 start 会被 clamp 回 n-1,
-      // 于是返回标点自己.
-      if (i + 1 >= n) return {};
-      return (*this)(i + 1, -1);
-    }
-  }
-
-  // 未找到标点，默认从第1位开始
-  return (*this)(1, -1);
-}
-
-}  // namespace copilot
+// SplitU8 and the UTF8 class used to be defined here; they now live in
+// utf8_index.h (included via history.h) so a translation unit that must not
+// link glog can still use them -- see that header's comment.
 
 namespace copilot {
 

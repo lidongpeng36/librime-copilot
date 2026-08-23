@@ -115,6 +115,10 @@ TEST(ImkClientQuery, FallsBackToOneCharWhenLongRangeIsRefused) {
   // R1: a client that refuses the longer range must not cost us the boundary
   // character AutoSpacer needs — retry with a single character instead of
   // reporting "no context at all".
+  //
+  // The document holds 4 characters before the caret and 8 were requested;
+  // the app answered only 1, so this is a kByApp case, not kFull -- the
+  // document did not run out, the app declined to answer the full request.
   @autoreleasepool {
     MockTextClient* c = [MockTextClient new];
     c.text = @"今天天气";
@@ -124,11 +128,58 @@ TEST(ImkClientQuery, FallsBackToOneCharWhenLongRangeIsRefused) {
     auto s = QuerySurroundingFromClient(c, /*prefix_chars=*/8);
     ASSERT_TRUE(s.has_value());
     EXPECT_EQ("气", s->before);
+    EXPECT_EQ(1, s->before_depth);
+    EXPECT_EQ(rime::Truncation::kByApp, s->truncation);
+  }
+}
+
+// The tie: exactly as many characters precede the caret as were requested.
+// The region ended on its own -- nothing was cut -- so this must be kFull,
+// not kByConfig. This is AutoSpacer's own default request shape
+// (prefix_chars=1), so it is also the most common real-world case.
+TEST(ImkClientQuery, TruncationFullOnExactTie) {
+  @autoreleasepool {
+    MockTextClient* c = [MockTextClient new];
+    c.text = @"a中";
+    c.selectedRangeValue = NSMakeRange(1, 0);  // one character precedes
+    c.markedRangeValue = NSMakeRange(NSNotFound, 0);
+    auto s = QuerySurroundingFromClient(c, /*prefix_chars=*/1);
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(1, s->before_depth);
+    EXPECT_EQ(rime::Truncation::kFull, s->truncation);
   }
 }
 
 TEST(ImkClientQuery, NilClientReturnsNullopt) {
   EXPECT_FALSE(QuerySurroundingFromClient(nil, /*prefix_chars=*/1).has_value());
+}
+
+// Asked for more than the document holds: the region genuinely ended.
+TEST(ImkClientQuery, TruncationFullWhenDocumentIsShorterThanRequested) {
+  @autoreleasepool {
+    MockTextClient* c = [MockTextClient new];
+    c.text = @"今天";
+    c.selectedRangeValue = NSMakeRange(2, 0);  // only two characters precede
+    c.markedRangeValue = NSMakeRange(NSNotFound, 0);
+    auto s = QuerySurroundingFromClient(c, /*prefix_chars=*/8);
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(2, s->before_depth);
+    EXPECT_EQ(rime::Truncation::kFull, s->truncation);
+  }
+}
+
+// Asked for 2 of a 4-character document: the budget is what cut it.
+TEST(ImkClientQuery, TruncationByConfigWhenDocumentHasMore) {
+  @autoreleasepool {
+    MockTextClient* c = [MockTextClient new];
+    c.text = @"今天天气";
+    c.selectedRangeValue = NSMakeRange(4, 0);  // caret after 天天, before 气
+    c.markedRangeValue = NSMakeRange(NSNotFound, 0);
+    auto s = QuerySurroundingFromClient(c, /*prefix_chars=*/2);
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(2, s->before_depth);
+    EXPECT_EQ(rime::Truncation::kByConfig, s->truncation);
+  }
 }
 
 TEST(ImkClientComposing, TrueWhenMarkedTextPresent) {

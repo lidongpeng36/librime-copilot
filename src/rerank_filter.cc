@@ -28,8 +28,9 @@ class RerankTranslation : public PrefetchTranslation {
  public:
   RerankTranslation(an<Translation> translation, an<RerankContinuations> continuations,
                     const RerankOptions& options, an<RerankTraceStore> traces, std::string input,
-                    std::string ctx, std::string llm_ctx, std::string src, TraceSpan span,
-                    Scorer* llm_scorer, llm_rerank::SkipReason llm_skip)
+                    std::string ctx, std::string llm_ctx, std::string src, int before_depth,
+                    Truncation truncation, TraceSpan span, Scorer* llm_scorer,
+                    llm_rerank::SkipReason llm_skip)
       : PrefetchTranslation(translation),
         continuations_(std::move(continuations)),
         options_(options),
@@ -38,6 +39,8 @@ class RerankTranslation : public PrefetchTranslation {
         ctx_(std::move(ctx)),
         llm_ctx_(std::move(llm_ctx)),
         src_(std::move(src)),
+        before_depth_(before_depth),
+        truncation_(truncation),
         span_(span),
         llm_scorer_(llm_scorer),
         llm_skip_(llm_skip) {}
@@ -55,9 +58,13 @@ class RerankTranslation : public PrefetchTranslation {
   // different strings for different consumers: ctx_ is the Han-only tail the
   // db is keyed by, and is what the trace records (telemetry_event.h's
   // contract), while llm_ctx_ is the raw text before the caret that the model
-  // was trained to read. See ScoringContext in rerank.h.
+  // was trained to read. See BuildScoringContextFor in rerank.h.
   std::string llm_ctx_;
   std::string src_;
+  // What the surrounding fetch behind ctx_ actually managed, captured in
+  // Apply() alongside src_ -- same reasoning, same lifetime.
+  int before_depth_ = -1;
+  Truncation truncation_ = Truncation::kUnknown;
   // The segment's own extent, captured in Apply(). A translation cannot reach
   // the Segment — it sees candidates — so it is handed in, exactly like input_,
   // ctx_ and src_.
@@ -111,6 +118,8 @@ bool RerankTranslation::Replenish() {
   trace.end = span_.end;
   trace.ctx = ctx_;
   trace.src = src_;
+  trace.before_depth = before_depth_;
+  trace.truncation = truncation_;
   // kNone here means "eligible" (llm_scorer_ non-null): Apply()'s fallback
   // chain already cleared every guard before constructing this translation at
   // all, so llm_skip_ itself is kNone in that case too. When llm_scorer_ is
@@ -318,7 +327,7 @@ bool RerankTranslation::Replenish() {
 // promoted to report.
 void RecordSkipTrace(const an<RerankTraceStore>& traces, const std::optional<TraceSpan>& span,
                      const std::string& input, const std::string& ctx, const std::string& src,
-                     llm_rerank::SkipReason llm_skip) {
+                     int before_depth, Truncation truncation, llm_rerank::SkipReason llm_skip) {
   if (!traces || !span) {
     return;
   }
@@ -329,6 +338,8 @@ void RecordSkipTrace(const an<RerankTraceStore>& traces, const std::optional<Tra
   trace.end = span->end;
   trace.ctx = ctx;
   trace.src = src;
+  trace.before_depth = before_depth;
+  trace.truncation = truncation;
   trace.llm_skip = llm_skip;
   traces->Record(trace);
 }
@@ -454,9 +465,10 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   // keyed by Han sequences and can look up nothing else; the model reads
   // whatever is there. Collapsing them applies the db's gate to the model,
   // which measured over 27245 replay segments blocks 42.9% of them -- see
-  // ScoringContext in rerank.h.
+  // BuildScoringContextFor in rerank.h.
   const std::string context = TrailingCjkRun(before, options_.max_context_chars);
-  const std::string llm_context = ScoringContext(before, options_.llm.context_chars);
+  const std::string llm_context =
+      BuildScoringContextFor(*surrounding, confirmed_prefix, options_.llm.context_chars);
 
   // The LLM fallback chain, checked in the exact order
   // docs/superpowers/specs/2026-08-17-llm-rerank-design.md ("Fallback chain")
@@ -506,8 +518,8 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   if (llm_rerank::BailOnEmptyDbContext(context.empty(), llm_eligible,
                                        options_.llm.require_han_context)) {
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
-                    SurroundingSourceName(surrounding->source),
-                    llm_rerank::SkipForEmptyDbContext(llm_skip));
+                    SurroundingSourceName(surrounding->source), surrounding->before_depth,
+                    surrounding->truncation, llm_rerank::SkipForEmptyDbContext(llm_skip));
     return translation;
   }
   // A missing db only takes the db branch down with it -- the LLM branch above
@@ -521,7 +533,8 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
     // context (or no db loaded at all), and the LLM guard chain above already
     // ruled out the LLM path.
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
-                    SurroundingSourceName(surrounding->source), llm_skip);
+                    SurroundingSourceName(surrounding->source), surrounding->before_depth,
+                    surrounding->truncation, llm_skip);
     return translation;
   }
   DLOG(INFO) << "[copilot] rerank context: '" << context
@@ -534,7 +547,8 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   return New<RerankTranslation>(
       translation, continuations, options_, span ? traces_ : an<RerankTraceStore>(),
       engine_->context()->input(), context, llm_context, SurroundingSourceName(surrounding->source),
-      span.value_or(TraceSpan{}), llm_eligible ? scorer_ : nullptr, llm_skip);
+      surrounding->before_depth, surrounding->truncation, span.value_or(TraceSpan{}),
+      llm_eligible ? scorer_ : nullptr, llm_skip);
 }
 
 CopilotRerankFilterComponent::CopilotRerankFilterComponent(

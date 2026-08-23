@@ -8,6 +8,7 @@
 
 #ifdef __APPLE__
 
+#include "history.h"
 #include "imk_client.h"
 #include "imk_client_internal.h"
 
@@ -165,11 +166,18 @@ std::optional<SurroundingText> QuerySurroundingFromClient(id client, int prefix_
   typedef NSAttributedString* (*AttrSubFn)(id, SEL, NSRange);
   AttrSubFn attrSub = (AttrSubFn)objc_msgSend;
 
+  const int requested = std::max(prefix_chars, 1);
+  // What we asked for, clamped to what the document could possibly hold
+  // before the caret -- captured before the fallback retry below, so the
+  // classifier can tell "the document ended" apart from "the app cut it".
+  // Mirrors tmux_source_util.h's `available`, captured before its tail is
+  // taken (src/tmux_source_util.h:602-611).
+  NSUInteger wanted = 0;
+
   std::string charBefore;
   std::string charAfter;
   if (selRange.location > 0) {
-    const NSUInteger wanted =
-        std::min(static_cast<NSUInteger>(std::max(prefix_chars, 1)), selRange.location);
+    wanted = std::min(static_cast<NSUInteger>(requested), selRange.location);
     NSAttributedString* before =
         attrSub(client, attrSubSel, NSMakeRange(selRange.location - wanted, wanted));
     // Some clients answer a single character but refuse a longer range. Falling
@@ -198,7 +206,43 @@ std::optional<SurroundingText> QuerySurroundingFromClient(id client, int prefix_
       charAfter = [[after string] UTF8String] ?: "";
     }
   }
-  return SurroundingText{charBefore, charAfter, "imk:query"};
+  const int got = ::copilot::CharCount(charBefore);
+
+  SurroundingText out;
+  out.before = charBefore;
+  out.after = charAfter;
+  out.client_key = "imk:query";
+  out.before_depth = got;
+  out.after_depth = ::copilot::CharCount(charAfter);
+  // `wanted` is what we asked for after clamping to the document; `got` is
+  // what came back. Comparing against `wanted` (not `requested`) is what
+  // makes the exact-tie case read as kFull rather than kByConfig: when the
+  // document holds fewer characters than were requested, `wanted` already
+  // equals the document's own length, so "got everything we asked for"
+  // and "the region ended on its own" are the same event.
+  if (got < static_cast<int>(wanted)) {
+    // The app answered less than even the clamped ask -- e.g. it refuses long
+    // ranges and we fell back to one character. The document had more
+    // (`wanted` already accounts for its length); the app declined to give it.
+    //
+    // NOTE selRange.location is in UTF-16 units while `got`/`wanted` are code
+    // points, so on astral text this comparison can fire when the true cause
+    // was kFull or kByConfig, never the reverse -- it only ever reports
+    // "less than requested", which is what happened. It does not change
+    // which of kFull/kByConfig fires below, and does not make either of
+    // those two branches approximate.
+    out.truncation = Truncation::kByApp;
+  } else if (selRange.location <= static_cast<NSUInteger>(requested)) {
+    // The document does not hold `requested` characters before the caret --
+    // including the exact tie, where it holds precisely `requested`: the
+    // region ended on its own, nothing was cut.
+    out.truncation = Truncation::kFull;
+  } else {
+    // The document had more than `requested` and we got all of `wanted`
+    // (which is capped at `requested`): the budget is what cut it.
+    out.truncation = Truncation::kByConfig;
+  }
+  return out;
 }
 
 void SetIMKSurroundingPrefixChars(int n) { s_prefixChars.store(std::clamp(n, 1, 64)); }

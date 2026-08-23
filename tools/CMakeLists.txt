@@ -26,13 +26,25 @@ target_link_libraries(replay_copilot
   ${rime_library}
   ${rime_dict_library})
 
+# Deliberately compiles nothing from ../src and links no rime library, no
+# glog: score_candidates.cc reaches src/scoring_form.h (context alignment and
+# tokenization), which reaches src/utf8_index.h (UTF-8 indexing) -- both are
+# header-only with no matching `.cc`, precisely so this target never needs
+# more than llama.cpp + nlohmann_json. Adding a `.cc` from ../src here (once
+# tried for history.cc's copilot::UTF8, before it was extracted into
+# utf8_index.h) would silently make this target's link depend on
+# CMAKE_BUILD_TYPE: history.cc's DLOG(INFO) calls compile to real,
+# glog-linking LOG() whenever NDEBUG is undefined, which a plain
+# `cmake -B build` (no build type) leaves undefined -- see the 2026-08-23
+# surrounding-context design.
 add_executable(score_candidates
   score_candidates.cc)
 target_link_libraries(score_candidates
   ${LINK_LIBS})
 
-# Same linkage as score_candidates: llama.cpp only, no rime. It measures the
-# batched scoring path by replicating it, not by calling into the plugin.
+# Same linkage as score_candidates: llama.cpp and nlohmann_json only, no rime,
+# no glog. It measures the batched scoring path by replicating it, not by
+# calling into the plugin.
 add_executable(bench_scorer
   bench_scorer.cc)
 target_link_libraries(bench_scorer

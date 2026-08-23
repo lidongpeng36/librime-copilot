@@ -20,7 +20,9 @@
 
 #include "auto_spacer_util.h"  // Utf8ToCodepoint
 #include "history.h"           // copilot::UTF8
+#include "imk_client.h"        // SurroundingText
 #include "provider.h"          // copilot::Entry
+#include "scoring_form.h"      // BuildScoringContext, kEosCarrier
 
 namespace rime {
 
@@ -38,18 +40,45 @@ inline bool IsHanIdeograph(uint32_t cp) {
 
 }  // namespace rerank_detail
 
-// The text the LLM scorer conditions on: the last `max_chars` characters
-// before the caret, whatever they are.
+// The scoring context, assembled from a surrounding fetch plus whatever the
+// caller knows is already committed beyond it, aligned to the training form
+// and truncated to `max_chars` (see scoring_form.h's BuildScoringContext).
+// THE ONLY WAY either caller may build that string.
 //
-// Deliberately NOT TrailingCjkRun. That trims to a Han-only tail because the
-// db is keyed by Han sequences and can look up nothing else -- a constraint of
-// the n-gram, not of the caret. Applying it to the model gates scoring on
-// "does the text before the caret end in Han", which measured over 27245
-// replay segments blocks 42.9% of them outright (`llm_skip=noctx` is 16322 of
-// 27245, 59.9%; see BailOnEmptyDbContext in rerank_llm.h). Earlier versions of
-// this comment quoted 68.2%/8.8% from a replay run whose trace detector
-// saturated at 16 entries -- treat any pre-2026-08-21 engagement figure as
-// unusable, not merely approximate.
+// `copilot.cc`'s warm trigger passes GetCommitText(); `rerank_filter.cc`'s
+// Apply() passes ConfirmedPrefix(). Those are different pieces of text on
+// purpose -- the warm runs one commit ahead of the Apply that will ask about
+// it -- and this one function is what makes the two sites unable to drift
+// STRUCTURALLY: they cannot disagree on assembly or truncation, because both
+// go through the one place that does either. It does NOT make the two calls
+// produce the same string: `copilot.cc`'s composition-start warm (called with
+// an empty `extra`) does key-match the following Apply(), but the commit-time
+// warm keys on align(before8 + GetCommitText()) while the Apply() that follows
+// asks about align(before'8 + ConfirmedPrefix()), where before'8 is the
+// source's own (at most 8-character, see "context_chars is a consumer
+// declaration" below) tail of that SAME text -- strictly shorter than
+// GetCommitText() whenever more than 8 characters were available, so at the
+// fetch ceiling those two strings cannot coincide. This is pre-existing and
+// harmless: the cost is at most one wasted prefill per such commit, not a
+// cold Apply(), and the new `truncation` field (SurroundingText::truncation)
+// now makes it measurable for the first time -- a warm whose fetch was
+// kByConfig/kByScreen is a warm nobody will ask about. See the 2026-08-23
+// design, "The trap that must be fixed in the same change".
+//
+// `extra` is appended to `surrounding.before` BEFORE alignment runs, not
+// after -- the join point between the two pieces gets the same sentence-ender
+// and whitespace treatment as any other character boundary, rather than being
+// exempted from it.
+//
+// This is deliberately NOT TrailingCjkRun. That trims to a Han-only tail
+// because the db is keyed by Han sequences and can look up nothing else -- a
+// constraint of the n-gram, not of the caret. Applying it to the model gates
+// scoring on "does the text before the caret end in Han", which measured over
+// 27245 replay segments blocks 42.9% of them outright (`llm_skip=noctx` is
+// 16322 of 27245, 59.9%; see BailOnEmptyDbContext in rerank_llm.h). Earlier
+// versions of this comment quoted 68.2%/8.8% from a replay run whose trace
+// detector saturated at 16 entries -- treat any pre-2026-08-21 engagement
+// figure as unusable, not merely approximate.
 //
 // The model has no such constraint: its training corpus keeps punctuation,
 // Latin and digits precisely because 0% of real scoring contexts end in a Han
@@ -62,18 +91,9 @@ inline bool IsHanIdeograph(uint32_t cp) {
 // Two of them disagreeing does not fail loudly; it makes every warm land on a
 // context nobody asks about, so every Apply() finds the cache cold and the
 // feature silently never runs.
-inline std::string ScoringContext(const std::string& text, int max_chars) {
-  if (text.empty() || max_chars <= 0) {
-    return {};
-  }
-  ::copilot::UTF8 utf8(text);
-  const int n = static_cast<int>(utf8.size());
-  const int take = std::min(n, max_chars);
-  std::string out;
-  for (int i = n - take; i < n; ++i) {
-    out += std::string(utf8[i]);
-  }
-  return out;
+inline std::string BuildScoringContextFor(const SurroundingText& surrounding,
+                                          const std::string& extra, int max_chars) {
+  return BuildScoringContext(surrounding.before + extra, max_chars);
 }
 
 // Which positions in a candidate window a promotion may consider, by input

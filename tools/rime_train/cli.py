@@ -144,6 +144,20 @@ def cmd_tokenize(args) -> int:
     return 0
 
 
+def cmd_scoring_form(args) -> int:
+    from . import goldens
+
+    if args.out:
+        path = Path(args.out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as sink:
+            n = goldens.emit_scoring_form(sink)
+        print(f"wrote {n} cases to {path}")
+    else:
+        goldens.emit_scoring_form(sys.stdout)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rime-train")
     parser.add_argument("--cache", default=str(DEFAULT_CACHE))
@@ -199,6 +213,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     tokenize.add_argument("--output", required=True)
     tokenize.add_argument("--limit", type=int, default=None)
     tokenize.set_defaults(func=cmd_tokenize)
+
+    scoring_form = sub.add_parser(
+        "scoring-form",
+        help="emit the golden fixture that holds C++ AlignToTrainingForm and "
+             "normalize.scoring_form to one truth",
+    )
+    scoring_form.add_argument(
+        "--out", default=None,
+        help="file to write (default stdout); the committed fixture lives at "
+             "test/data/scoring_form_golden.jsonl")
+    scoring_form.set_defaults(func=cmd_scoring_form)
 
     args = parser.parse_args(argv)
     return args.func(args)

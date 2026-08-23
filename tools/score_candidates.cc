@@ -12,7 +12,7 @@
 // against the model's own logits.
 //
 //   score_candidates --model <gguf> --input <jsonl> --output <jsonl> \
-//                     [--limit N] [--n-ctx N] [--n-gpu-layers N]
+//                     [--limit N] [--n-ctx N] [--n-gpu-layers N] [--context-chars N]
 //
 #include <llama.h>
 
@@ -28,6 +28,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "scoring_form.h"  // BuildScoringContext, TokenizeScoringForm
+
 using json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 
@@ -40,7 +42,11 @@ int64_t NowUs() {
 
 // Same shape as llama::Backend::Tokenize (src/llm.cc): add_special controls
 // whether BOS is inserted, parse_special is always true (no chat template,
-// no special-token markup expected in the corpus text anyway).
+// no special-token markup expected in the corpus text anyway). Every call
+// site here passes false -- BOS never occurs in the training stream (see
+// src/scoring_form.h) -- used to tokenize the pieces TokenizeScoringForm
+// splits the context into around each EOS carrier, and to tokenize a
+// candidate continuing it.
 std::vector<llama_token> Tokenize(const llama_vocab* vocab, const std::string& text,
                                   bool add_special) {
   int n = -llama_tokenize(vocab, text.data(), (int)text.size(), nullptr, 0, add_special, true);
@@ -73,6 +79,7 @@ struct Args {
   int limit = -1;
   int n_ctx = 4096;
   int n_gpu_layers = 99;
+  int context_chars = 64;
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -97,12 +104,16 @@ Args ParseArgs(int argc, char** argv) {
       a.n_ctx = std::stoi(next());
     } else if (arg == "--n-gpu-layers") {
       a.n_gpu_layers = std::stoi(next());
+    } else if (arg == "--context-chars") {
+      a.context_chars = std::stoi(next());
     } else {
       throw std::runtime_error("unknown arg: " + arg);
     }
   }
   if (a.model.empty() || a.input.empty() || a.output.empty()) {
-    throw std::runtime_error("usage: score_candidates --model M --input I --output O [--limit N]");
+    throw std::runtime_error(
+        "usage: score_candidates --model M --input I --output O [--limit N] "
+        "[--n-ctx N] [--n-gpu-layers N] [--context-chars N]");
   }
   return a;
 }
@@ -199,7 +210,11 @@ int main(int argc, char** argv) {
     }
     std::string id = j.at("id").get<std::string>();
     std::string bucket = j.at("bucket").get<std::string>();
-    std::string context = j.at("ctx").get<std::string>();
+    // The C++ side truncates AND aligns; evalset.py deliberately keeps writing
+    // the full raw ctx so the alignment rules have exactly one implementation
+    // and there is no Python copy of them to drift from it.
+    std::string context =
+        rime::BuildScoringContext(j.at("ctx").get<std::string>(), args.context_chars);
     std::vector<std::string> cands = j.at("cands").get<std::vector<std::string>>();
     std::string gold = j.at("gold").get<std::string>();
     int gold_idx = j.at("gold_idx").get<int>();
@@ -209,13 +224,22 @@ int main(int argc, char** argv) {
     llama_memory_seq_rm(mem, kCtxSeq, -1, -1);
     llama_memory_seq_rm(mem, kScratchSeq, -1, -1);
 
-    std::vector<llama_token> ctx_tokens = Tokenize(vocab, context, /*add_special=*/true);
-    // An empty context tokenizes to nothing on a vocab with no BOS (Qwen3 is
-    // one), and then the prefill loop below never runs, llama_decode is never
-    // called, and llama_get_logits_ith(ctx, -1) returns a null pointer that
-    // the very next line reads n_vocab floats from -- a silent SIGSEGV with no
-    // output at all, which is how this was found. Every candidate needs SOME
-    // distribution to score its first token against; BOS is that distribution.
+    // add_special = false: BOS never occurs in the training stream (see
+    // src/scoring_form.h). The carrier splice is what turns the aligned
+    // string's 0x02 bytes into real EOS tokens -- llama_tokenize's
+    // parse_special would byte-fall-back on them otherwise.
+    std::vector<llama_token> ctx_tokens = rime::TokenizeScoringForm(
+        context, llama_vocab_eos(vocab),
+        [vocab](const std::string& run) { return Tokenize(vocab, run, /*add_special=*/false); });
+    // An empty context (raw ctx was empty, or alignment stripped it down to
+    // nothing but whitespace) tokenizes to nothing now that BOS is no longer
+    // spliced in, and then the prefill loop below never runs, llama_decode is
+    // never called, and llama_get_logits_ith(ctx, -1) returns a null pointer
+    // that the very next line reads n_vocab floats from -- a silent SIGSEGV
+    // with no output at all, which is how this was found. Every candidate
+    // needs SOME distribution to score its first token against; BOS is that
+    // distribution -- for this one bail-out only, never as a normal context
+    // token.
     //
     // Not a nicety: whole-sentence scoring sets have empty contexts by
     // construction wherever the text starts a message (measured: 619 of 3287

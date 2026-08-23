@@ -105,10 +105,10 @@ TEST(SerializeJsonl, OmitsTheLlmRecordWhenAbsent) {
   EXPECT_EQ(SerializeJsonl(e).find("\"llm\""), std::string::npos);
 }
 
-TEST(SerializeJsonl, SchemaVersionIsThree) {
+TEST(SerializeJsonl, SchemaVersionIsFour) {
   Event e;
   e.ts = "t";
-  EXPECT_NE(SerializeJsonl(e).find("\"v\":3"), std::string::npos);
+  EXPECT_NE(SerializeJsonl(e).find("\"v\":4"), std::string::npos);
 }
 
 // The per-event stream only records hard cases (ShouldRecord), which is right
@@ -126,7 +126,7 @@ TEST(SerializeStatsJsonl, CarriesCountersAndItsOwnType) {
   EXPECT_NE(line.find("\"type\":\"stats\""), std::string::npos);
   EXPECT_NE(line.find("\"llm_acted\":5310"), std::string::npos);
   EXPECT_NE(line.find("\"cold\":519"), std::string::npos);
-  EXPECT_NE(line.find("\"v\":3"), std::string::npos);
+  EXPECT_NE(line.find("\"v\":4"), std::string::npos);
 }
 
 // No stored `warm_hit`: under the fallback chain kCold and kNone are mutually
@@ -163,7 +163,7 @@ TEST(SerializeJsonl, CarriesTheModelsPickWhenNothingWasPromoted) {
   e.llm = llm;
 
   const auto j = nlohmann::json::parse(SerializeJsonl(e));
-  EXPECT_EQ(j["v"], 3);
+  EXPECT_EQ(j["v"], 4);
   EXPECT_EQ(j["llm"]["best"], "那里");
   EXPECT_EQ(j["llm"]["best_from"], 1);
   EXPECT_EQ(j["llm"]["text"], "");  // nothing was promoted
@@ -256,4 +256,29 @@ TEST(ShouldRecord, KeepsOneSuccessInN) {
 TEST(ShouldRecord, SampleOkOfOneKeepsEverySuccess) {
   EXPECT_TRUE(ShouldRecord(0, false, 0, 1));
   EXPECT_TRUE(ShouldRecord(0, false, 1, 1));
+}
+
+TEST(TelemetryEvent, SerializesFetchDepthAndTruncation) {
+  Event e;
+  e.ts = "2026-08-23T10:00:00+08:00";
+  e.machine = "m";
+  e.schema = "double_pinyin";
+  e.src = "tmux";
+  e.before_depth = 17;
+  e.trunc = "config";
+
+  auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_EQ(j["v"], 4);
+  EXPECT_EQ(j["before_depth"], 17);
+  EXPECT_EQ(j["trunc"], "config");
+}
+
+// An event with no trace behind it must not claim a depth of zero as if it had
+// measured one: "unknown" is a value, 0 is a measurement.
+TEST(TelemetryEvent, OmitsFetchDepthWhenNeverMeasured) {
+  Event e;
+  e.ts = "2026-08-23T10:00:00+08:00";
+  auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_FALSE(j.contains("trunc"));
+  EXPECT_FALSE(j.contains("before_depth"));
 }

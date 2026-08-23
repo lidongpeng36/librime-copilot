@@ -153,9 +153,20 @@ inline bool IsPureAsciiText(const std::string& s) {
   return true;
 }
 
+// Any ASCII whitespace is a spacing boundary, not just U+0020.
+//
+// `before` grows real newlines once a source can walk past the caret's line
+// (step (c) of the 2026-08-23 surrounding-context design). Until then this is
+// unreachable, which is exactly why it is written now: a predicate that answers
+// a new input correctly by falling through to IsAsciiRightPunctCode('\n') is
+// correct by accident, and this tree has been bitten by that shape before.
+inline bool IsAsciiSpaceChar(const std::string& ch) {
+  return ch.size() == 1 && std::isspace(static_cast<unsigned char>(ch[0])) != 0;
+}
+
 inline bool NeedSpaceBefore(const std::string& before, bool content_is_ascii) {
   std::string ch = GetLastUtf8Char(before);
-  if (ch.empty() || IsChinesePunctuationChar(ch) || ch == " ") {
+  if (ch.empty() || IsChinesePunctuationChar(ch) || IsAsciiSpaceChar(ch)) {
     return false;
   }
   int ascii = LastAsciiCharCode(ch);
@@ -167,7 +178,7 @@ inline bool NeedSpaceBefore(const std::string& before, bool content_is_ascii) {
 
 inline bool NeedSpaceAfter(const std::string& after, bool content_is_ascii) {
   std::string ch = GetFirstUtf8Char(after);
-  if (ch.empty() || IsChinesePunctuationChar(ch)) {
+  if (ch.empty() || IsChinesePunctuationChar(ch) || IsAsciiSpaceChar(ch)) {
     return false;
   }
   int ascii = LastAsciiCharCode(ch);

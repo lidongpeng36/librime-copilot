@@ -14,6 +14,8 @@
 #include <rime/schema.h>
 #include <nlohmann/json.hpp>
 
+#include "history.h"
+
 namespace rime {
 
 using json = nlohmann::json;
@@ -584,7 +586,17 @@ std::optional<SurroundingText> ImeBridgeState::GetActiveContext() {
       return std::nullopt;
     }
   }
-  return SurroundingText{it->second.char_before, it->second.char_after, active_client_};
+  SurroundingText out;
+  out.before = it->second.char_before;
+  out.after = it->second.char_after;
+  out.client_key = active_client_;
+  out.before_depth = ::copilot::CharCount(out.before);
+  out.after_depth = ::copilot::CharCount(out.after);
+  // Deliberately not one of the four real values -- see Truncation in
+  // imk_client.h. The client's own cap is invisible from this side of the
+  // socket until the protocol carries it.
+  out.truncation = Truncation::kUnknown;
+  return out;
 }
 
 void ImeBridgeState::CleanupStaleClients() {

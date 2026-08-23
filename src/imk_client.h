@@ -31,6 +31,42 @@ inline const char* SurroundingSourceName(SurroundingSource source) {
   return "none";
 }
 
+// Why `before` stopped where it did. Exactly one answer per fetch.
+//
+// kUnknown is deliberately the zero: a source that forgets to set this reports
+// "I do not know" rather than confidently reporting kFull. It is also the honest
+// answer for the ImeBridge, which receives a string over a socket and has no way
+// to learn whether the client had more -- until step (c) puts `want_before` in
+// the greeting and a `truncation` field in the `context` action.
+//
+// An input region of EXACTLY the requested length is NOT kByConfig: the region
+// ended on its own and nothing was cut. That tie is written down because it is
+// the one case three independently-written sources would each answer
+// differently, and comparability across sources is this field's entire value.
+enum class Truncation {
+  kUnknown = 0,  // the source cannot say
+  kFull,         // the input region ended; nothing was cut
+  kByConfig,     // the source had more and the requested length capped it
+  kByApp,        // the application answered less than was asked (IMK)
+  kByScreen,     // the source cannot see further (tmux)
+};
+
+inline const char* TruncationName(Truncation t) {
+  switch (t) {
+    case Truncation::kFull:
+      return "full";
+    case Truncation::kByConfig:
+      return "config";
+    case Truncation::kByApp:
+      return "app";
+    case Truncation::kByScreen:
+      return "screen";
+    case Truncation::kUnknown:
+      break;
+  }
+  return "unknown";
+}
+
 // Text surrounding the cursor position
 struct SurroundingText {
   // UTF-8 text immediately before the cursor. At least the boundary character
@@ -44,6 +80,15 @@ struct SurroundingText {
   // Which source in the priority chain produced this snapshot. Set by
   // GetSurroundingContext(); AutoSpacer ignores it, the telemetry records it.
   SurroundingSource source = SurroundingSource::kNone;
+  // How many CHARACTERS (code points, not bytes and not UTF-16 units) each side
+  // actually carries, and why `before` stopped. Recorded rather than inferred:
+  // "how much did the source really get" has never been a readable number, and
+  // every remaining question in this area -- should tmux cross hard newlines,
+  // is the Han-context gate worth lifting -- is a question about this
+  // distribution. See the 2026-08-23 surrounding-context design.
+  int before_depth = 0;
+  int after_depth = 0;
+  Truncation truncation = Truncation::kUnknown;
 };
 
 // Get surrounding text from the most recent IMK client interaction.

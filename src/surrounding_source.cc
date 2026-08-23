@@ -27,7 +27,9 @@ std::optional<SurroundingText> GetSurroundingContext() {
     context->source = SurroundingSource::kIMK;
     if (debug) {
       LOG(INFO) << "[Surrounding] Using IMK context: before='" << context->before << "', after='"
-                << context->after << "'";
+                << context->after << "', before_depth=" << context->before_depth
+                << ", after_depth=" << context->after_depth
+                << ", truncation=" << TruncationName(context->truncation);
     }
     return context;
   }
@@ -38,7 +40,9 @@ std::optional<SurroundingText> GetSurroundingContext() {
     context->source = SurroundingSource::kBridge;
     if (debug) {
       LOG(INFO) << "[Surrounding] Using ImeBridge context: before='" << context->before
-                << "', after='" << context->after << "'";
+                << "', after='" << context->after << "', before_depth=" << context->before_depth
+                << ", after_depth=" << context->after_depth
+                << ", truncation=" << TruncationName(context->truncation);
     }
     return context;
   }
@@ -51,7 +55,9 @@ std::optional<SurroundingText> GetSurroundingContext() {
     context->source = SurroundingSource::kTmux;
     if (debug) {
       LOG(INFO) << "[Surrounding] Using tmux context: before='" << context->before << "', after='"
-                << context->after << "'";
+                << context->after << "', before_depth=" << context->before_depth
+                << ", after_depth=" << context->after_depth
+                << ", truncation=" << TruncationName(context->truncation);
     }
     return context;
   }

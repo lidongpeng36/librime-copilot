@@ -403,3 +403,21 @@ TEST(ImeBridgeState, RepushingContextRefreshesTheDeadline) {
   ASSERT_TRUE(ctx.has_value());
   EXPECT_EQ("国", ctx->before);
 }
+
+// The bridge receives a string and cannot know whether the client had more.
+// Reporting any of the four real values would be inventing evidence; kUnknown
+// is the honest answer until step (c) puts `want_before` in the greeting.
+//
+// There is no HandleRegister: HandleContext creates the client's state entry
+// and activates it (ime_bridge.cc:501-510), which is what the file's existing
+// ContextAutoActivatesSender test already pins.
+TEST(ImeBridgeState, ContextDepthIsCountedAndTruncationIsUnknown) {
+  ImeBridgeState s;
+  s.HandleContext("nvim:1", "今天天气", "好");
+
+  auto ctx = s.GetActiveContext();
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ(4, ctx->before_depth);
+  EXPECT_EQ(1, ctx->after_depth);
+  EXPECT_EQ(rime::Truncation::kUnknown, ctx->truncation);
+}

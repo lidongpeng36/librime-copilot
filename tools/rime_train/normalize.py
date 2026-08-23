@@ -33,6 +33,12 @@ _TOKENIZER_GAP = re.compile(r"(?<![A-Za-z0-9])[ \t]+(?![A-Za-z0-9])")
 _SENT_END = re.compile(r"(?<=[。！？!?；;])")
 _HAS_HAN = re.compile(f"[{HAN_CLASS}]")
 
+# What carries an EOS inside a plain string, so the warm cache goes on comparing
+# plain strings and no consumer needs a token type. U+0002 (STX) cannot occur in
+# real text -- normalize() drops every control character before this is inserted.
+EOS_CARRIER = "\x02"
+_SENT_END_CHARS = "。！？!?；;"
+
 
 def normalize(text: str) -> str:
     """Collapsed whitespace and control characters dropped. Nothing else.
@@ -112,3 +118,69 @@ def text_sentences(text: str) -> list[str]:
         if chunk and _HAS_HAN.search(chunk):
             out.append(chunk)
     return out
+
+
+def scoring_form(text: str) -> str:
+    r"""The training stream's shape for ONE continuous string.
+
+    `text_sentences` answers "what sentences does this document contribute to
+    the corpus" -- it splits, strips and DISCARDS. Inference asks a different
+    question of the same pipeline: "what would the stream look like at the point
+    the user's caret is". Same normalization and the same boundaries, but NOT
+    the same EOS placement -- see rule 2 and the divergence noted below --
+    because at inference there is nothing to select: the text before the caret
+    is what the user wrote.
+
+    Three rules, each traceable to the pipeline that produced the deployed
+    model:
+
+      1. normalize() -- control characters out, `\s+` to one space, strip. A
+         newline is `\s`, so it folds to a space exactly as in training. It is
+         emphatically NOT an EOS: that would render the user's line break as the
+         symbol the model learned to read as a full stop.
+      2. an EOS after every sentence ender, mirroring _SENT_END. `train.py`
+         (line 48) appends EOS after every non-empty corpus LINE,
+         unconditionally -- it never inspects the line's last character.
+         Because a corpus line is `text_sentences` output, the two rules
+         coincide at every INTERNAL boundary. They diverge at the end of the
+         input -- see below.
+      3. no whitespace on either side of an EOS. normalize() ends in .strip()
+         and text_sentences strips EVERY chunk, so the training stream contains
+         no whitespace adjacent to token 2 anywhere in 4.5B tokens. Producing
+         "你好。\x02 我们" would be a shape the model has never seen, and it is
+         the rule an implementation gets wrong by default.
+
+    Deliberately absent, and NOT an omission -- divergences from the training
+    chain, each traded off on purpose:
+
+      * text_sentences also drops chunks with no Han, and charset.is_typeable
+        drops sentences carrying an out-of-table Han character. Both are
+        corpus SELECTION. Copying them here would delete the user's own text
+        from its own context. The train/inference gap that leaves is real,
+        grows with context length, and is closed by a corpus change if the
+        factorial says it is worth one -- not here.
+      * `train.py`'s EOS is unconditional per line; a dialogue line with no
+        terminal punctuation ("在吗", "好的") still gets one. `scoring_form`
+        emits no EOS at the end of an unfinished context. This is the correct
+        divergence, not a bug to fix: at the caret the sentence is unfinished,
+        and an EOS would tell the model "this is finished" while we are asking
+        it to predict the continuation.
+
+    There is no unconditional trailing EOS: a context ending mid-sentence -- the
+    common live case, since the caret is where the user stopped typing -- ends
+    with no EOS at all, even though the training chain always closes a line
+    with one.
+
+    C++ `AlignToTrainingForm` (src/scoring_form.h) must agree with this function
+    exactly; the golden fixture emitted by `rime-train scoring-form` is what
+    holds the two together.
+    """
+    out: list[str] = []
+    for chunk in _SENT_END.split(normalize(text)):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        out.append(chunk)
+        if chunk[-1] in _SENT_END_CHARS:
+            out.append(EOS_CARRIER)
+    return "".join(out)

@@ -28,6 +28,7 @@
 #include <deque>
 #include <string>
 
+#include "imk_client.h"  // Truncation
 #include "rerank_llm.h"  // llm_rerank::SkipReason
 #include "telemetry_event.h"
 
@@ -64,6 +65,12 @@ struct RerankTrace {
   size_t end = 0;
   std::string ctx;  // TrailingCjkRun the decision was made against
   std::string src;  // which surrounding-text source supplied it
+  // What the surrounding fetch behind `ctx` actually managed, recorded at
+  // decision time. Carried on the trace rather than re-read at commit because
+  // the fetch that produced this decision is gone by then -- a second
+  // GetSurroundingContext() at commit describes a different caret.
+  int before_depth = -1;
+  Truncation truncation = Truncation::kUnknown;
   // `record.text` is empty when re-ranking ran but promoted nothing. The
   // context above is still meaningful in that case.
   telemetry::RerankRecord record;

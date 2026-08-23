@@ -31,7 +31,13 @@ namespace telemetry {
 // and stops emitting an `llm` object for a segment that was never scored (the
 // kNone-without-scoring path fixed in rerank_filter.cc). A v2 line carries
 // none of those and must keep loading unchanged under a v3 reader.
-inline constexpr int kSchemaVersion = 3;
+//
+// v4 adds `before_depth` and `trunc` to Event: how many characters the
+// surrounding source actually returned, and why it stopped. Both are omitted on
+// a line whose trace carried no measurement, so a v3 reader loses nothing and a
+// v4 reader can tell "not measured" from "measured zero". A v3 line carries
+// neither and must keep loading unchanged under a v4 reader.
+inline constexpr int kSchemaVersion = 4;
 
 // What the re-ranking filter decided for one segment.
 struct RerankRecord {
@@ -82,6 +88,12 @@ struct Event {
   std::string machine;           // Deployer::user_id
   std::string schema;            // Rime schema id
   std::string src;               // "imk" | "bridge" | "tmux" | "none"
+  int before_depth = -1;         // characters the source returned before the caret; -1
+                                 // means no trace carried a measurement, which is a
+                                 // different fact from a measured 0
+  std::string trunc;             // TruncationName(): full|config|app|screen. Empty when
+                                 // the source could not say (the bridge, today) or when
+                                 // no trace existed.
   std::string input;             // the segment's input code
   std::string ctx;               // TrailingCjkRun before the caret; Han only
   int sel_idx = 0;               // selected index in the list as displayed
@@ -177,6 +189,15 @@ inline std::string SerializeJsonl(const Event& e) {
   j["machine"] = e.machine;
   j["schema"] = e.schema;
   j["src"] = e.src;
+  // Omitted rather than written as -1/"": an absent key is how every other
+  // optional field in this line says "no evidence", and a reader that has to
+  // special-case a sentinel is a reader that will forget to.
+  if (e.before_depth >= 0) {
+    j["before_depth"] = e.before_depth;
+  }
+  if (!e.trunc.empty()) {
+    j["trunc"] = e.trunc;
+  }
   j["input"] = e.input;
   j["ctx"] = e.ctx;
   j["sel_idx"] = e.sel_idx;

@@ -299,7 +299,13 @@ int main(int argc, char** argv) {
   // or kCandidateHeadroom and the other term can take over -- which is why the
   // guard is a min and not a single comparison.
   {
-    const std::vector<llama_token> probe = Tokenize(vocab, context, /*add_special=*/true);
+    // No BOS: it never appears in the training stream (train.py writes
+    // `sentence + EOS` repeated), and the deployed path dropped it on the
+    // 2026-08-23 branch (src/scoring_form.h). Deliberately NOT run through
+    // AlignToTrainingForm either -- `context` here is synthetic, built to a
+    // known character count for timing, and alignment would change the token
+    // count this probe is deliberately controlling.
+    const std::vector<llama_token> probe = Tokenize(vocab, context, /*add_special=*/false);
     const int n_ctx_seq = (int)llama_n_ctx_seq(ctx);
     const int limit = std::min(kNBatch, n_ctx_seq - kCandidateHeadroom);
     if (probe.empty() || (int)probe.size() > limit) {
@@ -331,7 +337,10 @@ int main(int argc, char** argv) {
     // sharing a context, but it is also re-run on every commit and every
     // composition start (rerank_filter.cc's warming call sites), so roughly one
     // prefill per one score is the honest live ratio, not zero.
-    std::vector<llama_token> ctx_tokens = Tokenize(vocab, context, /*add_special=*/true);
+    // Same reasoning as the probe above: no BOS, and no AlignToTrainingForm
+    // since this context is synthetic and its token count is what is being
+    // measured.
+    std::vector<llama_token> ctx_tokens = Tokenize(vocab, context, /*add_special=*/false);
     llama_memory_seq_rm(mem, 0, -1, -1);
     for (int s = 1; s <= n_candidates; ++s) {
       llama_memory_seq_rm(mem, s, -1, -1);

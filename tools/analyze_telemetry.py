@@ -109,7 +109,11 @@ CREATE TABLE recorder (
 # Kept here rather than parsed out of the header so the report needs no source
 # tree at hand; analyze_telemetry_test.py fails if the two drift, which is the
 # same generated-file-plus-drift-test arrangement tools/requirements.txt uses.
-SCHEMA_VERSION = 3
+#
+# v4 adds `before_depth` (characters the surrounding source actually returned
+# before the caret) and `trunc` (why it stopped: full|config|app|screen) to
+# Event. Both are omitted on a line whose trace carried no measurement.
+SCHEMA_VERSION = 4
 
 # Below this many samples a percentage is noise, and the first percentage this
 # report prints becomes the baseline every later change is quoted against. The

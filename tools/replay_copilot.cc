@@ -40,6 +40,7 @@
 #include "rerank_llm.h"          // llm_rerank::SkipReason, SkipReasonName
 #include "rerank_trace.h"        // RerankTraceStore, RerankTrace
 #include "scorer.h"              // Scorer
+#include "scoring_form.h"        // BuildScoringContext
 #include "surrounding_source.h"  // GetSurroundingContext, SurroundingSource(Name)
 
 using json = nlohmann::json;
@@ -638,7 +639,7 @@ PendingSegmentContext BuildAndWarmContext(const Options& opts, const WarmConfig&
   // Must be the same function the filter and Copilot's warm trigger use, or
   // this harness warms a context nobody asks about and every --wait-for-warm
   // reports success while every Apply() finds the cache cold.
-  out.context = rime::ScoringContext(base, cfg.llm_context_chars);
+  out.context = rime::BuildScoringContext(base, cfg.llm_context_chars);
   if (opts.wait_for_warm) {
     out.warmed = WarmAndWait(cfg.scorer, out.context);
   }

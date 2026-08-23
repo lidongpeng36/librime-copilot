@@ -209,42 +209,45 @@ class RecorderVersions(unittest.TestCase):
     not a statement."""
 
     def test_a_machine_writing_the_previous_schema_is_named_stale(self):
+        current = analyze.SCHEMA_VERSION
         db = load_files({
-            "New.jsonl": [{"v": 3, "ts": "2026-08-21T10:00:00+0800", "machine": "New",
+            "New.jsonl": [{"v": current, "ts": "2026-08-21T10:00:00+0800", "machine": "New",
                            "sel": "想", "sel_idx": 0, "top": ["想"]}],
-            "Old.jsonl": [{"v": 2, "ts": "2026-08-21T10:00:00+0800", "machine": "Old",
+            "Old.jsonl": [{"v": current - 1, "ts": "2026-08-21T10:00:00+0800", "machine": "Old",
                            "sel": "想", "sel_idx": 0, "top": ["想"]}],
         })
         report = {r[0]: r for r in analyze.recorder_report(db)}
-        self.assertEqual(report["Old"][1], 2)
+        self.assertEqual(report["Old"][1], current - 1)
         self.assertTrue(report["Old"][3])
-        self.assertEqual(report["New"][1], 3)
+        self.assertEqual(report["New"][1], current)
         self.assertFalse(report["New"][3])
 
     def test_a_machine_that_upgraded_is_judged_on_its_latest_line(self):
+        current = analyze.SCHEMA_VERSION
         db = load_files({
             "Mac-Mini.jsonl": [
-                {"v": 2, "ts": "2026-08-20T10:00:00+0800", "machine": "Mac-Mini",
+                {"v": current - 1, "ts": "2026-08-20T10:00:00+0800", "machine": "Mac-Mini",
                  "sel": "想", "sel_idx": 0, "top": ["想"]},
-                {"v": 3, "ts": "2026-08-21T10:00:00+0800", "machine": "Mac-Mini",
+                {"v": current, "ts": "2026-08-21T10:00:00+0800", "machine": "Mac-Mini",
                  "sel": "想", "sel_idx": 0, "top": ["想"]},
             ],
         })
         machine, latest_v, lines, stale, behind = analyze.recorder_report(db)[0]
-        self.assertEqual((machine, latest_v, lines, behind), ("Mac-Mini", 3, 2, 1))
+        self.assertEqual((machine, latest_v, lines, behind), ("Mac-Mini", current, 2, 1))
         self.assertFalse(stale)
 
     def test_a_stats_line_is_attributed_to_the_file_it_came_from(self):
+        current = analyze.SCHEMA_VERSION
         db = load_files({
-            "Mac-Mini.jsonl": [{"v": 2, "type": "stats", "ts": "2026-08-20T15:29:03+0800",
+            "Mac-Mini.jsonl": [{"v": current - 1, "type": "stats", "ts": "2026-08-20T15:29:03+0800",
                                 "segments": 6, "llm_acted": 5}],
         })
-        self.assertEqual(analyze.recorder_report(db), [("Mac-Mini", 2, 1, True, 1)])
+        self.assertEqual(analyze.recorder_report(db), [("Mac-Mini", current - 1, 1, True, 1)])
 
     def test_an_unparseable_line_is_not_counted_as_a_recorded_line(self):
         db = load_files({
-            "Mac-Mini.jsonl": [{"v": 3, "type": "stats", "ts": "2026-08-21T10:00:00+0800",
-                                "segments": "not a number"}],
+            "Mac-Mini.jsonl": [{"v": analyze.SCHEMA_VERSION, "type": "stats",
+                                "ts": "2026-08-21T10:00:00+0800", "segments": "not a number"}],
         })
         self.assertEqual(analyze.recorder_report(db), [])
 
@@ -339,24 +342,26 @@ class MixedVersionMachine(unittest.TestCase):
     of the report is blank for reasons that are not about the typing."""
 
     def test_the_lines_predating_the_current_schema_are_counted(self):
+        current = analyze.SCHEMA_VERSION
         db = load_files({
             "Mac-Mini.jsonl": [
-                {"v": 2, "ts": "2026-08-20T10:00:00+0800", "machine": "Mac-Mini",
+                {"v": current - 1, "ts": "2026-08-20T10:00:00+0800", "machine": "Mac-Mini",
                  "sel": "想", "sel_idx": 0, "top": ["想"]},
-                {"v": 2, "ts": "2026-08-20T11:00:00+0800", "machine": "Mac-Mini",
+                {"v": current - 1, "ts": "2026-08-20T11:00:00+0800", "machine": "Mac-Mini",
                  "sel": "想", "sel_idx": 0, "top": ["想"]},
-                {"v": 3, "ts": "2026-08-21T10:00:00+0800", "machine": "Mac-Mini",
+                {"v": current, "ts": "2026-08-21T10:00:00+0800", "machine": "Mac-Mini",
                  "sel": "想", "sel_idx": 0, "top": ["想"]},
             ],
         })
-        self.assertEqual(analyze.recorder_report(db), [("Mac-Mini", 3, 3, False, 2)])
+        self.assertEqual(analyze.recorder_report(db), [("Mac-Mini", current, 3, False, 2)])
 
     def test_a_machine_wholly_on_the_current_schema_has_nothing_behind(self):
+        current = analyze.SCHEMA_VERSION
         db = load_files({
-            "New.jsonl": [{"v": 3, "ts": "2026-08-21T10:00:00+0800", "machine": "New",
+            "New.jsonl": [{"v": current, "ts": "2026-08-21T10:00:00+0800", "machine": "New",
                            "sel": "想", "sel_idx": 0, "top": ["想"]}],
         })
-        self.assertEqual(analyze.recorder_report(db), [("New", 3, 1, False, 0)])
+        self.assertEqual(analyze.recorder_report(db), [("New", current, 1, False, 0)])
 
 
 class DeclineWithNothingToCompare(unittest.TestCase):

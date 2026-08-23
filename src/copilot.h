@@ -125,8 +125,11 @@ class Copilot : public Processor {
   // WarmRerankContext builds the identical context and honors the identical
   // battery gate the filter itself applies before it would ever call WarmUp().
   int rerank_max_context_chars_ = 8;
-  // LlmRerankOptions::context_chars' own default -- what the SCORER is warmed
+  // Read from copilot/rerank/llm/context_chars -- what the SCORER is warmed
   // with, which is a different and longer string than the db's Han-only tail.
+  // Initializer mirrors LlmRerankOptions::context_chars' own default
+  // (rerank_llm.h) so an unconfigured schema is bit-identical; not clamped,
+  // to match the filter, which does not clamp this key either.
   int rerank_llm_context_chars_ = 32;
   bool rerank_llm_battery_active_ = false;
   // Cached rather than queried on every warm attempt -- same reason and same

@@ -166,6 +166,18 @@ TEST(TrailingCjk, DegenerateInput) {
   EXPECT_EQ("", TrailingCjkRun("高屋建", 0));  // non-positive cap
 }
 
+// The reason BuildScoringContext (src/scoring_form.h) exists instead of
+// reusing TrailingCjkRun for the model: on the context that 77.3% of eval
+// requests actually have, TrailingCjkRun drops everything because a trailing
+// comma is not Han, while the model was trained to read exactly this kind of
+// text. See BuildScoringContextFor's comment in rerank.h.
+TEST(TrailingCjk, DiffersFromBuildScoringContextOnNonHanTail) {
+  EXPECT_EQ("", TrailingCjkRun("好的, ", 32));
+  // BuildScoringContext also aligns first: the trailing space is stripped,
+  // but the comma (not a sentence ender) and the Han text before it survive.
+  EXPECT_EQ("好的,", rime::BuildScoringContext("好的, ", 32));
+}
+
 // -------------------------------------------------------------- promotion --
 
 TEST(Promotion, ExactMatchIsPromoted) {
@@ -314,47 +326,14 @@ TEST(EligibleBySpan, EmptyWindowYieldsNothingRatherThanReadingTheHead) {
   EXPECT_TRUE(rime::EligibleBySpan({}, false).empty());
 }
 
-// ScoringContext — what the model conditions on.
-//
-// Distinct from TrailingCjkRun, and the distinction is worth 68.2% of
-// segments: gating the model on a Han-only tail meant it was consulted on
-// 8.8% of them (llm_skip=noctx). Three call sites compute this string and the
-// warm cache is keyed by it, so they all call this one function -- two of
-// them disagreeing warms a context nobody asks about and the feature silently
-// never runs.
-
-TEST(ScoringContext, KeepsNonHanThatTrailingCjkRunWouldDrop) {
-  // The context that 77.3% of eval requests actually have.
-  EXPECT_EQ("好的, ", rime::ScoringContext("好的, ", 32));
-  EXPECT_EQ("", rime::TrailingCjkRun("好的, ", 32));
-}
-
-TEST(ScoringContext, TakesTheTailNotTheHead) {
-  EXPECT_EQ("建瓴", rime::ScoringContext("高屋建瓴", 2));
-}
-
-TEST(ScoringContext, CountsCharactersNotBytes) {
-  // Four Han characters are twelve bytes; a byte-wise tail would split one.
-  EXPECT_EQ("高屋建瓴", rime::ScoringContext("高屋建瓴", 4));
-}
-
-TEST(ScoringContext, ShorterThanTheLimitIsReturnedWhole) {
-  EXPECT_EQ("好的", rime::ScoringContext("好的", 32));
-}
-
-TEST(ScoringContext, EmptyInputsYieldEmpty) {
-  EXPECT_EQ("", rime::ScoringContext("", 32));
-  EXPECT_EQ("", rime::ScoringContext("好的", 0));
-}
-
-TEST(ScoringContext, MixedLatinAndHanSurvivesIntact) {
-  // What the user's own technical writing looks like, and the reason the
-  // limit counts characters uniformly: 10 back from the end of
-  // "先去修 build.py 吧" lands inside the Latin, and every one of those
-  // characters is context the model was trained to read.
-  EXPECT_EQ("build.py 吧", rime::ScoringContext("先去修 build.py 吧", 10));
-  EXPECT_EQ("先去修 build.py 吧", rime::ScoringContext("先去修 build.py 吧", 32));
-}
+// What the model conditions on, and its truncation, is BuildScoringContext
+// (src/scoring_form.h) now, aligned to the training form first. Its own
+// coverage (tail-not-head, character counting, degenerate inputs, mixed
+// Latin/Han) lives in test/scoring_form_test.cc; the contrast with
+// TrailingCjkRun on a non-Han tail lives above, next to TrailingCjkRun's own
+// tests (TrailingCjk.DiffersFromBuildScoringContextOnNonHanTail). What is
+// left to test here is BuildScoringContextFor's assembly of `before` + `extra`
+// ahead of that truncation -- see below.
 
 // The span gate's leftovers, recorded so `sel in dropped` can say how often
 // same_span_only had any chance to matter. Recorded, never scored: scoring
@@ -384,4 +363,34 @@ TEST(DroppedBySpan, TreatsANonPositiveCapAsRecordNothing) {
   const std::vector<std::string> texts{"a", "b"};
   const std::vector<size_t> eligible{0};
   EXPECT_TRUE(DroppedBySpan(texts, eligible, 0).empty());
+}
+
+// The warm trigger and the filter must not be able to compute two different
+// strings. They used to: copilot.cc appended GetCommitText() and truncated at a
+// hard-coded 32, rerank_filter.cc appended ConfirmedPrefix() and truncated at
+// the configured value. Identical today only because both were 32 and the
+// sources were capped at 8. This function makes them the same by construction.
+TEST(Rerank, BuildScoringContextForAppendsThenTruncates) {
+  rime::SurroundingText s;
+  s.before = "今天天气";
+
+  EXPECT_EQ("今天天气真好", rime::BuildScoringContextFor(s, "真好", 64));
+  // Truncation applies to the CONCATENATION, not to `before` alone.
+  EXPECT_EQ("天气真好", rime::BuildScoringContextFor(s, "真好", 4));
+  EXPECT_EQ("", rime::BuildScoringContextFor(s, "真好", 0));
+}
+
+TEST(Rerank, BuildScoringContextForHandlesEmptyBefore) {
+  rime::SurroundingText s;
+  EXPECT_EQ("真好", rime::BuildScoringContextFor(s, "真好", 64));
+  EXPECT_EQ("", rime::BuildScoringContextFor(s, "", 64));
+}
+
+TEST(Rerank, BuildScoringContextForAppliesTheTrainingForm) {
+  rime::SurroundingText s;
+  s.before = "今天。 ";
+  // The trailing space is stripped, the sentence ender gains its carrier, and
+  // `extra` is appended BEFORE alignment runs, not after.
+  EXPECT_EQ(std::string("今天。") + rime::kEosCarrier + "真好",
+            rime::BuildScoringContextFor(s, "真好", 64));
 }

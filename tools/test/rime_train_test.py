@@ -326,6 +326,83 @@ class TextSentences(unittest.TestCase):
         self.assertEqual(normalize.text_sentences("just english here. and more"), [])
 
 
+class ScoringFormTest(unittest.TestCase):
+    def test_scoring_form_inserts_eos_after_every_sentence_ender(self):
+        self.assertEqual(normalize.scoring_form("你好。我们走"), "你好。\x02我们走")
+        self.assertEqual(normalize.scoring_form("你好。"), "你好。\x02")
+        self.assertEqual(normalize.scoring_form("好吗？好的！"), "好吗？\x02好的！\x02")
+
+    def test_scoring_form_leaves_no_whitespace_beside_eos(self):
+        """normalize() ends in .strip() and text_sentences strips EVERY chunk, so
+        the training stream never has whitespace on either side of token 2."""
+        self.assertEqual(normalize.scoring_form("你好。 我们走"), "你好。\x02我们走")
+        self.assertEqual(normalize.scoring_form("  你好。\n我们走  "), "你好。\x02我们走")
+
+    def test_scoring_form_does_not_split_on_commas(self):
+        self.assertEqual(normalize.scoring_form("你好，我们走"), "你好，我们走")
+
+    def test_scoring_form_folds_newlines_to_a_space(self):
+        """A newline is NOT a full stop: mapping it to EOS would render the
+        user's line break as the symbol the model learned to read as a period."""
+        self.assertEqual(normalize.scoring_form("你好\n我们走"), "你好 我们走")
+
+    def test_scoring_form_preserves_the_chains_segmentation(self):
+        """Checks that scoring_form is the concatenation of
+        text_sentences(normalize(text)) with a carrier after every ender --
+        i.e. that the projection preserves the chain's segmentation and
+        normalization. It does NOT verify EOS placement against train.py:
+        that is test_scoring_form_emits_no_eos_for_an_unfinished_context, and
+        it needs a separate test because train.py's EOS is unconditional per
+        LINE while this expression's is conditional per ENDER -- the two only
+        coincide at internal boundaries, never at the end of the input, so an
+        equality check built from the same per-chunk condition scoring_form
+        itself uses cannot catch a wrong EOS rule; it can only catch two local
+        copies going out of sync with each other. References
+        normalize._SENT_END_CHARS rather than a second hardcoded literal so a
+        change to the ender set cannot desync the test from the code it is
+        checking.
+        """
+        samples = [
+            "你好。我们走",
+            "看下当前的项目。然后重测吧！",
+            "运行 3 次都失败了。改一下 config.py 再试；应该可以了。",
+            "好的，继续",
+            "ＡＢ１２ 混排的全角。半角也在。",
+        ]
+        for text in samples:
+            with self.subTest(text=text):
+                chunks = normalize.text_sentences(normalize.normalize(text))
+                expected = "".join(
+                    c + (normalize.EOS_CARRIER if c[-1] in normalize._SENT_END_CHARS else "")
+                    for c in chunks
+                )
+                self.assertEqual(normalize.scoring_form(text), expected)
+
+    def test_scoring_form_keeps_what_the_corpus_would_have_dropped(self):
+        """The one deliberate divergence, pinned so it cannot become accidental.
+
+        text_sentences drops a chunk with no Han because a corpus should not
+        spend capacity teaching this model English. At inference there is nothing
+        to select: the text before the caret is what the user wrote.
+        """
+        text = "ok then。好的。"
+        self.assertEqual(normalize.text_sentences(normalize.normalize(text)), ["好的。"])
+        self.assertEqual(normalize.scoring_form(text), "ok then。\x02好的。\x02")
+
+    def test_scoring_form_emits_no_eos_for_an_unfinished_context(self):
+        """A second deliberate divergence from the training chain, pinned so it
+        cannot become accidental. train.py appends EOS after every non-empty
+        corpus LINE, unconditionally -- a dialogue line with no terminal
+        punctuation ("在吗") still gets one. At the caret the sentence is
+        unfinished, and an EOS there would tell the model "this is finished"
+        while we are asking it to predict the continuation -- so scoring_form
+        must not append one for an unfinished context, even though training
+        always would have.
+        """
+        self.assertEqual(normalize.scoring_form("你好。我们走"), "你好。\x02我们走")
+        self.assertEqual(normalize.scoring_form("在吗"), "在吗")
+
+
 class LanguageFilterTest(unittest.TestCase):
     """m-a-p/Matrix does not carry the language in the split name; the
     `Language=` field does, and the two disagree. Measured 2026-08-21:
@@ -480,3 +557,41 @@ class BuildCmdRepeatTest(unittest.TestCase):
         summary = [line for line in stdout.splitlines() if line.strip().startswith("t (technical)")]
         self.assertEqual(len(summary), 1, stdout)
         self.assertNotIn("x1", summary[0])
+
+
+class GoldenFixtureTest(unittest.TestCase):
+    def test_golden_fixture_is_in_step_with_scoring_form(self):
+        """The committed fixture is generated. A hand-edited one is a lie every
+        run reports as success -- the same shape as tools/requirements.txt before
+        it was generated from RUNTIME_REQUIREMENTS.
+        """
+        import io
+        import json
+
+        from rime_train import goldens
+
+        path = Path(__file__).resolve().parents[2] / "test" / "data" / "scoring_form_golden.jsonl"
+        self.assertTrue(path.exists(), f"missing fixture: {path}; run `rime-train scoring-form`")
+
+        sink = io.StringIO()
+        goldens.emit_scoring_form(sink)
+        self.assertEqual(
+            sink.getvalue(),
+            path.read_text(encoding="utf-8"),
+            "test/data/scoring_form_golden.jsonl is stale; regenerate with "
+            "`tools/rime-train scoring-form --out test/data/scoring_form_golden.jsonl`",
+        )
+
+        for line in path.read_text(encoding="utf-8").splitlines():
+            case = json.loads(line)
+            self.assertEqual(normalize.scoring_form(case["in"]), case["out"])
+
+    def test_golden_cases_cover_every_alignment_rule(self):
+        from rime_train import goldens
+
+        joined = "".join(goldens.SCORING_FORM_CASES)
+        self.assertIn("\n", joined)         # rule 1: newline folding
+        self.assertIn("。", joined)          # rule 2: sentence boundary
+        self.assertIn("。 ", joined)         # rule 3: whitespace beside an EOS
+        self.assertIn("　", joined)      # an exotic blank Python's \s matches
+        self.assertIn("\x07", joined)       # a control character normalize() drops

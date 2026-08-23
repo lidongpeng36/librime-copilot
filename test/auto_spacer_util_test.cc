@@ -134,6 +134,37 @@ TEST(DecorateCommitText, BothSides) {
   EXPECT_EQ(" 中文 ", DecorateCommitText("中文", "abc", "def", false, true));
 }
 
+// A newline before the caret is a boundary, exactly as a space is. No source
+// produces this string yet -- nvim reads only the caret's line and tmux slices a
+// single row -- but step (c) of the surrounding-context design makes `before`
+// carry real newlines, and the predicate must not answer that question by
+// falling through to IsAsciiRightPunctCode('\n').
+TEST(AutoSpacerUtil, WhitespaceBeforeNeedsNoSpace) {
+  using rime::auto_spacer_detail::NeedSpaceBefore;
+  EXPECT_FALSE(NeedSpaceBefore("上一行\n", true));
+  EXPECT_FALSE(NeedSpaceBefore("上一行\n", false));
+  EXPECT_FALSE(NeedSpaceBefore("word\t", true));
+  EXPECT_FALSE(NeedSpaceBefore("word\t", false));
+  EXPECT_FALSE(NeedSpaceBefore("word\r", false));
+}
+
+TEST(AutoSpacerUtil, WhitespaceAfterNeedsNoSpace) {
+  using rime::auto_spacer_detail::NeedSpaceAfter;
+  EXPECT_FALSE(NeedSpaceAfter("\n下一行", true));
+  EXPECT_FALSE(NeedSpaceAfter("\n下一行", false));
+  EXPECT_FALSE(NeedSpaceAfter("\tword", true));
+}
+
+// Regression guard: the ordinary cases must be untouched by the change above.
+TEST(AutoSpacerUtil, WhitespaceHardeningLeavesOrdinaryCasesAlone) {
+  using rime::auto_spacer_detail::NeedSpaceAfter;
+  using rime::auto_spacer_detail::NeedSpaceBefore;
+  EXPECT_TRUE(NeedSpaceBefore("今天", true));      // CJK then ascii content
+  EXPECT_TRUE(NeedSpaceBefore("word", false));     // ascii then CJK content
+  EXPECT_FALSE(NeedSpaceBefore("今天，", false));  // Chinese punctuation
+  EXPECT_TRUE(NeedSpaceAfter("今天", true));
+}
+
 TEST(DecorateCommitText, TrimsAndSkipsChinesePunct) {
   // Surrounding whitespace in the raw text is trimmed before decoration.
   EXPECT_EQ(" test", DecorateCommitText("  test  ", "中", "", true, true));

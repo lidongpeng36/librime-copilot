@@ -441,7 +441,14 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   }
 
   const std::string client_key = tmux_detail::MakeClientKey(socket, snap->pane_id);
-  return remember(SurroundingText{ctx->before, ctx->after, client_key});
+  SurroundingText result;
+  result.before = ctx->before;
+  result.after = ctx->after;
+  result.client_key = client_key;
+  result.before_depth = ctx->before_depth;
+  result.after_depth = ctx->after_depth;
+  result.truncation = ctx->truncation;
+  return remember(result);
 }
 
 }  // namespace rime

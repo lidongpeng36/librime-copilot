@@ -611,3 +611,64 @@ TEST(TmuxArgs, AsksCapturePaneForEscapeSequences) {
   ASSERT_NE(cp, args.end());
   EXPECT_NE(std::find(cp, args.end(), "-e"), args.end());
 }
+
+// A row longer than prefix_chars was cut by the config, not by the screen.
+TEST(TmuxSourceUtil, TruncationByConfigWhenRowIsLongerThanAsked) {
+  rime::tmux_detail::Snapshot snap;
+  snap.pane_width = 80;
+  snap.cursor_x = 16;  // 8 Han characters occupy 16 display columns
+  snap.cursor_y = 0;
+  snap.rows.push_back("今天天气真的很好");
+
+  auto ctx = rime::tmux_detail::ExtractContext(snap, 4);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ("真的很好", ctx->before);
+  EXPECT_EQ(4, ctx->before_depth);
+  EXPECT_EQ(rime::Truncation::kByConfig, ctx->truncation);
+}
+
+// The row began before we ran out of budget: tmux simply cannot see further.
+TEST(TmuxSourceUtil, TruncationByScreenWhenRowIsShorterThanAsked) {
+  rime::tmux_detail::Snapshot snap;
+  snap.pane_width = 80;
+  snap.cursor_x = 4;
+  snap.cursor_y = 0;
+  snap.rows.push_back("今天天气真的很好");
+
+  auto ctx = rime::tmux_detail::ExtractContext(snap, 64);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ("今天", ctx->before);
+  EXPECT_EQ(2, ctx->before_depth);
+  EXPECT_EQ(rime::Truncation::kByScreen, ctx->truncation);
+}
+
+// A region ending exactly on the budget is kByScreen for tmux, not kByConfig
+// and not kFull: what ended it is the start of the row, which is a screen
+// limit. kFull stays unreachable for tmux until step (c) teaches it where the
+// user's own text begins.
+TEST(TmuxSourceUtil, TruncationExactFitIsByScreen) {
+  rime::tmux_detail::Snapshot snap;
+  snap.pane_width = 80;
+  snap.cursor_x = 4;
+  snap.cursor_y = 0;
+  snap.rows.push_back("今天");
+
+  auto ctx = rime::tmux_detail::ExtractContext(snap, 2);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ("今天", ctx->before);
+  EXPECT_EQ(2, ctx->before_depth);
+  EXPECT_EQ(rime::Truncation::kByScreen, ctx->truncation);
+}
+
+TEST(TmuxSourceUtil, AfterDepthCountsCharactersNotBytes) {
+  rime::tmux_detail::Snapshot snap;
+  snap.pane_width = 80;
+  snap.cursor_x = 2;
+  snap.cursor_y = 0;
+  snap.rows.push_back("今天");
+
+  auto ctx = rime::tmux_detail::ExtractContext(snap, 8);
+  ASSERT_TRUE(ctx.has_value());
+  EXPECT_EQ("天", ctx->after);
+  EXPECT_EQ(1, ctx->after_depth);
+}
