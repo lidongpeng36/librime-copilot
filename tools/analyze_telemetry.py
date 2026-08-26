@@ -81,14 +81,36 @@ CREATE TABLE ev (
 -- (ShouldRecord's "hard cases only" gate). This is the "everything" side of
 -- the split telemetry_event.h documents; warm-hit rate can only be computed
 -- from here.
+--
+-- `depth_p50`/`depth_p95` are NULL on a v4 line, and also on a v5 line whose
+-- window saw no environment-truncated fetch. Those two are the same fact for
+-- every question here -- "no depth measurement to report" -- and neither is
+-- a zero: the plugin omits the field rather than writing 0.0 precisely so a
+-- real measured 0 (the source reached no characters at all) stays legible.
 CREATE TABLE stats (
-  ts TEXT, segments INT, llm_acted INT, us_p50 REAL, us_p95 REAL
+  ts TEXT, segments INT, llm_acted INT, us_p50 REAL, us_p95 REAL,
+  depth_p50 REAL, depth_p95 REAL
 );
 
 -- One row per (stats line, skip reason) pair, flattened out of that line's
 -- `skip_counts` object so it can be summed with plain SQL.
 CREATE TABLE skip (
   ts TEXT, reason TEXT, count INT
+);
+
+-- One row per (stats line, truncation kind) pair, flattened out of that
+-- line's `trunc_counts` object -- full|config|app|screen|unknown. Same shape
+-- and same reason as `skip` above.
+--
+-- Deliberately NOT read off the `ev` table, which also carries `trunc` per
+-- event: the event stream is sampled (ShouldRecord keeps every miss and
+-- promotion but only 1 in `sample_ok` plain successes), so a kByScreen share
+-- computed there is biased toward the hard cases -- the short requests
+-- carrying least context, i.e. exactly the ones most likely to be truncated.
+-- This table is the unbiased one, and it is the only one whose numbers should
+-- be quoted when deciding whether to reach deeper.
+CREATE TABLE trunc (
+  ts TEXT, kind TEXT, count INT
 );
 
 -- One row per (machine, schema version) actually seen in the files, counted
@@ -113,7 +135,12 @@ CREATE TABLE recorder (
 # v4 adds `before_depth` (characters the surrounding source actually returned
 # before the caret) and `trunc` (why it stopped: full|config|app|screen) to
 # Event. Both are omitted on a line whose trace carried no measurement.
-SCHEMA_VERSION = 4
+#
+# v5 adds `trunc_counts` and `depth_p50`/`depth_p95` to the stats line: the
+# same two facts over EVERY segment rather than the sampled subset the event
+# stream keeps. The depth pair covers only the fetches the environment cut
+# short (screen/app) and is omitted when the window saw none.
+SCHEMA_VERSION = 5
 
 # Below this many samples a percentage is noise, and the first percentage this
 # report prints becomes the baseline every later change is quoted against. The
@@ -391,16 +418,28 @@ def _load_stats_line(db, e):
     for reason, count in (skip_counts or {}).items():
         if not isinstance(reason, str) or isinstance(count, bool) or not isinstance(count, (int, float)):
             raise ValueError("skip_counts entry is not a str -> number mapping")
+    trunc_counts = e.get("trunc_counts")
+    if trunc_counts is not None and not isinstance(trunc_counts, dict):
+        raise ValueError("trunc_counts is not a JSON object")
+    for kind, count in (trunc_counts or {}).items():
+        if not isinstance(kind, str) or isinstance(count, bool) or not isinstance(count, (int, float)):
+            raise ValueError("trunc_counts entry is not a str -> number mapping")
     us_p50 = e.get("us_p50")
     us_p95 = e.get("us_p95")
+    # Absent on v4, and on a v5 window that saw no environment-truncated
+    # fetch. NULL rather than 0.0 for both: see the `stats` table comment.
+    depth_p50 = e.get("depth_p50")
+    depth_p95 = e.get("depth_p95")
     # Validated in full above before the first INSERT: a malformed entry
-    # midway through skip_counts must not leave this line's `stats` row
-    # written while its `skip` rows are half-missing -- the exception the
-    # caller catches has no transaction to roll back that back out of.
-    db.execute("INSERT INTO stats VALUES (?,?,?,?,?)",
-              (e.get("ts"), segments, llm_acted, us_p50, us_p95))
+    # midway through skip_counts or trunc_counts must not leave this line's
+    # `stats` row written while its child rows are half-missing -- the
+    # exception the caller catches has no transaction to roll that back out.
+    db.execute("INSERT INTO stats VALUES (?,?,?,?,?,?,?)",
+              (e.get("ts"), segments, llm_acted, us_p50, us_p95, depth_p50, depth_p95))
     for reason, count in (skip_counts or {}).items():
         db.execute("INSERT INTO skip VALUES (?,?,?)", (e.get("ts"), reason, count))
+    for kind, count in (trunc_counts or {}).items():
+        db.execute("INSERT INTO trunc VALUES (?,?,?)", (e.get("ts"), kind, count))
 
 
 def rate_table(db, title, expr, where="rr_from > 0", limit=None,
@@ -570,6 +609,7 @@ def main():
     if not total:
         print("No per-event lines (only stats lines) in the given files.")
         _print_skip_distribution(db)
+        _print_fetch_truncation(db)
         return 0
 
     altered = db.execute("SELECT COUNT(*) FROM ev WHERE head_altered = 1").fetchone()[0]
@@ -616,6 +656,7 @@ def main():
         # Independent of `usable`: it comes from the stats table, which
         # head_altered (a db-`rr` concept) has no bearing on.
         _print_skip_distribution(db)
+        _print_fetch_truncation(db)
         return 0
 
     print(f"\n  Of the {usable} usable event(s):")
@@ -777,6 +818,7 @@ def main():
         print("  (no rejections recorded)")
 
     _print_skip_distribution(db)
+    _print_fetch_truncation(db)
     print()
     return 0
 
@@ -877,6 +919,73 @@ def _print_skip_distribution(db):
         print("  (no skips recorded -- the LLM path engaged on every segment observed)")
     print("\n  If `cold` dominates, the problem is the warming trigger, not the model:")
     print("  see src/warm_cache.h and copilot.cc's WarmUp calls.")
+
+
+def _print_fetch_truncation(db):
+    """How often the surrounding fetch is cut short, and how deep it gets.
+
+    This is the number that decides whether reaching deeper is worth
+    building -- stripping tmux chrome is the one surrounding-context change
+    with a measured gain (+2.47 points, p=4.6e-07), and it only pays where
+    the fetch is actually screen-limited.
+
+    From the `trunc` table, never from `ev.trunc`: the event stream is
+    sampled and its sample is biased toward short requests, which are
+    exactly the ones most likely to be truncated. A share computed there
+    would be wrong by an unknown amount in a knowable direction.
+    """
+    print("\n" + "=" * 64)
+    print("SURROUNDING FETCH  how often it is cut short, and how deep it gets")
+    print("=" * 64)
+    rows = db.execute(
+        "SELECT kind, SUM(count) AS n FROM trunc GROUP BY kind ORDER BY n DESC"
+    ).fetchall()
+    if not rows:
+        print("  (no `trunc_counts` on any stats line -- every machine here is writing")
+        print(f"   a schema older than v{SCHEMA_VERSION}; see the RECORDERS section above)")
+        return
+    total = sum(n for _, n in rows)
+    print(f"  {'stopped because':<18}{'n':>10}{'share':>9}")
+    for kind, n in rows:
+        print(f"  {kind:<18}{n:>10}{n / total:>8.1%}")
+    print(f"  {'(total)':<18}{total:>10}")
+
+    unknown = dict(rows).get("unknown", 0)
+    if unknown / total >= 0.5:
+        print("\n  !!  Most fetches cannot say why they stopped. That is the IME Bridge's")
+        print("      honest answer (src/imk_client.h) -- it receives a string over a")
+        print("      socket and has no way to learn whether the client had more. The")
+        print("      shares above describe the minority that can say, not typing overall.")
+
+    # Per-WINDOW percentiles. A percentile of the pooled segments is not
+    # recoverable from them -- averaging percentiles is not a percentile --
+    # so this reports their spread and says so, rather than printing a
+    # plausible single number that is not the statistic it looks like.
+    depths = db.execute(
+        "SELECT depth_p50, depth_p95 FROM stats WHERE depth_p50 IS NOT NULL"
+    ).fetchall()
+    if not depths:
+        print("\n  depth: not reported -- no window saw a fetch the environment cut")
+        print("         short (screen/app). Nothing here is limited by how far the")
+        print("         source can see.")
+        return
+    # By position, not by name: `load()` leaves the connection's default
+    # row_factory (plain tuples), while the unit tests build theirs with
+    # sqlite3.Row. Indexing works on both; naming works only on the second,
+    # and that difference once let a green test suite ship a report that
+    # crashed on the first real file.
+    p50s = sorted(r[0] for r in depths)
+    p95s = sorted(r[1] for r in depths)
+    mid = lambda v: v[len(v) // 2]
+    print(f"\n  depth reached when the environment ran out (screen/app), "
+         f"over {len(depths)} window(s):")
+    print(f"    p50   typical {mid(p50s):.1f}   range {p50s[0]:.1f} - {p50s[-1]:.1f}")
+    print(f"    p95   typical {mid(p95s):.1f}   range {p95s[0]:.1f} - {p95s[-1]:.1f}")
+    print("    (per-window percentiles; a pooled one is not recoverable by averaging")
+    print("     them. For the pooled shape use `ev.before_depth`, accepting its bias.)")
+    print("\n  Reaching deeper only pays where `screen` dominates AND the depth above")
+    print("  is well under copilot/rerank/llm/context_chars -- otherwise the cap that")
+    print("  binds is the config, not the terminal.")
 
 
 if __name__ == "__main__":

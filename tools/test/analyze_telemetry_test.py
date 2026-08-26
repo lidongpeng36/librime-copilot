@@ -252,6 +252,92 @@ class RecorderVersions(unittest.TestCase):
         self.assertEqual(analyze.recorder_report(db), [])
 
 
+class FetchTruncation(unittest.TestCase):
+    """v5's `trunc_counts` / `depth_p50` -- the unbiased half of the
+    truncation question. The same two facts are on every Event, but the event
+    stream is sampled (ShouldRecord keeps misses and promotions and only 1 in
+    `sample_ok` plain successes), so a share computed from it is biased toward
+    the hard cases -- the ones carrying least context."""
+
+    def test_trunc_counts_are_flattened_into_their_own_table(self):
+        db = load_all(events=[], stats=[
+            {"v": 5, "type": "stats", "ts": "t1", "segments": 100, "llm_acted": 80,
+             "trunc_counts": {"screen": 60, "full": 30, "unknown": 10},
+             "depth_p50": 3.0, "depth_p95": 6.0},
+            {"v": 5, "type": "stats", "ts": "t2", "segments": 50, "llm_acted": 40,
+             "trunc_counts": {"screen": 40, "full": 10},
+             "depth_p50": 2.0, "depth_p95": 5.0},
+        ])
+        rows = dict(db.execute(
+            "SELECT kind, SUM(count) FROM trunc GROUP BY kind").fetchall())
+        self.assertEqual(rows, {"screen": 100, "full": 40, "unknown": 10})
+
+    def test_the_depth_travels_on_the_stats_row(self):
+        db = load_all(events=[], stats=[
+            {"v": 5, "type": "stats", "ts": "t", "segments": 10, "llm_acted": 8,
+             "trunc_counts": {"screen": 10}, "depth_p50": 3.0, "depth_p95": 6.0},
+        ])
+        row = db.execute("SELECT depth_p50, depth_p95 FROM stats").fetchone()
+        self.assertEqual((row["depth_p50"], row["depth_p95"]), (3.0, 6.0))
+
+    def test_a_v4_line_loads_unchanged_and_reports_no_depth(self):
+        # Files outlive the code that wrote them: a machine on an older dylib
+        # keeps writing v4, and its lines must still count toward `segments`.
+        db = load_all(events=[], stats=[
+            {"v": 4, "type": "stats", "ts": "t", "segments": 10, "llm_acted": 8,
+             "skip_counts": {"cold": 2}, "us_p50": 4.0, "us_p95": 11.0},
+        ])
+        row = db.execute("SELECT segments, depth_p50 FROM stats").fetchone()
+        self.assertEqual(row["segments"], 10)
+        self.assertIsNone(row["depth_p50"])
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM trunc").fetchone()[0], 0)
+
+    def test_a_malformed_trunc_counts_is_rejected_whole(self):
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.executescript(analyze.SCHEMA)
+        with self.assertRaises(ValueError):
+            analyze._load_stats_line(db, {
+                "v": 5, "type": "stats", "ts": "t", "segments": 10, "llm_acted": 8,
+                "trunc_counts": {"screen": 10, "full": "lots"}})
+        # Nothing half-written: the `stats` row must not survive a
+        # trunc_counts entry that failed validation, exactly as skip_counts
+        # already guarantees -- the caller catches the exception and has no
+        # transaction to roll back.
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM stats").fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM trunc").fetchone()[0], 0)
+
+
+    def test_the_section_prints_against_a_plain_tuple_connection(self):
+        """`load()` leaves the default row_factory; load_all() above sets
+        sqlite3.Row. A report that indexes rows by name passes every test here
+        and crashes on the first real file, which is how this test came to
+        exist -- caught by running the tool, not by running the suite."""
+        db = sqlite3.connect(":memory:")  # deliberately NO row_factory
+        db.executescript(analyze.SCHEMA)
+        analyze._load_stats_line(db, {
+            "v": 5, "type": "stats", "ts": "t", "segments": 100, "llm_acted": 80,
+            "trunc_counts": {"screen": 60, "full": 40},
+            "depth_p50": 3.0, "depth_p95": 6.0})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_fetch_truncation(db)
+        out = buf.getvalue()
+        self.assertIn("screen", out)
+        self.assertIn("3.0", out)
+
+    def test_no_depth_says_so_rather_than_printing_a_zero(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        analyze._load_stats_line(db, {
+            "v": 5, "type": "stats", "ts": "t", "segments": 10, "llm_acted": 8,
+            "trunc_counts": {"full": 10}})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_fetch_truncation(db)
+        self.assertIn("not reported", buf.getvalue())
+
+
 class SchemaVersionDrift(unittest.TestCase):
     """The analyser's idea of `current` has to be the plugin's. A hand-kept
     copy that drifts would report every machine as stale, or none."""

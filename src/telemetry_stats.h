@@ -49,11 +49,17 @@ class StatsAccumulator {
   // trace increments no skip bucket: which of the eight reasons applies is
   // not recoverable from "no trace at all", and guessing would misattribute
   // exactly the way rerank_trace.h's header comment warns against.
+  //
+  // Every non-null trace ALSO feeds the surrounding-fetch counters, whatever
+  // the LLM did with it: how the fetch was truncated is a property of the
+  // frontend, not of the scorer, and a segment the model skipped had its
+  // context fetched all the same. See ObserveFetch.
   void Observe(const RerankTrace* trace) {
     ++segments_;
     if (!trace) {
       return;
     }
+    ObserveFetch(*trace);
     if (trace->llm_skip == llm_rerank::SkipReason::kNone) {
       ++llm_acted_;
       if (trace->llm.us >= 0) {
@@ -77,6 +83,15 @@ class StatsAccumulator {
     s.skip_counts = skip_counts_;
     s.us_p50 = Percentile(us_samples_, 0.5);
     s.us_p95 = Percentile(us_samples_, 0.95);
+    s.trunc_counts = trunc_counts_;
+    // Left at StatsLine's negative default when nothing was cut short by the
+    // environment: Percentile() answers 0.0 for an empty vector, and a 0 here
+    // would read as "the source reached no characters at all", which is a
+    // real and very different finding. See StatsLine's field comment.
+    if (!depth_samples_.empty()) {
+      s.depth_p50 = Percentile(depth_samples_, 0.5);
+      s.depth_p95 = Percentile(depth_samples_, 0.95);
+    }
     return s;
   }
 
@@ -85,15 +100,41 @@ class StatsAccumulator {
     llm_acted_ = 0;
     skip_counts_.clear();
     us_samples_.clear();
+    trunc_counts_.clear();
+    depth_samples_.clear();
   }
 
   int64_t segments() const { return segments_; }
 
  private:
+  // Why this segment's surrounding fetch stopped, and -- only when it stopped
+  // because the environment ran out -- how deep it had got.
+  //
+  // kUnknown counts as "unknown" rather than being dropped: it is the honest
+  // answer for the IME Bridge (imk_client.h), and a window that is mostly
+  // unknown means the question cannot be answered from that data at all,
+  // which has to be visible rather than quietly missing from the denominator.
+  //
+  // The depth sample is conditional on kByScreen/kByApp for the reason
+  // StatsLine's `depth_p50` comment gives: the other three truncations carry
+  // a depth that is not a limit. A trace that reported a truncation but no
+  // depth (-1) still counts its bucket; only its depth is missing, and
+  // pushing the -1 would report a fetch that reached nothing.
+  void ObserveFetch(const RerankTrace& trace) {
+    ++trunc_counts_[TruncationName(trace.truncation)];
+    const bool cut_short =
+        trace.truncation == Truncation::kByScreen || trace.truncation == Truncation::kByApp;
+    if (cut_short && trace.before_depth >= 0) {
+      depth_samples_.push_back(trace.before_depth);
+    }
+  }
+
   int64_t segments_ = 0;
   int64_t llm_acted_ = 0;
   std::map<std::string, int64_t> skip_counts_;
   std::vector<int64_t> us_samples_;
+  std::map<std::string, int64_t> trunc_counts_;
+  std::vector<int64_t> depth_samples_;
 };
 
 }  // namespace telemetry

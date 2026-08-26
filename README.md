@@ -513,6 +513,21 @@ warm cache is cold, so warm-hit rate is derived as
 `llm_acted / (llm_acted + skip_counts["cold"])`, which `analyze_telemetry.py`
 computes for you.
 
+The stats line also carries `trunc_counts` — why the surrounding fetch stopped
+(`full`/`config`/`app`/`screen`/`unknown`), over every segment — and
+`depth_p50`/`depth_p95`, how deep it got, over **only** the fetches the
+environment cut short (`screen`/`app`). The other three truncations carry a
+depth that is not a limit: `config`'s is the configured cap, `full`'s is an
+input region that ended on its own, and `unknown`'s is whatever a source that
+cannot say returned. The depth pair is omitted entirely when a window saw no
+such fetch, so a reported `0` always means the source really reached nothing.
+
+Every Event carries the same two facts per segment (`trunc`, `before_depth`),
+and those are the ones to join back to a specific commit — but the event
+stream is sampled, so a `screen` share computed from it is biased toward short
+requests, which are exactly the ones most likely to be truncated. Quote the
+stats line for the share; quote the events only for shape.
+
 **Privacy.** The `ctx` field is Han characters only, by construction:
 `TrailingCjkRun` stops at the first non-Han character, so an ASCII secret on
 screen yields an empty context and re-ranking does not even run. But the

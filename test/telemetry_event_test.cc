@@ -108,7 +108,7 @@ TEST(SerializeJsonl, OmitsTheLlmRecordWhenAbsent) {
 TEST(SerializeJsonl, SchemaVersionIsFour) {
   Event e;
   e.ts = "t";
-  EXPECT_NE(SerializeJsonl(e).find("\"v\":4"), std::string::npos);
+  EXPECT_NE(SerializeJsonl(e).find("\"v\":5"), std::string::npos);
 }
 
 // The per-event stream only records hard cases (ShouldRecord), which is right
@@ -126,7 +126,7 @@ TEST(SerializeStatsJsonl, CarriesCountersAndItsOwnType) {
   EXPECT_NE(line.find("\"type\":\"stats\""), std::string::npos);
   EXPECT_NE(line.find("\"llm_acted\":5310"), std::string::npos);
   EXPECT_NE(line.find("\"cold\":519"), std::string::npos);
-  EXPECT_NE(line.find("\"v\":4"), std::string::npos);
+  EXPECT_NE(line.find("\"v\":5"), std::string::npos);
 }
 
 // No stored `warm_hit`: under the fallback chain kCold and kNone are mutually
@@ -140,6 +140,34 @@ TEST(SerializeStatsJsonl, HasNoWarmHitField) {
   s.llm_acted = 1;
   s.skip_counts["cold"] = 1;
   EXPECT_EQ(SerializeStatsJsonl(s).find("warm_hit"), std::string::npos);
+}
+
+// v5. The unbiased half of the truncation question: `trunc` on an Event is
+// sampled (ShouldRecord), these counters see every segment.
+TEST(SerializeStatsJsonl, CarriesWhyEachFetchStoppedAndHowDeepTheTruncatedOnesGot) {
+  StatsLine s;
+  s.ts = "t";
+  s.trunc_counts["screen"] = 812;
+  s.trunc_counts["full"] = 240;
+  s.depth_p50 = 3.0;
+  s.depth_p95 = 6.0;
+  const std::string line = SerializeStatsJsonl(s);
+  EXPECT_NE(line.find("\"screen\":812"), std::string::npos);
+  EXPECT_NE(line.find("\"depth_p50\":3.0"), std::string::npos);
+  EXPECT_NE(line.find("\"depth_p95\":6.0"), std::string::npos);
+}
+
+// A window with no environment-truncated fetch OMITS the depth rather than
+// writing 0.0, so "nothing ran out" and "everything ran out at zero
+// characters" stay distinguishable -- the same choice Event makes for
+// `before_depth`/`trunc`, and what lets a reader trust a depth of 0.
+TEST(SerializeStatsJsonl, OmitsTheDepthWhenNothingWasTruncatedByTheEnvironment) {
+  StatsLine s;
+  s.ts = "t";
+  s.trunc_counts["full"] = 12;
+  const std::string line = SerializeStatsJsonl(s);
+  EXPECT_EQ(line.find("depth_p50"), std::string::npos);
+  EXPECT_EQ(line.find("depth_p95"), std::string::npos);
 }
 
 // A decline must carry what the model wanted. This is the `nali` case from
@@ -163,7 +191,7 @@ TEST(SerializeJsonl, CarriesTheModelsPickWhenNothingWasPromoted) {
   e.llm = llm;
 
   const auto j = nlohmann::json::parse(SerializeJsonl(e));
-  EXPECT_EQ(j["v"], 4);
+  EXPECT_EQ(j["v"], 5);
   EXPECT_EQ(j["llm"]["best"], "那里");
   EXPECT_EQ(j["llm"]["best_from"], 1);
   EXPECT_EQ(j["llm"]["text"], "");  // nothing was promoted
@@ -268,7 +296,7 @@ TEST(TelemetryEvent, SerializesFetchDepthAndTruncation) {
   e.trunc = "config";
 
   auto j = nlohmann::json::parse(SerializeJsonl(e));
-  EXPECT_EQ(j["v"], 4);
+  EXPECT_EQ(j["v"], 5);
   EXPECT_EQ(j["before_depth"], 17);
   EXPECT_EQ(j["trunc"], "config");
 }

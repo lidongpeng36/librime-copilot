@@ -27,6 +27,19 @@ RerankTrace SkippedTrace(llm_rerank::SkipReason reason) {
   return t;
 }
 
+// A trace whose surrounding fetch reached `before_depth` characters and
+// stopped for `truncation`. Every real source sets the two together
+// (tmux_source_util.h:606-611, ime_bridge.cc:593-598).
+RerankTrace FetchTrace(int before_depth, Truncation truncation) {
+  RerankTrace t;
+  t.valid = true;
+  t.llm_skip = llm_rerank::SkipReason::kNone;
+  t.llm.us = 1000;
+  t.before_depth = before_depth;
+  t.truncation = truncation;
+  return t;
+}
+
 }  // namespace
 
 TEST(Percentile, MatchesCompareRerankPysDefinition) {
@@ -139,4 +152,125 @@ TEST(StatsAccumulator, ASegmentThatWasNeverScoredIsNeitherActedNorTimed) {
   EXPECT_EQ(s.llm_acted, 1);
   EXPECT_EQ(s.skip_counts.at("noctx"), 1);
   EXPECT_DOUBLE_EQ(s.us_p50, 7000.0);  // the un-scored segment contributed no 0
+}
+
+// --- how deep the surrounding fetch reached, and why it stopped -------------
+//
+// These exist because `before_depth`/`trunc` on Event are SAMPLED: ShouldRecord
+// keeps every miss and promotion but only 1 in `sample_ok` plain successes, so
+// a truncation distribution computed from the event stream is biased toward
+// hard cases. The stats line observes every segment, which is the only
+// unbiased place this can live.
+
+TEST(StatsAccumulator, CountsWhyEachFetchStopped) {
+  StatsAccumulator acc;
+  RerankTrace screen1 = FetchTrace(3, Truncation::kByScreen);
+  RerankTrace screen2 = FetchTrace(2, Truncation::kByScreen);
+  RerankTrace full = FetchTrace(5, Truncation::kFull);
+  acc.Observe(&screen1);
+  acc.Observe(&screen2);
+  acc.Observe(&full);
+  const auto s = acc.Snapshot("t");
+  EXPECT_EQ(s.trunc_counts.at("screen"), 2);
+  EXPECT_EQ(s.trunc_counts.at("full"), 1);
+}
+
+// kUnknown gets a bucket rather than being dropped. It is the honest answer
+// for the IME Bridge (imk_client.h), and a window that is mostly "unknown"
+// means the truncation question cannot be answered from that data at all --
+// which has to be visible, not silently missing from the denominator.
+TEST(StatsAccumulator, AnUnknownTruncationIsItsOwnBucketNotASilentDrop) {
+  StatsAccumulator acc;
+  RerankTrace t = FetchTrace(8, Truncation::kUnknown);
+  acc.Observe(&t);
+  EXPECT_EQ(acc.Snapshot("t").trunc_counts.at("unknown"), 1);
+}
+
+// The same rule skip_counts follows: which of the five answers applies is not
+// recoverable from "no trace at all", and guessing would misattribute.
+TEST(StatsAccumulator, NullTraceCountsNoTruncationBucket) {
+  StatsAccumulator acc;
+  acc.Observe(nullptr);
+  EXPECT_TRUE(acc.Snapshot("t").trunc_counts.empty());
+}
+
+// The depth summary answers exactly one question -- "when the source ran out,
+// how deep did it get" -- so only the two truncations that MEAN "ran out"
+// feed it. kByConfig's depth is the configured cap (a constant, no
+// information); kFull's is the length of an input region that ended on its
+// own, which is not a limit at all. Mixing either in would report a ceiling
+// that is not one.
+TEST(StatsAccumulator, OnlyAnEnvironmentTruncatedFetchFeedsTheDepthSummary) {
+  StatsAccumulator acc;
+  RerankTrace screen = FetchTrace(3, Truncation::kByScreen);
+  RerankTrace app = FetchTrace(3, Truncation::kByApp);
+  RerankTrace config = FetchTrace(8, Truncation::kByConfig);
+  RerankTrace full = FetchTrace(7, Truncation::kFull);
+  RerankTrace unknown = FetchTrace(8, Truncation::kUnknown);
+  acc.Observe(&screen);
+  acc.Observe(&app);
+  acc.Observe(&config);
+  acc.Observe(&full);
+  acc.Observe(&unknown);
+  const auto s = acc.Snapshot("t");
+  EXPECT_DOUBLE_EQ(s.depth_p50, 3.0);  // only the two 3s
+  EXPECT_DOUBLE_EQ(s.depth_p95, 3.0);
+}
+
+TEST(StatsAccumulator, DepthPercentilesUseTheSameDefinitionAsTheLatencyOnes) {
+  StatsAccumulator acc;
+  std::vector<RerankTrace> traces;
+  for (int d : {1, 2, 3, 4, 5}) {
+    traces.push_back(FetchTrace(d, Truncation::kByScreen));
+  }
+  for (auto& t : traces) {
+    acc.Observe(&t);
+  }
+  const auto s = acc.Snapshot("t");
+  EXPECT_DOUBLE_EQ(s.depth_p50, 3.0);  // idx = min(4, floor(5*0.5)) = 2
+  EXPECT_DOUBLE_EQ(s.depth_p95, 5.0);  // idx = min(4, floor(5*0.95)) = 4
+}
+
+// Negative is "no environment-truncated fetch was measured in this window",
+// which is a different fact from a window where the source reached zero
+// characters every time -- the same distinction Event::before_depth's -1
+// draws, and the reason the serializer omits the field rather than writing 0.
+TEST(StatsAccumulator, NoTruncatedFetchLeavesTheDepthUnreported) {
+  StatsAccumulator acc;
+  RerankTrace full = FetchTrace(7, Truncation::kFull);
+  acc.Observe(&full);
+  const auto s = acc.Snapshot("t");
+  EXPECT_LT(s.depth_p50, 0.0);
+  EXPECT_LT(s.depth_p95, 0.0);
+}
+
+TEST(StatsAccumulator, AMeasuredZeroIsASampleNotAnAbsence) {
+  StatsAccumulator acc;
+  RerankTrace screen = FetchTrace(0, Truncation::kByScreen);
+  acc.Observe(&screen);
+  EXPECT_DOUBLE_EQ(acc.Snapshot("t").depth_p50, 0.0);
+}
+
+// A source that reported a truncation but no depth still counts as that
+// truncation. Only the depth is missing, and a -1 must not be averaged in as
+// if the fetch had reached nothing.
+TEST(StatsAccumulator, AnUnmeasuredDepthIsNotCountedAsZero) {
+  StatsAccumulator acc;
+  RerankTrace unmeasured = FetchTrace(-1, Truncation::kByScreen);
+  RerankTrace measured = FetchTrace(4, Truncation::kByScreen);
+  acc.Observe(&unmeasured);
+  acc.Observe(&measured);
+  const auto s = acc.Snapshot("t");
+  EXPECT_EQ(s.trunc_counts.at("screen"), 2);
+  EXPECT_DOUBLE_EQ(s.depth_p50, 4.0);
+}
+
+TEST(StatsAccumulator, ResetClearsTheTruncationCountsAndTheDepth) {
+  StatsAccumulator acc;
+  RerankTrace screen = FetchTrace(3, Truncation::kByScreen);
+  acc.Observe(&screen);
+  acc.Reset();
+  const auto s = acc.Snapshot("t");
+  EXPECT_TRUE(s.trunc_counts.empty());
+  EXPECT_LT(s.depth_p50, 0.0);
 }

@@ -37,7 +37,13 @@ namespace telemetry {
 // a line whose trace carried no measurement, so a v3 reader loses nothing and a
 // v4 reader can tell "not measured" from "measured zero". A v3 line carries
 // neither and must keep loading unchanged under a v4 reader.
-inline constexpr int kSchemaVersion = 4;
+//
+// v5 adds `trunc_counts` and `depth_p50`/`depth_p95` to StatsLine: the same
+// two facts v4 put on Event, but over EVERY segment rather than the sampled
+// subset ShouldRecord keeps. v4's Event fields are unchanged and still the
+// only place either fact can be joined back to the segment it came from. A
+// v4 line carries neither and must keep loading unchanged under a v5 reader.
+inline constexpr int kSchemaVersion = 5;
 
 // What the re-ranking filter decided for one segment.
 struct RerankRecord {
@@ -140,6 +146,35 @@ struct StatsLine {
   double us_p95 = 0.0;                         // LlmRecord::us measures -- p95 rather than the p90
                                                // the offline measurement used, since a live stats
                                                // line should watch the worse tail, not repeat it
+  // TruncationName() -> count, over every segment whose trace carried one,
+  // "unknown" included. Event::trunc says the same thing per segment but is
+  // SAMPLED: ShouldRecord keeps every miss and promotion and only 1 in
+  // `sample_ok` plain successes, so the share of kByScreen computed from the
+  // event stream is biased toward hard cases -- the ones carrying least
+  // context. This is the unbiased denominator, and it is what decides whether
+  // stripping tmux chrome (the one surrounding-context change with a measured
+  // gain) is worth building. Segments with no trace at all count here in
+  // nothing, exactly as they count in no skip bucket, so the sum is <=
+  // `segments`.
+  //
+  // The unit is the segment, not the fetch: one fetch serves every segment of
+  // a commit, and the measured gain (+2.47 points) is per segment, so
+  // segment-weighting is what says how much typing the change would reach.
+  std::map<std::string, int64_t> trunc_counts;
+  // How deep the fetch got, over ONLY the fetches the environment cut short
+  // -- kByScreen and kByApp. The other three answers carry a depth that is
+  // not a limit: kByConfig's is the configured cap (a constant), kFull's is
+  // the length of an input region that ended on its own, and kUnknown's is
+  // whatever a source that cannot say happened to return. Averaging them
+  // together would report a ceiling that is not one, which is the whole
+  // reason this is a conditional summary rather than a marginal histogram.
+  //
+  // Negative means no such fetch was measured in this window -- distinct from
+  // a window where the source reached zero characters every time, and the
+  // reason SerializeStatsJsonl omits the field rather than writing 0.0. Same
+  // convention as Event::before_depth's -1.
+  double depth_p50 = -1.0;
+  double depth_p95 = -1.0;
 };
 
 // Whether this segment is worth a line at all.
@@ -257,6 +292,18 @@ inline std::string SerializeStatsJsonl(const StatsLine& s) {
   j["skip_counts"] = std::move(skip);
   j["us_p50"] = s.us_p50;
   j["us_p95"] = s.us_p95;
+  nlohmann::ordered_json trunc;
+  for (const auto& [reason, count] : s.trunc_counts) {
+    trunc[reason] = count;
+  }
+  j["trunc_counts"] = std::move(trunc);
+  // Omitted, not zeroed, when the window saw no environment-truncated fetch:
+  // see StatsLine's field comment. Both move together -- they come from one
+  // sample vector, so one present and the other absent is not a state.
+  if (s.depth_p50 >= 0.0) {
+    j["depth_p50"] = s.depth_p50;
+    j["depth_p95"] = s.depth_p95;
+  }
   return j.dump();
 }
 
