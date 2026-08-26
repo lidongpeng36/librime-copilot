@@ -262,3 +262,101 @@ TEST(ClampOptions, BoundsTheSuccessSamplingRate) {
   ClampOptions(o);
   EXPECT_EQ(o.sample_ok, 10000);
 }
+
+// --- auto-sync into Rime's sync directory -----------------------------------
+
+TEST(TelemetrySync, ShouldSyncOnlyOnceTheIntervalHasPassed) {
+  EXPECT_FALSE(ShouldSync(1000, 1000 + 1799, 1800));
+  EXPECT_TRUE(ShouldSync(1000, 1000 + 1800, 1800));
+  EXPECT_TRUE(ShouldSync(1000, 1000 + 9999, 1800));
+}
+
+// Same rule the stats flush uses (copilot.cc): a zero opens the first window
+// rather than firing immediately, so a session that dies young does not copy on
+// its way past. The destructor is what covers a short session.
+TEST(TelemetrySync, AZeroOpensTheWindowRatherThanFiring) {
+  EXPECT_FALSE(ShouldSync(0, 999999, 1800));
+}
+
+// A clock that jumped backwards (NTP, a timezone change while suspended) must
+// not wedge the sync off until it catches up.
+TEST(TelemetrySync, ABackwardClockSyncs) { EXPECT_TRUE(ShouldSync(9999, 1000, 1800)); }
+
+TEST(TelemetrySync, CopiesTheLiveFileAndEveryArchive) {
+  fs::path src = FreshDir("sync_src");
+  fs::path dest = FreshDir("sync_dest");
+  std::ofstream(src / "m.jsonl") << "live\n";
+  std::ofstream(src / "m.jsonl.1") << "older\n";
+  std::ofstream(src / "m.jsonl.2") << "oldest\n";
+
+  EXPECT_EQ(3, SyncToDir(src, dest, "m", 3));
+  EXPECT_EQ(std::vector<std::string>{"live"}, ReadLines(dest / "m.jsonl"));
+  EXPECT_EQ(std::vector<std::string>{"older"}, ReadLines(dest / "m.jsonl.1"));
+  EXPECT_EQ(std::vector<std::string>{"oldest"}, ReadLines(dest / "m.jsonl.2"));
+}
+
+// Only this machine's own files. The destination holds every machine's
+// telemetry, and copying by glob would let a file that arrived over iCloud be
+// copied back out again.
+TEST(TelemetrySync, LeavesOtherMachinesFilesAlone) {
+  fs::path src = FreshDir("sync_mine_src");
+  fs::path dest = FreshDir("sync_mine_dest");
+  std::ofstream(src / "mine.jsonl") << "mine\n";
+  std::ofstream(src / "theirs.jsonl") << "theirs\n";
+  std::ofstream(dest / "theirs.jsonl") << "theirs, already here\n";
+
+  EXPECT_EQ(1, SyncToDir(src, dest, "mine", 2));
+  EXPECT_TRUE(fs::exists(dest / "mine.jsonl"));
+  EXPECT_EQ(std::vector<std::string>{"theirs, already here"}, ReadLines(dest / "theirs.jsonl"));
+}
+
+TEST(TelemetrySync, OverwritesAStaleDestination) {
+  fs::path src = FreshDir("sync_stale_src");
+  fs::path dest = FreshDir("sync_stale_dest");
+  std::ofstream(dest / "m.jsonl") << "yesterday\n";
+  std::ofstream(src / "m.jsonl") << "today\n";
+
+  EXPECT_EQ(1, SyncToDir(src, dest, "m", 2));
+  EXPECT_EQ(std::vector<std::string>{"today"}, ReadLines(dest / "m.jsonl"));
+}
+
+// The copy is atomic: a reader on another machine, reaching this file through
+// iCloud while it is being replaced, must never see half of it. Written to a
+// temp name and renamed, so no leftover may survive a successful sync.
+TEST(TelemetrySync, LeavesNoTemporaryFileBehind) {
+  fs::path src = FreshDir("sync_tmp_src");
+  fs::path dest = FreshDir("sync_tmp_dest");
+  std::ofstream(src / "m.jsonl") << "line\n";
+
+  EXPECT_EQ(1, SyncToDir(src, dest, "m", 2));
+  for (const auto& entry : fs::directory_iterator(dest)) {
+    EXPECT_EQ(".jsonl", entry.path().extension().string()) << entry.path();
+  }
+}
+
+TEST(TelemetrySync, CreatesTheDestinationDirectory) {
+  fs::path src = FreshDir("sync_mkdir_src");
+  fs::path dest = fs::path(::testing::TempDir()) / "copilot_telemetry_sync_mkdir" / "nested";
+  fs::remove_all(dest.parent_path());
+  std::ofstream(src / "m.jsonl") << "line\n";
+
+  EXPECT_EQ(1, SyncToDir(src, dest, "m", 2));
+  EXPECT_TRUE(fs::exists(dest / "m.jsonl"));
+}
+
+// Nothing recorded yet, or an archive index never reached: not an error, just
+// nothing to do. Telemetry must never break input.
+TEST(TelemetrySync, AnAbsentSourceCopiesNothingAndDoesNotThrow) {
+  fs::path src = FreshDir("sync_absent_src");
+  fs::path dest = FreshDir("sync_absent_dest");
+  EXPECT_EQ(0, SyncToDir(src, dest, "m", 2));
+  EXPECT_TRUE(fs::is_empty(dest));
+}
+
+// An unset `sync_dir` is the common case -- Squirrel never writes one. Refusing
+// is correct; writing into the current directory would not be.
+TEST(TelemetrySync, AnEmptyDestinationIsRefused) {
+  fs::path src = FreshDir("sync_nodest_src");
+  std::ofstream(src / "m.jsonl") << "line\n";
+  EXPECT_EQ(0, SyncToDir(src, fs::path(), "m", 2));
+}

@@ -87,6 +87,7 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
     }
     config->GetInt("copilot/telemetry/keep_generations", &telemetry_options_.keep_generations);
     config->GetInt("copilot/telemetry/sample_ok", &telemetry_options_.sample_ok);
+    config->GetBool("copilot/telemetry/auto_sync", &telemetry_options_.auto_sync);
     telemetry::ClampOptions(telemetry_options_);
 
     config->GetBool("copilot/use_surrounding_context", &use_surrounding_context_);
@@ -222,6 +223,13 @@ Copilot::~Copilot() {
   // a short session that never crosses kStatsFlushIntervalSec would
   // otherwise report nothing at all.
   FlushStatsIfAny();
+  // After the flush, never before: the stats line it just wrote belongs in
+  // the copy. Unconditional at session end for the same reason the flush is
+  // -- a session shorter than kTelemetrySyncIntervalSec would otherwise ship
+  // nothing at all, and schema redeploy ends one of these on every deploy.
+  if (telemetry_options_.auto_sync) {
+    SyncTelemetry();
+  }
   // The monitor is a process-wide singleton: leaving the `this`-capturing
   // callback registered means the next plug/unplug writes into freed memory
   // (this processor dies on every schema redeploy) -- same hazard and same
@@ -592,9 +600,47 @@ void Copilot::EmitCommitTelemetry(Context* ctx, bool selection_commit) {
     }
   }
 
+  if (telemetry_options_.auto_sync) {
+    const std::time_t now = std::time(nullptr);
+    if (last_telemetry_sync_ == 0) {
+      last_telemetry_sync_ = now;  // open the first window rather than firing immediately
+    } else if (telemetry::ShouldSync(last_telemetry_sync_, now, kTelemetrySyncIntervalSec)) {
+      SyncTelemetry();
+      last_telemetry_sync_ = now;
+    }
+  }
+
   if (rerank_traces_) {
     rerank_traces_->Clear();
   }
+}
+
+void Copilot::SyncTelemetry() {
+  if (!telemetry_ || !telemetry_options_.enable) {
+    return;
+  }
+  // The same deployer copilot.cc already takes user_id from, and the same
+  // field tools/sync_telemetry.sh parses out of installation.yaml -- read
+  // directly, so nothing here parses YAML.
+  const auto& sync_dir = Service::instance().deployer().sync_dir;
+  if (sync_dir.empty()) {
+    // Once per process: this runs on a timer, so a line per commit would be
+    // noise nobody reads. Not silent, though -- an unset sync_dir is the
+    // likely state and looks exactly like a working install from outside.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      LOG(ERROR) << "[copilot] telemetry auto_sync is on but sync_dir is unset; add "
+                    "`sync_dir: \"/path/to/sync\"` to installation.yaml -- Squirrel never "
+                    "writes one";
+    }
+    return;
+  }
+  // Flat under the sync dir, exactly where tools/sync_telemetry.sh puts it,
+  // and deliberately NOT under <sync_dir>/<installation_id>/, which Rime's
+  // own sync task manages.
+  const int copied = telemetry_->SyncTo(sync_dir / "copilot_telemetry");
+  DLOG(INFO) << "[copilot] telemetry: synced " << copied << " file(s) to " << sync_dir;
 }
 
 void Copilot::FlushStatsIfAny() {
@@ -628,6 +674,7 @@ Copilot* CopilotComponent::Create(const Ticket& ticket) {
       }
       config->GetInt("copilot/telemetry/keep_generations", &telemetry_options.keep_generations);
       config->GetInt("copilot/telemetry/sample_ok", &telemetry_options.sample_ok);
+      config->GetBool("copilot/telemetry/auto_sync", &telemetry_options.auto_sync);
     }
   }
   telemetry::ClampOptions(telemetry_options);

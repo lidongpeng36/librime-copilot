@@ -2,10 +2,19 @@
 # Copy this machine's telemetry into the Rime sync directory, where iCloud
 # picks it up and every other machine can read it.
 #
-# Deliberately not done by the plugin: appending inside an iCloud directory
-# would re-upload the file on every keystroke, and iCloud may evict a file it
-# considers cold. Run this when you are about to analyse, or from a launchd
-# job if you get tired of running it.
+# The plugin can now do this itself -- `copilot/telemetry/auto_sync: true`,
+# every 30 minutes plus once at session end (src/telemetry.h, SyncToDir). This
+# script stays the manual path, and is what to reach for when auto_sync is off
+# or when you want the copy to happen exactly now.
+#
+# Only half of the original objection to doing it in the plugin has died. It
+# was: appending inside an iCloud directory would re-upload the file on every
+# keystroke, and iCloud may evict a file it considers cold. That still stands,
+# and auto_sync does not violate it -- the append stays in the local
+# private/ directory and only a periodic whole-file copy reaches this
+# destination. What changed is the assumption that a manual step would be
+# run: a copy nobody remembers to make is days stale exactly when someone
+# comes to analyse it.
 set -eu
 
 RIME_DIR="${RIME_DIR:-$HOME/Library/Rime}"

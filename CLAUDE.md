@@ -885,6 +885,7 @@ other**, and most changes touch more than one:
 | `*.custom.yaml`, the lexicon, `dict.json`, `private.dict.yaml` + `private/personal.dict.yaml`, the model | the vault, via `backup` / `restore` |
 | the **user dictionary** (`private.userdb`) | Rime's own user-data sync, from Squirrel's menu — NOT the vault |
 | the design records (`docs/superpowers/`) | iCloud, plus a symlink made by hand |
+| the **telemetry** (`private/copilot_telemetry/`) | `<sync_dir>/copilot_telemetry/` — `tools/sync_telemetry.sh` by hand, or `copilot/telemetry/auto_sync: true` on a 30-min timer. NOT the vault, and never merged: one file per machine, so collecting is concatenation |
 
 The user dictionary is the one people get wrong, because it has its own
 channel and its own precondition: syncing brings the merged history down, but

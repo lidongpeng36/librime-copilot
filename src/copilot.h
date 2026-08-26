@@ -82,6 +82,13 @@ class Copilot : public Processor {
   // config is read elsewhere.
   void FlushStatsIfAny();
 
+  // Copies this machine's telemetry into Rime's sync directory
+  // (telemetry::Writer::SyncTo). A no-op when telemetry is off; loud, once,
+  // when `sync_dir` is unset -- that is the likely state, not the odd one,
+  // since Squirrel never writes one, and a feature that silently does
+  // nothing for a week is exactly what auto-sync exists to prevent.
+  void SyncTelemetry();
+
   enum Action { kUnspecified, kSelect, kDelete, kSpecial };
   Action last_action_ = kUnspecified;
   bool self_updating_ = false;
@@ -116,6 +123,15 @@ class Copilot : public Processor {
   // enough that this is a rare Write() call, not a periodic timer thread --
   // there is no new mechanism here, only a check piggybacked on OnCommit.
   static constexpr std::time_t kStatsFlushIntervalSec = 300;
+  // Same shape and the same zero convention as last_stats_flush_ above, for
+  // copilot/telemetry/auto_sync. Not a thread: the file measured 8.5 KB over
+  // two days against an 8 MB cap, so the copy is microseconds -- there is no
+  // new mechanism here either, only a second check piggybacked on OnCommit.
+  std::time_t last_telemetry_sync_ = 0;
+  // 30 minutes. Longer than the stats flush because the unit of work is a
+  // whole-file copy into an iCloud-backed directory rather than an append,
+  // and because nothing downstream reads it sooner than a person does.
+  static constexpr std::time_t kTelemetrySyncIntervalSec = 1800;
 
   int last_keycode_ = 0;
   bool use_surrounding_context_ = true;

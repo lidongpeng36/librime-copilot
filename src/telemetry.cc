@@ -25,6 +25,73 @@ bool ShouldRotate(int64_t current_size, int64_t pending_bytes, int64_t max_bytes
   return current_size + pending_bytes > max_bytes;
 }
 
+bool ShouldSync(std::time_t last_sync, std::time_t now, std::time_t interval_sec) {
+  if (last_sync == 0) {
+    return false;  // open the first window rather than firing immediately
+  }
+  if (now < last_sync) {
+    return true;  // the clock went backwards; sync now rather than wedge
+  }
+  return now - last_sync >= interval_sec;
+}
+
+namespace {
+
+// Copies one file whole, through a temporary name in the DESTINATION
+// directory -- same filesystem, so the rename that follows is atomic and a
+// reader on another machine never sees a partial file. False when the source
+// is absent (nothing recorded at this index: not an error) or the copy
+// failed.
+bool CopyAtomically(const std::filesystem::path& src, const std::filesystem::path& dest) {
+  std::error_code ec;
+  if (!std::filesystem::exists(src, ec) || ec) {
+    return false;
+  }
+  // The pid is in the name because a Copilot processor exists per schema and
+  // each syncs on its own timer: two of them sharing one temp file could
+  // rename a half-written copy into place, which is the exact failure the
+  // temp-and-rename is here to prevent.
+  const std::filesystem::path tmp =
+      dest.string() + ".tmp" + std::to_string(static_cast<long>(::getpid()));
+  std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
+  if (ec) {
+    std::filesystem::remove(tmp, ec);
+    return false;
+  }
+  std::filesystem::rename(tmp, dest, ec);
+  if (ec) {
+    // Leave nothing behind: the destination is a shared directory, and a
+    // stray `.tmp<pid>` there outlives the process that made it.
+    std::filesystem::remove(tmp, ec);
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+int SyncToDir(const std::filesystem::path& src_dir, const std::filesystem::path& dest_dir,
+              const std::string& machine, int keep_generations) {
+  if (dest_dir.empty()) {
+    return 0;  // an unset sync_dir; see the header
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(dest_dir, ec);
+
+  // Every name Rotate() can produce, enumerated -- keep_generations counts the
+  // live file, so the highest archive index is keep_generations - 1. Never a
+  // directory scan: see the header.
+  const std::string name = machine + ".jsonl";
+  int copied = 0;
+  for (int i = 0; i < std::max(keep_generations, 1); ++i) {
+    const std::string suffix = i == 0 ? std::string() : "." + std::to_string(i);
+    if (CopyAtomically(src_dir / (name + suffix), dest_dir / (name + suffix))) {
+      ++copied;
+    }
+  }
+  return copied;
+}
+
 std::string FormatTimestamp(std::time_t t) {
   std::tm tm{};
   localtime_r(&t, &tm);
@@ -36,9 +103,13 @@ std::string FormatTimestamp(std::time_t t) {
 }
 
 Writer::Writer(std::filesystem::path dir, std::string machine, Options options)
-    : dir_(std::move(dir)), options_(options) {
+    : dir_(std::move(dir)), machine_(std::move(machine)), options_(options) {
   ClampOptions(options_);
-  path_ = dir_ / (machine + ".jsonl");
+  path_ = dir_ / (machine_ + ".jsonl");
+}
+
+int Writer::SyncTo(const std::filesystem::path& dest_dir) const {
+  return SyncToDir(dir_, dest_dir, machine_, options_.keep_generations);
 }
 
 Writer::~Writer() {

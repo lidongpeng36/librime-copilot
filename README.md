@@ -457,6 +457,7 @@ copilot:
     max_file_bytes: 8388608   # rotate past this size
     keep_generations: 2       # counts the live file, so 2 = live + one archive
     sample_ok: 0              # keep 1 in N ordinary successes; 0 = none (default)
+    auto_sync: false          # copy into sync_dir every 30 min; see Privacy below
 ```
 
 `sample_ok` puts ordinary successes back into the log at a known rate — an
@@ -464,6 +465,19 @@ eval set built from real typing needs those as well as the hard cases the log
 otherwise keeps exclusively. It does not affect first-candidate accuracy:
 misses are recorded in full regardless of this setting, so that number needs
 neither sampling nor scaling.
+
+`auto_sync` does from inside the plugin what `tools/sync_telemetry.sh` does by
+hand: every 30 minutes, and once at session end, this machine's file and its
+archives are copied whole into `<sync_dir>/copilot_telemetry/`. It is off by
+default, and it is the same privacy decision the script is — read Privacy
+below before turning it on. It is not a thread and not a network call: a
+whole-file copy of a file that measured 8.5 KB over two days, on the same
+`OnCommit` the stats flush already piggybacks on. The append itself stays
+local; only the periodic copy touches the sync directory, which is why
+appending-inside-iCloud (the script's stated reason for not doing this) does
+not apply. With `sync_dir` unset — Squirrel never writes one — it logs one
+`ERROR` naming what to add to `installation.yaml`, rather than doing nothing
+quietly.
 
 One file per machine at
 `<rime user dir>/private/copilot_telemetry/<installation_id>.jsonl`, created `0600`.
@@ -505,11 +519,14 @@ screen yields an empty context and re-ranking does not even run. But the
 selected and candidate texts are the user's own Chinese input, which makes this
 file a chronological transcript of it — unlike Rime's `*.userdb`, which is a
 frequency table with no timeline. The plugin makes no network connections;
-copying the file anywhere is an explicit, separate step
-(`tools/sync_telemetry.sh`). Be clear about what that step does, though: it puts
-the transcript into the iCloud sync directory, from where it is uploaded and
-lands on every machine signed into the account — so run it only when you accept
-that, and only for as long as you are analysing. Set `enable: false` to stop
+copying the file out of the machine's own directory is a separate, opt-in step
+— `tools/sync_telemetry.sh` by hand, or `auto_sync: true` on a timer. Be clear
+about what either does, though: it puts the transcript into the iCloud sync
+directory, from where it is uploaded and lands on every machine signed into the
+account. `auto_sync` keeps doing it until you turn it off, which is exactly its
+value (a stale copy is a wasted week of typing) and exactly its cost — so turn
+it on only when you accept that, and turn it off when you have finished
+analysing. Set `enable: false` to stop
 recording, and delete the directory to discard what was already recorded.
 
 The local file lives under `private/` because a Rime user directory is
@@ -531,6 +548,10 @@ report command for it, path already filled in:
 ```sh
 tools/sync_telemetry.sh                       # on each machine; prints the next command
 ```
+
+Or set `auto_sync: true` on each machine and let the plugin keep the shared
+directory current — the same destination, so the report command above is
+unchanged.
 
 The report is organised by the claim each section tests, from the design spec.
 A rejection rate that is flat across a section's buckets refutes that section's
