@@ -326,6 +326,40 @@ class FetchTruncation(unittest.TestCase):
         self.assertIn("screen", out)
         self.assertIn("3.0", out)
 
+    def _guidance(self, trunc_counts):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        analyze._load_stats_line(db, {
+            "v": 5, "type": "stats", "ts": "t", "segments": 100, "llm_acted": 80,
+            "trunc_counts": trunc_counts})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_fetch_truncation(db)
+        return buf.getvalue()
+
+    # The guidance was INVERTED when this section was written: it told the
+    # reader that a config-dominated profile meant reaching deeper would not
+    # pay, when config is the one bucket where it demonstrably does -- the
+    # source had more text and prefix_chars cut it, and 8 -> 64 characters is
+    # the +2.47 result. Caught on 2026-08-27 against real data that landed in
+    # exactly this bucket. One test per branch, because an untested branch is
+    # how it survived review in the first place.
+    def test_config_dominant_points_at_raising_the_cap(self):
+        out = self._guidance({"config": 60, "screen": 30, "full": 10})
+        self.assertIn("prefix_chars", out)
+        self.assertIn("8 -> 64", out)
+        self.assertNotIn("buys nothing", out)
+
+    def test_screen_dominant_says_the_cap_is_not_the_lever(self):
+        out = self._guidance({"screen": 60, "config": 30, "full": 10})
+        self.assertIn("buys nothing", out)
+        # And must not send the reader to chrome as though it were measured.
+        self.assertIn("says nothing about chrome", out)
+
+    def test_full_dominant_says_neither_cap_binds(self):
+        out = self._guidance({"full": 60, "config": 30, "screen": 10})
+        self.assertIn("ends on its own", out)
+
     def test_no_depth_says_so_rather_than_printing_a_zero(self):
         db = sqlite3.connect(":memory:")
         db.executescript(analyze.SCHEMA)

@@ -924,10 +924,18 @@ def _print_skip_distribution(db):
 def _print_fetch_truncation(db):
     """How often the surrounding fetch is cut short, and how deep it gets.
 
-    This is the number that decides whether reaching deeper is worth
-    building -- stripping tmux chrome is the one surrounding-context change
-    with a measured gain (+2.47 points, p=4.6e-07), and it only pays where
-    the fetch is actually screen-limited.
+    Which bucket dominates decides which lever is the right one, and the two
+    are not interchangeable:
+
+      config  the source HAD more and `prefix_chars` cut it. Raising that cap
+              recovers real text, and 8 -> 64 characters is worth +2.47 points
+              (p = 4.6e-07; the context-length results record). This is the
+              bucket with a measured payoff behind it.
+      screen  the terminal cannot see further. Raising the cap buys nothing;
+              only chrome stripping or scrollback would, and neither has any
+              measured gain -- that record says explicitly that it "says
+              nothing about chrome".
+      full    the input region ended on its own. Nothing to win either way.
 
     From the `trunc` table, never from `ev.trunc`: the event stream is
     sampled and its sample is biased toward short requests, which are
@@ -968,6 +976,7 @@ def _print_fetch_truncation(db):
         print("\n  depth: not reported -- no window saw a fetch the environment cut")
         print("         short (screen/app). Nothing here is limited by how far the")
         print("         source can see.")
+        _print_fetch_lever(rows)
         return
     # By position, not by name: `load()` leaves the connection's default
     # row_factory (plain tuples), while the unit tests build theirs with
@@ -983,9 +992,33 @@ def _print_fetch_truncation(db):
     print(f"    p95   typical {mid(p95s):.1f}   range {p95s[0]:.1f} - {p95s[-1]:.1f}")
     print("    (per-window percentiles; a pooled one is not recoverable by averaging")
     print("     them. For the pooled shape use `ev.before_depth`, accepting its bias.)")
-    print("\n  Reaching deeper only pays where `screen` dominates AND the depth above")
-    print("  is well under copilot/rerank/llm/context_chars -- otherwise the cap that")
-    print("  binds is the config, not the terminal.")
+    _print_fetch_lever(rows)
+
+
+def _print_fetch_lever(rows):
+    """Which lever the dominant bucket points at.
+
+    Called on BOTH exits from _print_fetch_truncation, including the one where
+    no depth was measured -- that path is a dataset with no screen/app fetch at
+    all, i.e. the strongest possible "raise the cap" case, and an early return
+    there printed no guidance whatsoever. Caught by the per-branch tests, which
+    exist because an untested branch is how the inverted guidance survived.
+    """
+    dominant = rows[0][0]
+    if dominant == "config":
+        print("\n  `config` dominates: the source had MORE text and prefix_chars cut it.")
+        print("  That is the bucket with a measured payoff -- 8 -> 64 characters is worth")
+        print("  +2.47 points (p=4.6e-07). copilot/rerank/llm/context_chars is a consumer")
+        print("  declaration only; it is not yet a term in copilot.cc's prefix_chars max,")
+        print("  so the fetch stops at 8 whatever it says. Raising that is the lever.")
+    elif dominant in ("screen", "app"):
+        print("\n  `screen`/`app` dominates: the source cannot see further, so raising")
+        print("  prefix_chars buys nothing here. The levers are chrome stripping and")
+        print("  scrollback -- NEITHER of which has a measured gain. The +2.47 result is")
+        print("  about context LENGTH (8 -> 64) and says nothing about chrome.")
+    else:
+        print("\n  Neither cap is binding: the input region mostly ends on its own, so")
+        print("  reaching deeper has nothing to reach for.")
 
 
 if __name__ == "__main__":

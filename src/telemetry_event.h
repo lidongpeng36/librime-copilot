@@ -151,15 +151,21 @@ struct StatsLine {
   // SAMPLED: ShouldRecord keeps every miss and promotion and only 1 in
   // `sample_ok` plain successes, so the share of kByScreen computed from the
   // event stream is biased toward hard cases -- the ones carrying least
-  // context. This is the unbiased denominator, and it is what decides whether
-  // stripping tmux chrome (the one surrounding-context change with a measured
-  // gain) is worth building. Segments with no trace at all count here in
-  // nothing, exactly as they count in no skip bucket, so the sum is <=
-  // `segments`.
+  // context. This is the unbiased denominator, and which bucket dominates
+  // decides which lever is the right one -- the two are not interchangeable.
+  // kByConfig means the source HAD more and `prefix_chars` cut it, so raising
+  // that cap recovers real text: 8 -> 64 characters is worth +2.47 points
+  // (p = 4.6e-07, the context-length results record). kByScreen means the
+  // terminal cannot see further, where raising the cap buys nothing and the
+  // only levers -- chrome stripping, scrollback -- have NO measured gain; that
+  // same record says in as many words that it "says nothing about chrome".
+  // Reading one as the other points the next change at the wrong half.
+  // Segments with no trace at all count here in nothing, exactly as they count
+  // in no skip bucket, so the sum is <= `segments`.
   //
   // The unit is the segment, not the fetch: one fetch serves every segment of
-  // a commit, and the measured gain (+2.47 points) is per segment, so
-  // segment-weighting is what says how much typing the change would reach.
+  // a commit, and the +2.47 was measured per segment, so segment-weighting is
+  // what says how much typing a deeper fetch would reach.
   std::map<std::string, int64_t> trunc_counts;
   // How deep the fetch got, over ONLY the fetches the environment cut short
   // -- kByScreen and kByApp. The other three answers carry a depth that is

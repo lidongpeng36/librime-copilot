@@ -922,8 +922,12 @@ install looks like.
 
 The cheap check is the schema version every telemetry line carries:
 `kSchemaVersion` (`src/telemetry_event.h`) against `"v":` in
-`private/copilot_telemetry/<machine>.jsonl`. Live lines reading `"v":3` against
-a source that says 5 date the running image without guesswork. Failing that,
+`private/copilot_telemetry/<machine>.jsonl`. Read the **last** line, not any
+line: the file is appended to for months, so every long-lived one carries a
+spread of old versions — measured 2026-08-27, `{2: 3, 3: 26, 5: 3}` on a
+machine that was running v5 the whole time, and a plain `grep '"v":'` there
+reads as a stale image when nothing is stale. `tail -1` dates the running
+image without guesswork. Failing that,
 `ps -p "$(pgrep -x Squirrel)" -o lstart` beside the dylib's mtime — that is what
 settled this one.
 
@@ -954,6 +958,10 @@ cd <librime>/plugins/copilot && git pull
 cd <librime> && cmake --build build          # C++ changes live here and nowhere else
 plugins/copilot/tools/rime-copilot install   # BEFORE restore -- see below
 ~/Library/Rime/private/bin/rime-copilot restore
+                                             # prints `conflict` and SKIPS any vaulted
+                                             # file this machine has edited -- which is
+                                             # every propagated config change. Read
+                                             # status, then `restore --force`.
 sudo cp build/lib/rime-plugins/librime-copilot.dylib \
   "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/"
 killall Squirrel                             # the cp above changes nothing until this
