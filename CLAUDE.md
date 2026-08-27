@@ -603,6 +603,8 @@ rime-copilot update                               # sogou lexicon + prediction d
 # 4. the plugin itself
 sudo cp build/lib/rime-plugins/librime-copilot.dylib \
   "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/"
+killall Squirrel                                  # if it was already running: the copy
+                                                  # alone never reaches a live process
 rime-copilot status                               # the check, not a formality
 ```
 
@@ -892,12 +894,38 @@ channel and its own precondition: syncing brings the merged history down, but
 a machine still running a dylib from before 2026-08-22 **will not add to it** —
 AutoSpacer's commits never reach `Memory::OnCommit` there. Sync on such a
 machine produces a dictionary that looks populated and then never grows, which
-reads as "already working". Copy the dylib first, confirm learning is live
-(see "AutoSpacer's commits and Rime's user dictionary"), and sync after.
+reads as "already working". Copy the dylib and restart Squirrel first, confirm
+learning is live (see "AutoSpacer's commits and Rime's user dictionary"), and
+sync after.
 
 The dylib is the channel with no automation, and it is the one carrying every
 C++ change. `git pull` and `restore` both succeeding says nothing about
 whether the plugin's behaviour changed on that machine.
+
+**And copying the dylib is not loading it — the running Squirrel has to be
+killed.** A process maps its dynamic libraries at launch and never re-reads the
+files; Rime's redeploy re-reads *config* and re-creates the processors, not the
+binary. So every line of the recipe below can succeed — `git pull`, `cmake
+--build`, `sudo cp`, `deploy`, a clean `status` — while the machine goes on
+running whatever C++ it started with, which on a laptop that sleeps rather than
+shuts down is weeks old.
+
+What makes this worse than a plain no-op is that a change spanning both the
+dylib and the vault **half-lands, and the half that works argues the other half
+did too.** Measured on 2026-08-27: `auto_sync` shipped as code (`74c0fe3`)
+alongside `copilot/telemetry/auto_sync: true` as config. The deploy took the
+config, so telemetry visibly started recording with the new `top_n: 10` — while
+`Copilot::SyncTelemetry` was not in the running image at all, and
+`<sync_dir>/copilot_telemetry/` held no file from this machine for nine hours.
+Nothing anywhere said so; the local `.jsonl` growing is exactly what a working
+install looks like.
+
+The cheap check is the schema version every telemetry line carries:
+`kSchemaVersion` (`src/telemetry_event.h`) against `"v":` in
+`private/copilot_telemetry/<machine>.jsonl`. Live lines reading `"v":3` against
+a source that says 5 date the running image without guesswork. Failing that,
+`ps -p "$(pgrep -x Squirrel)" -o lstart` beside the dylib's mtime — that is what
+settled this one.
 
 **One-off, for any checkout made before 2026-08-22: `git pull` will not work.**
 The remote's history was rewritten and the repository deleted and recreated on
@@ -928,6 +956,7 @@ plugins/copilot/tools/rime-copilot install   # BEFORE restore -- see below
 ~/Library/Rime/private/bin/rime-copilot restore
 sudo cp build/lib/rime-plugins/librime-copilot.dylib \
   "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/"
+killall Squirrel                             # the cp above changes nothing until this
 rime-copilot update                          # regenerates private/personal.dict.yaml,
                                              # then rebuilds and deploys
 rime-copilot status                          # read every line
