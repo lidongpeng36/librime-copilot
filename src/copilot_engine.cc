@@ -314,12 +314,25 @@ string DescribeTelemetryOptions(const telemetry::Options& options) {
 
 an<telemetry::Writer> CopilotEngineComponent::GetTelemetryWriter(
     const telemetry::Options& options) {
+  auto& deployer = Service::instance().deployer();
+  const string machine = telemetry::MachineName(deployer.user_id);
+  // The writer's name is fixed at construction (it is what the path is derived
+  // from) and this writer is process-wide, so a deployment that changes
+  // installation_id leaves it writing the previous machine's file -- while
+  // EmitCommitTelemetry, which re-reads user_id per commit, stamps every line
+  // with the new name. That is not hypothetical: it ran for four days and
+  // 221 lines on this author's laptop (see telemetry.h's MachineName). Rebuild
+  // rather than warn, so the filename follows the config; the old writer stays
+  // alive in whatever Copilot still holds it and flushes its tail to the old
+  // file on destruction, which is where that data belongs.
+  if (telemetry_writer_ && telemetry_writer_->machine() != machine) {
+    LOG(ERROR) << "[copilot] telemetry: installation_id changed " << telemetry_writer_->machine()
+               << " -> " << machine << "; reopening under the new name (was "
+               << telemetry_writer_->path() << ")";
+    telemetry_writer_.reset();
+  }
   if (!telemetry_writer_) {
     telemetry_writer_options_ = options;
-    auto& deployer = Service::instance().deployer();
-    // "unknown" until the first deployment (deployer.cc:21). Still worth
-    // writing: a machine that has not deployed yet is still producing data.
-    string machine = deployer.user_id.empty() ? string("unknown") : deployer.user_id;
     // Under private/: see README "Telemetry" for why — a Rime user directory
     // is commonly a git repo of the user's own config on top of upstream, and
     // private/ is the conventional gitignore line, so this transcript of the

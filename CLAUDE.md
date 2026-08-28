@@ -917,6 +917,41 @@ other**, and most changes touch more than one:
 | the design records (`docs/superpowers/`) | iCloud, plus a symlink made by hand |
 | the **telemetry** (`private/copilot_telemetry/`) | `<sync_dir>/copilot_telemetry/` — `tools/sync_telemetry.sh` by hand, or `copilot/telemetry/auto_sync: true` on a 30-min timer. NOT the vault, and never merged: one file per machine, so collecting is concatenation |
 
+**The telemetry filename is `installation_id`, and it used to go stale.** The
+name reaches the log twice: `CopilotEngineComponent::GetTelemetryWriter` reads
+`deployer.user_id` **once**, when it builds the process-wide `telemetry::Writer`
+(the path is derived from it in the constructor), while
+`Copilot::EmitCommitTelemetry` re-reads it on **every commit** for the line's
+own `machine` field. A comment claimed the two therefore "never disagree". They
+disagreed for four days: a laptop whose `installation_id` was corrected
+`MacBookPro-M1` → `MacBookAir-M4` kept appending to `MacBookPro-M1.jsonl` — a
+redeploy rebuilds processors, not the process — while stamping every new line
+with the new name. Found on 2026-08-28 because that file held 231 lines saying
+one machine followed by 221 saying the other, timestamps monotonic across the
+flip, ending 70 seconds before the correctly-named file began (the restart).
+
+Both sites now derive it from one `telemetry::MachineName` (`src/telemetry.h`),
+and `GetTelemetryWriter` **rebuilds** the writer when the deployer no longer
+agrees, so the filename follows the config. The old writer stays alive in
+whatever `Copilot` still holds it and flushes its tail to the old file, which
+is where that data belongs.
+
+Two consequences worth knowing. **A machine's local
+`private/copilot_telemetry/` can hold another machine's file** — its own data
+under the pre-rename name — so `sync_telemetry.sh` publishes **only**
+`<installation_id>.jsonl`, matching what `SyncToDir` already did, and names
+any others without copying them. It globbed `*.jsonl` until 2026-08-28, which
+would have republished the stale name over a shared copy that had since been
+corrected. And **the analyser falls back to the FILENAME for a line with no
+`machine` field** (`stats` lines have none), so a wrong filename mislabels
+those too — 126 stats lines rode along with the 162 events in that incident.
+
+The shared `MacBookPro-M1.jsonl` was merged into `MacBookAir-M4.jsonl` on
+2026-08-28. The 162 rewritten lines carry `machine_was: MacBookPro-M1`, so the
+correction is self-documenting and reversible from the merged file alone; the
+original is beside it as `.bak-20260828-merged-into-air`. **The real M1 has
+never reported.**
+
 The user dictionary is the one people get wrong, because it has its own
 channel and its own precondition: syncing brings the merged history down, but
 a machine still running a dylib from before 2026-08-22 **will not add to it** —

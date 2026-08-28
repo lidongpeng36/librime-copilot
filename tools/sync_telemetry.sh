@@ -69,17 +69,18 @@ if [ ! -d "$SRC" ]; then
   exit 1
 fi
 
-# Deliberately NOT `|| true`: an unreadable source is a failure to report, not
-# a state to paper over. The glob is expanded once, into a counted list.
-FOUND=0
-for f in "$SRC"/*.jsonl; do
-  [ -e "$f" ] || continue
-  FOUND=$((FOUND + 1))
-done
-if [ "$FOUND" -eq 0 ]; then
-  echo "no *.jsonl in $SRC -- nothing to copy" >&2
-  echo "The directory exists but is empty, so telemetry is configured and has" >&2
-  echo "written nothing. Type some Chinese and run this again." >&2
+SELF="$SRC/$MACHINE.jsonl"
+if [ ! -f "$SELF" ]; then
+  echo "no $SELF" >&2
+  if ls "$SRC"/*.jsonl >/dev/null 2>&1; then
+    echo "The directory holds other machines' files but not this machine's." >&2
+    echo "Either installation_id was just changed (the running Squirrel is" >&2
+    echo "still writing the old name until it is restarted) or nothing has" >&2
+    echo "been typed since telemetry was enabled." >&2
+  else
+    echo "Nothing has been recorded on this machine. Type some Chinese and" >&2
+    echo "run this again." >&2
+  fi
   exit 1
 fi
 
@@ -99,40 +100,45 @@ last_v() {
   tail -1 "$1" 2>/dev/null | sed -n 's/.*"v":[ ]*\([0-9][0-9]*\).*/\1/p'
 }
 
+# ONLY this machine's file, which is what the plugin's own auto_sync does
+# (telemetry.cc's SyncToDir enumerates <machine>.jsonl and its generations and
+# never globs). This used to be `cp "$SRC"/*.jsonl`, and the difference is not
+# cosmetic: a local directory can hold another machine's file -- left behind by
+# a rename, since the filename comes from installation_id -- and globbing
+# republishes it over whatever the shared copy has become. On 2026-08-28 the
+# shared MacBookPro-M1.jsonl was merged into MacBookAir-M4.jsonl after it turned
+# out to be the Air's own data under a stale name; the Air's local copy still
+# exists, and one glob would have undone that merge and reported success.
+# CLAUDE.md's rule for this directory is "one file per machine, so collecting is
+# concatenation" -- a machine publishes its own file and nothing else.
 echo "copying from $SRC"
-COPIED_SELF=0
-for f in "$SRC"/*.jsonl; do
-  [ -e "$f" ] || continue
-  name=$(basename "$f")
-  cp "$f" "$DEST/$name"
-  # Compare after the copy rather than trusting cp's exit status alone: the
-  # destination is an iCloud-backed directory, where a write can be accepted
-  # and then not be what you wrote.
-  src_size=$(wc -c < "$f" | tr -d ' ')
-  dst_size=$(wc -c < "$DEST/$name" | tr -d ' ')
-  if [ "$src_size" != "$dst_size" ]; then
-    echo "  $name: copied $src_size bytes but destination has $dst_size" >&2
-    exit 1
-  fi
-  v=$(last_v "$f")
-  [ -n "$v" ] || v="?"
-  if [ "$name" = "$MACHINE.jsonl" ]; then
-    COPIED_SELF=1
-    echo "  $name  $src_size bytes  last line v$v  <- this machine"
-  else
-    echo "  $name  $src_size bytes  last line v$v"
-  fi
-done
-echo "copied $FOUND file(s) to $DEST"
-
-if [ "$COPIED_SELF" -eq 0 ]; then
-  echo >&2
-  echo "!!  $MACHINE.jsonl was NOT among them. This machine's own telemetry is" >&2
-  echo "    not in the sync directory -- everything copied above came from" >&2
-  echo "    somewhere else (a restore, most likely). Nothing this machine typed" >&2
-  echo "    will reach the analysis." >&2
+name="$MACHINE.jsonl"
+cp "$SELF" "$DEST/$name"
+# Compare after the copy rather than trusting cp's exit status alone: the
+# destination is an iCloud-backed directory, where a write can be accepted
+# and then not be what you wrote.
+src_size=$(wc -c < "$SELF" | tr -d ' ')
+dst_size=$(wc -c < "$DEST/$name" | tr -d ' ')
+if [ "$src_size" != "$dst_size" ]; then
+  echo "  $name: copied $src_size bytes but destination has $dst_size" >&2
   exit 1
 fi
+v=$(last_v "$SELF")
+[ -n "$v" ] || v="?"
+echo "  $name  $src_size bytes  last line v$v  <- this machine"
+echo "copied 1 file to $DEST"
+
+# Named, not copied. A file here under another machine's name is nearly always
+# this machine's own data written before installation_id was corrected, and
+# saying so beats leaving it to be rediscovered.
+for f in "$SRC"/*.jsonl; do
+  [ -e "$f" ] || continue
+  other=$(basename "$f")
+  [ "$other" != "$name" ] || continue
+  echo "  $other  NOT copied -- not this machine's name."
+  echo "    If this machine was renamed, these lines are yours under the old"
+  echo "    name; merge them into $name rather than publishing them."
+done
 
 echo
 echo "run the report with:"

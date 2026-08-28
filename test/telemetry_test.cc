@@ -360,3 +360,40 @@ TEST(TelemetrySync, AnEmptyDestinationIsRefused) {
   std::ofstream(src / "m.jsonl") << "line\n";
   EXPECT_EQ(0, SyncToDir(src, fs::path(), "m", 2));
 }
+
+// The name a machine writes under, in one place. Two copies of this fallback
+// used to sit in copilot_engine.cc and copilot.cc under a comment claiming
+// they could not disagree.
+TEST(MachineName, EmptyUserIdBecomesUnknown) {
+  EXPECT_EQ(MachineName(""), "unknown");
+}
+
+TEST(MachineName, ARealUserIdIsUsedVerbatim) {
+  EXPECT_EQ(MachineName("MacBookAir-M4"), "MacBookAir-M4");
+}
+
+// A writer's name is fixed for its lifetime because the path is derived from
+// it once. Exposing it is what lets a cached writer be checked against a
+// deployer that has since changed -- the check that was missing while one
+// laptop wrote 221 lines into MacBookPro-M1.jsonl after being renamed.
+TEST(Writer, ReportsTheNameItsPathWasDerivedFrom) {
+  fs::path dir = FreshDir("machine_name");
+  Options o;
+  o.enable = true;
+  Writer w(dir, "MacBookAir-M4", o);
+  EXPECT_EQ(w.machine(), "MacBookAir-M4");
+  EXPECT_EQ(w.path().filename().string(), "MacBookAir-M4.jsonl");
+}
+
+// The two must agree by construction, not by two authors spelling the same
+// fallback: this is the invariant GetTelemetryWriter's rebuild restores.
+TEST(Writer, TheNameAndTheFilenameCannotDisagree) {
+  fs::path dir = FreshDir("machine_name_agree");
+  Options o;
+  o.enable = true;
+  for (const std::string& name : {std::string("unknown"), MachineName(""),
+                                  MachineName("Mac-Mini")}) {
+    Writer w(dir, name, o);
+    EXPECT_EQ(w.path().filename().string(), w.machine() + ".jsonl");
+  }
+}

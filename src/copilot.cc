@@ -590,9 +590,14 @@ void Copilot::EmitCommitTelemetry(Context* ctx, bool selection_commit) {
   if (!telemetry_ || !telemetry_options_.enable) {
     return;
   }
-  // Same fallback as the filename in GetTelemetryWriter, so the `machine`
-  // field and the file it lives in never disagree.
-  const string& user_id = Service::instance().deployer().user_id;
+  // The SAME function GetTelemetryWriter derives the filename from, which is
+  // what actually keeps the `machine` field and the file it lives in in step.
+  // Two copies of the fallback used to sit here under a comment claiming they
+  // could not disagree; they disagreed for four days, because only one of the
+  // two re-reads user_id (telemetry.h, MachineName). Sharing the spelling is
+  // not what fixes that -- GetTelemetryWriter rebuilding on a change is -- but
+  // one spelling is what makes the two provably the same string.
+  const string machine = telemetry::MachineName(Service::instance().deployer().user_id);
   // Only worth accumulating when there is an LLM path to report on -- same
   // condition the constructor already uses for the AC/battery monitor.
   // Without this, a schema with telemetry on but the LLM off would
@@ -601,7 +606,7 @@ void Copilot::EmitCommitTelemetry(Context* ctx, bool selection_commit) {
   telemetry::StatsAccumulator* stats =
       (copilot_engine_ && copilot_engine_->scorer()) ? &stats_ : nullptr;
   const auto events = telemetry::BuildCommitEvents(
-      ctx, rerank_traces_.get(), telemetry_options_, user_id.empty() ? string("unknown") : user_id,
+      ctx, rerank_traces_.get(), telemetry_options_, machine,
       engine_->schema() ? engine_->schema()->schema_id() : string(),
       telemetry::FormatTimestamp(std::time(nullptr)), stats, selection_commit, &telemetry_ok_seen_);
   for (const auto& e : events) {

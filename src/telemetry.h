@@ -90,6 +90,25 @@ bool ShouldSync(std::time_t last_sync, std::time_t now, std::time_t interval_sec
 int SyncToDir(const std::filesystem::path& src_dir, const std::filesystem::path& dest_dir,
               const std::string& machine, int keep_generations);
 
+// The name this machine writes under -- the telemetry filename AND the
+// `machine` field on every line. Both used to spell this fallback out
+// separately (copilot_engine.cc's GetTelemetryWriter and copilot.cc's
+// EmitCommitTelemetry), under a comment claiming they therefore "never
+// disagree". They disagreed for four days: the filename is read once, when the
+// process-wide Writer is built, while the field is read on every commit, so a
+// machine whose `installation_id` changed without a Squirrel restart went on
+// appending to the OLD file while stamping every line with the NEW name.
+// Measured: MacBookPro-M1.jsonl held 231 lines saying MacBookPro-M1 followed
+// by 221 saying MacBookAir-M4, timestamps monotonic across the flip -- one
+// laptop, renamed, writing another machine's file until it was restarted.
+//
+// "unknown" rather than "": deployer.user_id is empty until the first
+// deployment (deployer.cc:21), and a machine that has not deployed yet is
+// still producing data worth keeping under a name that says so.
+inline std::string MachineName(const std::string& user_id) {
+  return user_id.empty() ? std::string("unknown") : user_id;
+}
+
 class Writer {
  public:
   Writer(std::filesystem::path dir, std::string machine, Options options);
@@ -109,6 +128,11 @@ class Writer {
 
   const std::filesystem::path& path() const { return path_; }
   const Options& options() const { return options_; }
+  // What this writer was BUILT with -- fixed for its lifetime, because the
+  // path is derived from it once in the constructor. Exposed so a caller
+  // holding a cached writer can notice the deployer no longer agrees; see
+  // MachineName above for what that cost.
+  const std::string& machine() const { return machine_; }
 
  private:
   // Opens (creating as needed) the live file for appending and re-reads its
