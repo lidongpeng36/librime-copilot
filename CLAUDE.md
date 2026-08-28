@@ -946,11 +946,30 @@ corrected. And **the analyser falls back to the FILENAME for a line with no
 `machine` field** (`stats` lines have none), so a wrong filename mislabels
 those too — 126 stats lines rode along with the 162 events in that incident.
 
+`tools/merge_renamed_telemetry.py` folds a stale-named file into the current
+one, relabelling `machine` and keeping the old value in `machine_was` so the
+correction is legible and reversible from the merged file alone. Three of its
+refusals are the lessons that produced it, each learned by getting it wrong:
+
+- **Repair the machine-LOCAL file, never the shared copy.** The shared copy is
+  a *projection*: every sync, manual or `auto_sync`, overwrites it wholesale.
+  The first attempt at this merge was made on the shared file and lasted 10
+  minutes — the Air's next sync replaced 603 merged lines with its own local
+  156 — so the tool refuses a destination that looks like a sync directory.
+- **Squirrel must not be running.** `telemetry::Writer` holds an open fd and
+  appends through it; replacing the file by rename leaves that fd on the
+  orphaned inode, so every later commit is written where nothing will read it,
+  silently, until the process restarts. The tool refuses rather than trusting
+  the operator to remember, and says to restart afterwards.
+- **The old name cannot always be read off the filename.** A file renamed out
+  of the way no longer ends in `.jsonl`, so the derived name matches nothing,
+  every line passes through still attributed to the machine that never typed
+  them, and the line count looks right — the same failure the tool exists to
+  repair, reintroduced by the repair. It refuses when nothing matched while
+  the file plainly names another machine, and `--stale-name` is the override.
+
 The shared `MacBookPro-M1.jsonl` was merged into `MacBookAir-M4.jsonl` on
-2026-08-28. The 162 rewritten lines carry `machine_was: MacBookPro-M1`, so the
-correction is self-documenting and reversible from the merged file alone; the
-original is beside it as `.bak-20260828-merged-into-air`. **The real M1 has
-never reported.**
+2026-08-28; the original is kept beside it. **The real M1 has never reported.**
 
 The user dictionary is the one people get wrong, because it has its own
 channel and its own precondition: syncing brings the merged history down, but
