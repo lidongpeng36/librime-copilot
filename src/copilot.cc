@@ -90,20 +90,26 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
     config->GetBool("copilot/telemetry/auto_sync", &telemetry_options_.auto_sync);
     telemetry::ClampOptions(telemetry_options_);
 
-    config->GetBool("copilot/use_surrounding_context", &use_surrounding_context_);
-    config->GetInt("copilot/surrounding_context_chars", &surrounding_context_chars_);
-    surrounding_context_chars_ = std::clamp(surrounding_context_chars_, 1, 64);
     // Both the IMK hook and the tmux pane scrape return this many characters
     // — the prediction context and the re-ranking filter each have their own
     // length, and both surrounding-text sources should reach equally deep.
-    // Left at 1 (the boundary character AutoSpacer uses) when neither is on,
-    // so the per-key query stays exactly as cheap as before.
-    int prefix_chars = use_surrounding_context_ ? surrounding_context_chars_ : 1;
+    // Which declarations count, and the clamping, live in
+    // SurroundingPrefixChars (surrounding_source.h) so they can be tested
+    // without an engine; this block only reads the keys.
+    SurroundingConsumers consumers;
+    config->GetBool("copilot/use_surrounding_context", &use_surrounding_context_);
+    config->GetInt("copilot/surrounding_context_chars", &surrounding_context_chars_);
+    surrounding_context_chars_ =
+        std::clamp(surrounding_context_chars_, 1, kMaxSurroundingPrefixChars);
+    consumers.use_surrounding_context = use_surrounding_context_;
+    consumers.surrounding_context_chars = surrounding_context_chars_;
     bool rerank_enable = true;
     int rerank_chars = 8;
     config->GetBool("copilot/rerank/enable", &rerank_enable);
     config->GetInt("copilot/rerank/max_context_chars", &rerank_chars);
-    rerank_max_context_chars_ = std::clamp(rerank_chars, 1, 64);
+    rerank_max_context_chars_ = std::clamp(rerank_chars, 1, kMaxSurroundingPrefixChars);
+    consumers.rerank_enable = rerank_enable;
+    consumers.rerank_max_context_chars = rerank_max_context_chars_;
     // The SCORER's own context length -- a different and longer string than the
     // db's Han-only tail. Read here because WarmRerankContext keys the warm
     // cache on it while CopilotRerankFilter reads the same key for Apply(); it
@@ -111,14 +117,26 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
     // the two agreed only because the schema happened to say 32 and the
     // 8-character source ceiling made every value above 8 indistinguishable.
     //
-    // Deliberately NOT folded into `prefix_chars` below. That term is what
-    // raises the fetch depth from 8, which is step (c) of the design and a
-    // behaviour change; this is the bug fix, which is a defect at any length.
+    // Now a term in the fetch depth as well, which is what makes that ceiling
+    // go away: with it declared but not folded in, the sources stopped at 8
+    // whatever the schema said, and 71% of measured fetches ended in
+    // kByConfig. It is clamped here for the same reason -- an unclamped key
+    // that only ever truncated a string it could not lengthen now sizes a
+    // per-keystroke query.
     config->GetInt("copilot/rerank/llm/context_chars", &rerank_llm_context_chars_);
+    rerank_llm_context_chars_ =
+        std::clamp(rerank_llm_context_chars_, 1, kMaxSurroundingPrefixChars);
+    config->GetBool("copilot/rerank/llm/enable", &consumers.llm_enable);
+    consumers.llm_context_chars = rerank_llm_context_chars_;
     config->GetBool("copilot/rerank/llm/battery_active", &rerank_llm_battery_active_);
-    if (rerank_enable) {
-      prefix_chars = std::max(prefix_chars, rerank_max_context_chars_);
-    }
+    const int prefix_chars = SurroundingPrefixChars(consumers);
+    surrounding_prefix_chars_ = prefix_chars;
+    LOG(INFO) << "[copilot] surrounding prefix_chars=" << prefix_chars
+              << " (surrounding=" << consumers.surrounding_context_chars
+              << " use=" << consumers.use_surrounding_context
+              << ", rerank=" << consumers.rerank_max_context_chars
+              << " enable=" << consumers.rerank_enable << ", llm=" << consumers.llm_context_chars
+              << " enable=" << consumers.llm_enable << ")";
 #ifdef __APPLE__
     SetIMKSurroundingPrefixChars(prefix_chars);
 #endif
@@ -651,7 +669,7 @@ void Copilot::FlushStatsIfAny() {
     return;  // nothing observed since construction or the last flush
   }
   telemetry_->Write(telemetry::SerializeStatsJsonl(
-      stats_.Snapshot(telemetry::FormatTimestamp(std::time(nullptr)))));
+      stats_.Snapshot(telemetry::FormatTimestamp(std::time(nullptr)), surrounding_prefix_chars_)));
   stats_.Reset();
 }
 

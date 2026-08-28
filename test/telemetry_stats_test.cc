@@ -274,3 +274,20 @@ TEST(StatsAccumulator, ResetClearsTheTruncationCountsAndTheDepth) {
   EXPECT_TRUE(s.trunc_counts.empty());
   EXPECT_LT(s.depth_p50, 0.0);
 }
+
+// Passed at Snapshot time rather than accumulated, so Reset() has nothing to
+// preserve -- a stored copy is the shape of bug that invites.
+TEST(StatsAccumulator, SnapshotStampsTheFetchDepthItIsGiven) {
+  telemetry::StatsAccumulator acc;
+  acc.Observe(nullptr);
+  EXPECT_EQ(acc.Snapshot("t", 32).fetch_chars, 32);
+  acc.Reset();
+  acc.Observe(nullptr);
+  EXPECT_EQ(acc.Snapshot("t", 32).fetch_chars, 32);
+}
+
+TEST(StatsAccumulator, AnUngivenFetchDepthStaysUnrecorded) {
+  telemetry::StatsAccumulator acc;
+  acc.Observe(nullptr);
+  EXPECT_LT(acc.Snapshot("t").fetch_chars, 0);
+}

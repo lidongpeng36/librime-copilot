@@ -105,10 +105,14 @@ TEST(SerializeJsonl, OmitsTheLlmRecordWhenAbsent) {
   EXPECT_EQ(SerializeJsonl(e).find("\"llm\""), std::string::npos);
 }
 
-TEST(SerializeJsonl, SchemaVersionIsFour) {
+// Named for the constant rather than a number: the literal spelling went stale
+// twice (the name still said Four while the body asserted 5), and a test whose
+// name contradicts its body is worse than none -- a reader trusts the name.
+TEST(SerializeJsonl, EveryLineCarriesTheCurrentSchemaVersion) {
   Event e;
   e.ts = "t";
-  EXPECT_NE(SerializeJsonl(e).find("\"v\":5"), std::string::npos);
+  auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_EQ(j["v"], kSchemaVersion);
 }
 
 // The per-event stream only records hard cases (ShouldRecord), which is right
@@ -126,7 +130,7 @@ TEST(SerializeStatsJsonl, CarriesCountersAndItsOwnType) {
   EXPECT_NE(line.find("\"type\":\"stats\""), std::string::npos);
   EXPECT_NE(line.find("\"llm_acted\":5310"), std::string::npos);
   EXPECT_NE(line.find("\"cold\":519"), std::string::npos);
-  EXPECT_NE(line.find("\"v\":5"), std::string::npos);
+  EXPECT_EQ(nlohmann::json::parse(line)["v"], kSchemaVersion);
 }
 
 // No stored `warm_hit`: under the fallback chain kCold and kNone are mutually
@@ -191,7 +195,7 @@ TEST(SerializeJsonl, CarriesTheModelsPickWhenNothingWasPromoted) {
   e.llm = llm;
 
   const auto j = nlohmann::json::parse(SerializeJsonl(e));
-  EXPECT_EQ(j["v"], 5);
+  EXPECT_EQ(j["v"], 6);
   EXPECT_EQ(j["llm"]["best"], "那里");
   EXPECT_EQ(j["llm"]["best_from"], 1);
   EXPECT_EQ(j["llm"]["text"], "");  // nothing was promoted
@@ -296,7 +300,7 @@ TEST(TelemetryEvent, SerializesFetchDepthAndTruncation) {
   e.trunc = "config";
 
   auto j = nlohmann::json::parse(SerializeJsonl(e));
-  EXPECT_EQ(j["v"], 5);
+  EXPECT_EQ(j["v"], 6);
   EXPECT_EQ(j["before_depth"], 17);
   EXPECT_EQ(j["trunc"], "config");
 }
@@ -309,4 +313,28 @@ TEST(TelemetryEvent, OmitsFetchDepthWhenNeverMeasured) {
   auto j = nlohmann::json::parse(SerializeJsonl(e));
   EXPECT_FALSE(j.contains("trunc"));
   EXPECT_FALSE(j.contains("before_depth"));
+}
+
+// v6: `fetch_chars`. It exists because `trunc_counts["config"]` changed meaning
+// under a fixed key -- it counted fetches cut at 8 until context_chars became a
+// term in SurroundingPrefixChars, and counts fetches cut at the configured
+// depth after. A count of "the cap bound" is uninterpretable without the cap.
+TEST(SerializeStatsJsonl, FetchCharsIsWrittenWhenRecorded) {
+  rime::telemetry::StatsLine s;
+  s.ts = "2026-08-28T10:00:00+0800";
+  s.segments = 40;
+  s.fetch_chars = 32;
+  auto j = nlohmann::json::parse(rime::telemetry::SerializeStatsJsonl(s));
+  EXPECT_EQ(j["fetch_chars"], 32);
+}
+
+// Absent, not zero: 0 is not a depth any build ever fetched, so writing it
+// would invent a state. An absent field says "predates the wiring", which is
+// itself the answer -- the depth was 8.
+TEST(SerializeStatsJsonl, AnUnrecordedFetchDepthIsOmittedNotZeroed) {
+  rime::telemetry::StatsLine s;
+  s.ts = "2026-08-28T10:00:00+0800";
+  s.segments = 40;
+  auto j = nlohmann::json::parse(rime::telemetry::SerializeStatsJsonl(s));
+  EXPECT_FALSE(j.contains("fetch_chars"));
 }

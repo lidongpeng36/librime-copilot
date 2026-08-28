@@ -350,6 +350,17 @@ class FetchTruncation(unittest.TestCase):
         self.assertIn("8 -> 64", out)
         self.assertNotIn("buys nothing", out)
 
+    def test_config_dominant_does_not_still_call_the_lever_unwired(self):
+        """The guidance said `context_chars` "is not yet a term in copilot.cc's
+        prefix_chars max, so the fetch stops at 8 whatever it says". That was
+        true until 2026-08-28 and is the sentence a reader acts on; leaving it
+        after SurroundingPrefixChars folded the term in would send them to
+        re-do work already done, and hide that pre-2026-08-28 counts describe a
+        fetch the current build no longer makes."""
+        out = self._guidance({"config": 60, "screen": 30, "full": 10})
+        self.assertNotIn("not yet a term", out)
+        self.assertIn("2026-08-28", out)
+
     def test_screen_dominant_says_the_cap_is_not_the_lever(self):
         out = self._guidance({"screen": 60, "config": 30, "full": 10})
         self.assertIn("buys nothing", out)
@@ -591,3 +602,198 @@ class DisplacingHeads(unittest.TestCase):
         ]:
             analyze._load_event_line(db, e)
         self.assertEqual(analyze.displaced_heads(db), [("的", 2, 1)])
+
+
+class PathSplitVerdicts(unittest.TestCase):
+    """The OVERALL panel used one verdict column for two re-ranking paths.
+
+    `verdict` is filled from `rr` alone (see SCHEMA's own note, "db path
+    only"), and every event the db loop did not touch fell into its
+    `misrank` bucket -- which the panel then printed as "no re-ranking,
+    user took a later candidate". On the live log that bucket held 91
+    events: 54 of them HAD been re-ranked, by the LLM path, 21 of those
+    were promotions, and 66 of the 91 had `sel_idx == 0`, i.e. the user
+    took the head. Both halves of the label were false for most of it,
+    and the headline read "promotion accepted 0" over a path running an
+    85.7% accept rate.
+
+    `rerank_filter.cc` runs the db loop OR the LLM path per segment,
+    never both, so the two paths plus "neither" partition the events and
+    each deserves its own denominator.
+    """
+
+    def _report_over(self, events):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "M.jsonl"
+            lines = list(events) + [
+                {"v": analyze.SCHEMA_VERSION, "type": "stats",
+                 "ts": "2026-08-21T10:01:00+0800", "segments": 40, "llm_acted": 30},
+            ]
+            p.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                argv = sys.argv
+                sys.argv = ["analyze_telemetry.py", str(p)]
+                try:
+                    analyze.main()
+                finally:
+                    sys.argv = argv
+        return out.getvalue()
+
+    @staticmethod
+    def _llm_event(sel, top, text, from_, margin=3.0):
+        return {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
+                "machine": "M", "input": "ab", "ctx": "测试", "sel": sel,
+                "sel_idx": top.index(sel), "top": top,
+                "llm": {"text": text, "incumbent": top[1], "from": from_,
+                        "margin": margin, "skip": "none", "dropped": []}}
+
+    @staticmethod
+    def _db_event(sel, top, text, from_):
+        return {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
+                "machine": "M", "input": "ab", "ctx": "测试", "sel": sel,
+                "sel_idx": top.index(sel), "top": top,
+                "rr": {"text": text, "from": from_, "key": "测", "n": 9,
+                       "rank": 2, "level": 1}}
+
+    def _section(self, text):
+        """The per-path block, up to the first CLAIM heading."""
+        return text.split("CLAIM 1")[0]
+
+    def test_an_llm_promotion_is_not_reported_as_no_re_ranking(self):
+        text = self._section(self._report_over([
+            self._llm_event("好的", ["好的", "好地"], "好的", 1),
+        ]))
+        self.assertNotIn("no re-ranking, user took a later candidate", text)
+        self.assertIn("LLM", text)
+
+    def test_each_path_gets_its_own_promotion_counts(self):
+        text = self._section(self._report_over([
+            # LLM: two promotions, one accepted one rejected.
+            self._llm_event("好的", ["好的", "好地"], "好的", 1),
+            self._llm_event("好地", ["好的", "好地"], "好的", 1),
+            # LLM consulted, promoted nothing.
+            {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
+             "machine": "M", "sel": "先", "sel_idx": 0, "top": ["先", "想"],
+             "llm": {"incumbent": "先", "best": "先", "best_from": 0,
+                     "margin": 0.0, "skip": "margin", "dropped": []}},
+            # db: one promotion the user accepted.
+            self._db_event("时间", ["时间", "事件"], "时间", 2),
+        ]))
+        db_block = text.split("db n-gram")[1].split("LLM")[0]
+        llm_block = text.split("LLM path")[1]
+        self.assertRegex(db_block, r"promotion accepted\s+1\b")
+        self.assertRegex(llm_block, r"promotion accepted\s+1\b")
+        self.assertRegex(llm_block, r"promotion REJECTED\s+1\b")
+        self.assertRegex(llm_block, r"promoted nothing\s+1\b")
+
+    def test_only_events_neither_path_touched_land_in_neither(self):
+        text = self._section(self._report_over([
+            self._llm_event("好的", ["好的", "好地"], "好的", 1),
+            self._db_event("时间", ["时间", "事件"], "时间", 2),
+            {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
+             "machine": "M", "sel": "想", "sel_idx": 1, "top": ["先", "想"]},
+        ]))
+        self.assertRegex(text, r"neither path re-ranked\s+1\b")
+
+    def test_a_displaced_llm_promotion_is_excluded_from_the_llm_rates(self):
+        """`的` pinned to the head displaces the LLM's pick exactly as it does
+        the db's, and the same argument excludes it: the user was shown a head
+        re-ranking did not produce."""
+        text = self._section(self._report_over([
+            # top[0] is not what the LLM promoted -- a downstream pin took it.
+            {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
+             "machine": "M", "sel": "的", "sel_idx": 0, "top": ["的", "到"],
+             "llm": {"text": "到", "incumbent": "地", "from": 1,
+                     "margin": 3.0, "skip": "none", "dropped": []}},
+        ]))
+        llm_block = text.split("LLM path")[1]
+        self.assertRegex(llm_block, r"head altered downstream\s+1\b")
+        self.assertRegex(llm_block, r"promotion accepted\s+0\b")
+        self.assertRegex(llm_block, r"promotion REJECTED\s+0\b")
+
+
+class FetchDepthOnTheStatsLine(unittest.TestCase):
+    """v6's `fetch_chars`, and the pooling it exists to prevent.
+
+    `trunc_counts["config"]` is a count of fetches the configured cap cut
+    short. That cap changed on 2026-08-28, when `context_chars` became a term
+    in SurroundingPrefixChars -- before it the sources stopped at 8 whatever
+    the schema said. So the same key counts two different measurements, and a
+    log spans the change. Summing them answers "is the cap binding?" over a cap
+    that moved, which is the merge every other comment in this file warns
+    about.
+    """
+
+    def test_the_depth_is_loaded_onto_the_stats_row(self):
+        db = load_all(events=[], stats=[
+            {"v": 6, "type": "stats", "ts": "t", "segments": 10, "llm_acted": 8,
+             "trunc_counts": {"config": 10}, "fetch_chars": 32},
+        ])
+        self.assertEqual(db.execute("SELECT fetch_chars FROM stats").fetchone()[0], 32)
+
+    def test_a_v5_line_loads_unchanged_with_no_depth(self):
+        db = load_all(events=[], stats=[
+            {"v": 5, "type": "stats", "ts": "t", "segments": 10, "llm_acted": 8,
+             "trunc_counts": {"config": 10}},
+        ])
+        row = db.execute("SELECT segments, fetch_chars FROM stats").fetchone()
+        self.assertEqual(row["segments"], 10)
+        self.assertIsNone(row["fetch_chars"])
+
+    def test_a_non_numeric_depth_is_rejected_whole(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        with self.assertRaises(ValueError):
+            analyze._load_stats_line(db, {
+                "v": 6, "type": "stats", "ts": "t", "segments": 10,
+                "llm_acted": 8, "fetch_chars": "deep"})
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM stats").fetchone()[0], 0)
+
+    def _report(self, stats):
+        db = sqlite3.connect(":memory:")  # plain tuples, as load() leaves it
+        db.executescript(analyze.SCHEMA)
+        for s in stats:
+            analyze._load_stats_line(db, s)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_fetch_truncation(db)
+        return buf.getvalue()
+
+    def test_one_recorded_depth_is_named_beside_the_counts(self):
+        out = self._report([
+            {"v": 6, "type": "stats", "ts": "t", "segments": 100, "llm_acted": 80,
+             "trunc_counts": {"config": 70, "full": 30}, "fetch_chars": 32},
+        ])
+        self.assertIn("32", out)
+
+    def test_windows_recorded_at_different_depths_are_not_pooled_silently(self):
+        out = self._report([
+            {"v": 6, "type": "stats", "ts": "t1", "segments": 100, "llm_acted": 80,
+             "trunc_counts": {"config": 90, "full": 10}, "fetch_chars": 8},
+            {"v": 6, "type": "stats", "ts": "t2", "segments": 100, "llm_acted": 80,
+             "trunc_counts": {"config": 10, "full": 90}, "fetch_chars": 32},
+        ])
+        self.assertIn("!!", out)
+        self.assertIn("8", out)
+        self.assertIn("32", out)
+
+    def test_an_unrecorded_depth_is_not_reported_as_eight(self):
+        """Absent means the line predates the wiring, when the depth was
+        max(surrounding_context_chars, max_context_chars) -- 8 under the
+        shipped schema, but the line does not carry that machine's schema and
+        the reader must not assume it."""
+        out = self._report([
+            {"v": 5, "type": "stats", "ts": "t", "segments": 100, "llm_acted": 80,
+             "trunc_counts": {"config": 70, "full": 30}},
+        ])
+        self.assertIn("unrecorded", out)
+
+    def test_a_recorded_and_an_unrecorded_window_together_still_warn(self):
+        out = self._report([
+            {"v": 5, "type": "stats", "ts": "t1", "segments": 100, "llm_acted": 80,
+             "trunc_counts": {"config": 90, "full": 10}},
+            {"v": 6, "type": "stats", "ts": "t2", "segments": 100, "llm_acted": 80,
+             "trunc_counts": {"config": 10, "full": 90}, "fetch_chars": 32},
+        ])
+        self.assertIn("!!", out)

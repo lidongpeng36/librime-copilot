@@ -571,12 +571,32 @@ independent knob: `CopilotRerankFilter` truncates the scoring context with it an
 same value or every warm lands on a string nobody asks about. Both now read the
 same config key and assemble the string through the single
 `BuildScoringContextFor` (`src/rerank.h`); it used to be a hard-coded 32 in
-`copilot.h` against a filter that read config, agreeing only by coincidence. It
-is NOT yet a term in the `prefix_chars` max in `copilot.cc`, so the three
-surrounding sources still fetch at most 8 characters whatever it says. How the
-deployed scorer actually responds to a longer context than that is measured in
-the context-length results record, kept locally — it bears on raising that
-ceiling, which is a later step and not built here.
+`copilot.h` against a filter that read config, agreeing only by coincidence.
+
+**Since 2026-08-28 it is also a term in the fetch depth**, which is what makes
+the declaration mean anything: `SurroundingPrefixChars`
+(`src/surrounding_source.h`) takes the max over the declarations of the
+consumers that are actually on, and `copilot.cc` hands the result to all three
+surrounding sources. Before that the sources stopped at 8 whatever the schema
+said, so every value above 8 was indistinguishable — telemetry measured the
+consequence directly, **71% of all fetches ending in `config`** ("the source
+HAD more and `prefix_chars` cut it") on a machine configured for 32. How the
+deployed scorer responds to the longer context is measured in the
+context-length results record, kept locally: 8 → 64 is worth +2.47 points
+(p=4.6e-07), 64 → unlimited +0.00.
+
+Two things about that function are load-bearing. **The LLM term is gated on
+`copilot/rerank/llm/enable` nested inside `copilot/rerank/enable`**, because
+both re-ranking consumers live in `CopilotRerankFilter`, which returns early on
+`!options_.enable` — declaring 32 characters that nothing reads would buy a
+deeper per-keystroke query for nothing. And **each term is clamped before the
+max, not after**, so one out-of-range key cannot raise the fetch on behalf of a
+consumer that would itself have clamped down; `context_chars` is now clamped in
+`copilot.cc` and in `rerank_filter.cc` both, which it was not while it could
+only ever truncate a string already fetched.
+
+Any `trunc_counts` figure from before 2026-08-28 describes the old fetch and is
+not comparable with one after it.
 
 **`status` is the check, and it exists because none of these fail loudly.**
 A schema naming a `.gram` that is absent decodes as though no grammar were
@@ -759,6 +779,14 @@ behaviour and is left for real use — or a better instrument — to decide:
 - **`copilot/rerank/llm/margin`** (default 2.0) — how much better a candidate
   must score before it is promoted. Swept on this model: harmful promotion
   0.8% at margin 2 against 2.8% at margin 1, for 13.3% net against 14.0%.
+  **The shipped schema moved to 1.0 on 2026-08-28**, on the sweep's own net
+  number plus the first live evidence there has been: telemetry recorded 11
+  declines whose cause was this threshold, and in **9 of them the blocked pick
+  is what the user then chose** (`decline_split`, the `blocked` bucket).
+  1.0 recovers 3 of those, 0.5 recovers 6; 0.5 was not taken because the sweep
+  has no measurement below 1. The code default stays 2.0. Note the accept rate
+  before and after the change is not one quantity — every promotion in the log
+  cleared whatever margin its machine was running.
 - **`copilot/rerank/same_span_only`** (default true) — whether a promotion may
   take a candidate covering a *different amount of input* than the one it
   displaces. False is worth +4.5 points of segments and costs p99 11.0ms →

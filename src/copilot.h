@@ -144,10 +144,18 @@ class Copilot : public Processor {
   // Read from copilot/rerank/llm/context_chars -- what the SCORER is warmed
   // with, which is a different and longer string than the db's Han-only tail.
   // Initializer mirrors LlmRerankOptions::context_chars' own default
-  // (rerank_llm.h) so an unconfigured schema is bit-identical; not clamped,
-  // to match the filter, which does not clamp this key either.
+  // (rerank_llm.h) so an unconfigured schema is bit-identical. Clamped to
+  // kMaxSurroundingPrefixChars here AND in the filter, in step: since it
+  // became a term in SurroundingPrefixChars it sizes a per-keystroke query,
+  // not just a truncation of a string already fetched.
   int rerank_llm_context_chars_ = 32;
   bool rerank_llm_battery_active_ = false;
+  // SurroundingPrefixChars' result, kept only so FlushStatsIfAny can stamp it
+  // on every stats line. `trunc_counts["config"]` is a count of fetches this
+  // cap cut short, and that count means nothing without the cap -- which
+  // changed on 2026-08-28 when context_chars became a term in it. Config-fixed,
+  // read once in the constructor.
+  int surrounding_prefix_chars_ = 1;
   // Cached rather than queried on every warm attempt -- same reason and same
   // pattern as CopilotRerankFilter (rerank_filter.h/.cc) and LLMProvider
   // (llm_provider.cc): kept current by a process-wide power monitor callback

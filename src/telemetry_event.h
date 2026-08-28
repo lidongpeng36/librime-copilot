@@ -43,7 +43,22 @@ namespace telemetry {
 // subset ShouldRecord keeps. v4's Event fields are unchanged and still the
 // only place either fact can be joined back to the segment it came from. A
 // v4 line carries neither and must keep loading unchanged under a v5 reader.
-inline constexpr int kSchemaVersion = 5;
+//
+// v6 adds `fetch_chars` to StatsLine, and unlike every bump above it exists
+// because an EXISTING field changed meaning. `copilot/rerank/llm/context_chars`
+// became a term in the fetch depth on 2026-08-28 (SurroundingPrefixChars,
+// surrounding_source.h); before that the sources stopped at 8 whatever the
+// schema said. So `trunc_counts["config"]` counted fetches cut at 8, and now
+// counts fetches cut at whatever the max resolves to -- two different
+// measurements under one key, and nothing in the line said which. Pooling them
+// would answer "is the cap binding?" over a cap that changed mid-file, which is
+// the class of merge this file's own comments keep warning about. A v5 line
+// carries no `fetch_chars` and must keep loading unchanged. Absent does NOT
+// mean 8: it means the line predates the wiring, when the depth was
+// max(surrounding_context_chars, max_context_chars) -- 8 under the shipped
+// schema, but a reader cannot know that machine's schema and must not assume
+// it. Report absent as unrecorded, and never pool it with a recorded depth.
+inline constexpr int kSchemaVersion = 6;
 
 // What the re-ranking filter decided for one segment.
 struct RerankRecord {
@@ -181,6 +196,20 @@ struct StatsLine {
   // convention as Event::before_depth's -1.
   double depth_p50 = -1.0;
   double depth_p95 = -1.0;
+  // What `prefix_chars` the surrounding sources were asked for during this
+  // window -- SurroundingPrefixChars' result, the max over the declarations of
+  // the consumers that are on. It is the denominator `trunc_counts["config"]`
+  // is a count against: "the cap bound 71% of the time" means nothing without
+  // the cap. Config-fixed, so it does not vary within a window; it is written
+  // per line anyway because a log spans redeploys and a reader has no other
+  // way to date the change.
+  //
+  // Negative means not recorded -- a v5 or older line, whose depth was
+  // max(surrounding_context_chars, max_context_chars): 8 under the shipped
+  // schema, but not knowable from the line. Same omit-rather-than-zero
+  // convention as the depth pair, and for the sharper reason: 0 is not a fetch
+  // depth any build ever used, so writing it would invent a state.
+  int fetch_chars = -1;
 };
 
 // Whether this segment is worth a line at all.
@@ -309,6 +338,11 @@ inline std::string SerializeStatsJsonl(const StatsLine& s) {
   if (s.depth_p50 >= 0.0) {
     j["depth_p50"] = s.depth_p50;
     j["depth_p95"] = s.depth_p95;
+  }
+  // Omitted rather than written negative, so a reader distinguishes "this build
+  // did not record it" from any value. See StatsLine's field comment.
+  if (s.fetch_chars >= 0) {
+    j["fetch_chars"] = s.fetch_chars;
   }
   return j.dump();
 }

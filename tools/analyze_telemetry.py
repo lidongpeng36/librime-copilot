@@ -89,7 +89,14 @@ CREATE TABLE ev (
 -- real measured 0 (the source reached no characters at all) stays legible.
 CREATE TABLE stats (
   ts TEXT, segments INT, llm_acted INT, us_p50 REAL, us_p95 REAL,
-  depth_p50 REAL, depth_p95 REAL
+  depth_p50 REAL, depth_p95 REAL,
+  -- v6. What prefix_chars the sources were asked for during this window.
+  -- NULL on a v5 or older line, where it is NOT 8 by default: the depth was
+  -- max(surrounding_context_chars, max_context_chars) on that machine's
+  -- schema, which the line does not carry. `trunc_counts['config']` counts
+  -- fetches THIS cap cut short, so the two must never be summed across
+  -- different values of it.
+  fetch_chars INT
 );
 
 -- One row per (stats line, skip reason) pair, flattened out of that line's
@@ -140,7 +147,7 @@ CREATE TABLE recorder (
 # same two facts over EVERY segment rather than the sampled subset the event
 # stream keeps. The depth pair covers only the fetches the environment cut
 # short (screen/app) and is omitted when the window saw none.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Below this many samples a percentage is noise, and the first percentage this
 # report prints becomes the baseline every later change is quoted against. The
@@ -430,12 +437,20 @@ def _load_stats_line(db, e):
     # fetch. NULL rather than 0.0 for both: see the `stats` table comment.
     depth_p50 = e.get("depth_p50")
     depth_p95 = e.get("depth_p95")
+    # v6. Same validate-then-default shape as the counters above: a line that
+    # parses but carries a non-numeric depth belongs in `skipped`, not in a row
+    # whose `config` count would then be attributed to a cap nobody can name.
+    fetch_chars = e.get("fetch_chars")
+    if fetch_chars is not None and (isinstance(fetch_chars, bool)
+                                    or not isinstance(fetch_chars, (int, float))):
+        raise ValueError("stats line: fetch_chars is not numeric")
     # Validated in full above before the first INSERT: a malformed entry
     # midway through skip_counts or trunc_counts must not leave this line's
     # `stats` row written while its child rows are half-missing -- the
     # exception the caller catches has no transaction to roll that back out.
-    db.execute("INSERT INTO stats VALUES (?,?,?,?,?,?,?)",
-              (e.get("ts"), segments, llm_acted, us_p50, us_p95, depth_p50, depth_p95))
+    db.execute("INSERT INTO stats VALUES (?,?,?,?,?,?,?,?)",
+              (e.get("ts"), segments, llm_acted, us_p50, us_p95, depth_p50, depth_p95,
+               fetch_chars))
     for reason, count in (skip_counts or {}).items():
         db.execute("INSERT INTO skip VALUES (?,?,?)", (e.get("ts"), reason, count))
     for kind, count in (trunc_counts or {}).items():
@@ -638,10 +653,10 @@ def main():
     print(f"  {'events read':<44}{total:>8}")
     displaced = db.execute("SELECT COUNT(*) FROM ev WHERE head_displaced = 1").fetchone()[0]
     if altered:
-        print(f"  {'EXCLUDED, head altered downstream':<44}{altered:>8}  {altered / total:>6.1%}")
+        print(f"  {'EXCLUDED, db pick altered downstream':<44}{altered:>8}  {altered / total:>6.1%}")
         print(f"    {'displaced -- the pick survived lower down':<42}{displaced:>8}")
         print(f"    {'rewritten or removed -- the pick is gone':<42}{altered - displaced:>8}")
-    print(f"  {'usable':<44}{usable:>8}")
+    print(f"  {'usable, db path':<44}{usable:>8}")
     if altered:
         if not usable:
             print("\n  !!  EVERY event was thrown away. There is nothing left to report on.")
@@ -659,27 +674,7 @@ def main():
         _print_fetch_truncation(db)
         return 0
 
-    print(f"\n  Of the {usable} usable event(s):")
-    for verdict, label in [
-        ("accepted", "promotion accepted"),
-        ("rejected", "promotion REJECTED"),
-        ("nomove", "re-ranking agreed, moved nothing (control)"),
-        ("misrank", "no re-ranking, user took a later candidate"),
-    ]:
-        n = db.execute(
-            "SELECT COUNT(*) FROM ev WHERE verdict = ? AND head_altered = 0", (verdict,)
-        ).fetchone()[0]
-        print(f"  {label:<44}{n:>8}  {n / usable:>6.1%}")
-
-    moved = db.execute(
-        "SELECT COUNT(*) FROM ev WHERE rr = 1 AND rr_from > 0 AND head_altered = 0"
-    ).fetchone()[0]
-    if moved:
-        rej = db.execute(
-            "SELECT COUNT(*) FROM ev WHERE verdict = 'rejected' AND head_altered = 0"
-        ).fetchone()[0]
-        print(f"\n  Promotions that moved a candidate: {moved}, rejected {rej / moved:.1%}")
-        print("  This is the number that says whether re-ranking is a net gain.")
+    _print_path_split(db, total)
 
     print("\n" + "=" * 64)
     print("CLAIM 1  rank carries signal, so using it only as a threshold is wrong")
@@ -854,6 +849,70 @@ def _print_recorders(db):
     print()
 
 
+def _print_path_split(db, total):
+    """Accept/reject counts per re-ranking path, each with its own denominator.
+
+    This block used to be a single four-row table over `verdict`, which is
+    filled from `rr` alone -- the db n-gram loop. Every segment the db loop did
+    not touch fell into its `misrank` row, printed as "no re-ranking, user took
+    a later candidate". On the live log that row held 91 events: 54 of them had
+    been re-ranked by the LLM path, 21 of those were promotions, and 66 of the
+    91 had `sel_idx == 0`. Both halves of the label were wrong for most of the
+    row, and the headline above it read "promotion accepted 0" while the LLM
+    path was running an 85.7% accept rate.
+
+    `copilot_rerank_filter` runs the db loop OR the LLM path per segment, never
+    both (rerank_filter.cc; the same fact `_load_event_line` relies on when it
+    treats `rr` and `llm` as mutually exclusive), so the two paths plus
+    "neither" partition the events read -- which is why `total`, not `usable`,
+    is the denominator here. `usable` subtracts only the db path's exclusions.
+
+    Each path excludes its own downstream-altered events, for the reason
+    HEAD_ALTERED_NOTE gives: the user was shown a head that path did not
+    produce, so `sel` cannot be read as a verdict on it. The rates are over
+    PROMOTIONS (accepted + rejected), not over the group -- a decline is not a
+    rejection, and averaging the two is how "is re-ranking a net gain" gets
+    answered with the wrong number.
+    """
+    one = lambda sql: db.execute(sql).fetchone()[0]
+    print(f"\n  Of the {total} event(s) read, by the path that re-ranked the segment:")
+    nets = []
+    for name, engaged, altered_col, verdict_col, declined in [
+        ("db n-gram path", "rr = 1", "head_altered", "verdict",
+         ("agreed, moved nothing (control)", "nomove")),
+        ("LLM path", "llm = 1", "llm_head_altered", "llm_verdict",
+         ("consulted, promoted nothing", "declined")),
+    ]:
+        n = one(f"SELECT COUNT(*) FROM ev WHERE {engaged}")
+        excl = one(f"SELECT COUNT(*) FROM ev WHERE {engaged} AND {altered_col} = 1")
+        counts = {}
+        for v in ("accepted", "rejected", declined[1]):
+            counts[v] = one(f"SELECT COUNT(*) FROM ev WHERE {engaged} AND "
+                            f"{altered_col} = 0 AND {verdict_col} = '{v}'")
+        moved = counts["accepted"] + counts["rejected"]
+        print(f"  {name:<44}{n:>8}")
+        print(f"    {'EXCLUDED, head altered downstream':<42}{excl:>8}")
+        for v, label in (("accepted", "promotion accepted"),
+                         ("rejected", "promotion REJECTED")):
+            share = f"  {counts[v] / moved:>6.1%}" if moved else ""
+            print(f"    {label:<42}{counts[v]:>8}{share}")
+        print(f"    {declined[0]:<42}{counts[declined[1]]:>8}")
+        if moved:
+            nets.append(f"{name.split()[0]} {moved}, rejected {counts['rejected'] / moved:.1%}")
+
+    neither = one("SELECT COUNT(*) FROM ev WHERE rr = 0 AND llm = 0")
+    print(f"  {'neither path re-ranked':<44}{neither:>8}")
+    if neither:
+        head = one("SELECT COUNT(*) FROM ev WHERE rr = 0 AND llm = 0 AND sel_idx = 0")
+        print(f"    {'of those, the user still took the head':<42}{head:>8}")
+        print("    Events are recorded on every miss plus a sample of hits")
+        print("    (ShouldRecord), so this group is not evidence that re-ranking")
+        print("    should have fired -- only that it did not.")
+    if nets:
+        print("\n  Promotions that moved a candidate: " + " | ".join(nets))
+        print("  This is the number that says whether re-ranking is a net gain.")
+
+
 def _print_displaced_heads(db):
     """What displaced re-ranking's pick, and what that cost."""
     rows = displaced_heads(db)
@@ -921,6 +980,48 @@ def _print_skip_distribution(db):
     print("  see src/warm_cache.h and copilot.cc's WarmUp calls.")
 
 
+def _print_fetch_depth_provenance(db):
+    """Which cap the `config` count above is a count against.
+
+    "the cap bound 71% of the time" is not a finding without the cap, and the
+    cap moved: `copilot/rerank/llm/context_chars` became a term in the fetch
+    depth on 2026-08-28 (SurroundingPrefixChars), and before that the sources
+    stopped at max(surrounding_context_chars, max_context_chars) whatever the
+    schema's `context_chars` said. A log spans that change, and summing across
+    it answers a question about a cap that was not one value.
+
+    NULL is reported as unrecorded, never as 8. 8 is what the SHIPPED schema
+    resolved to before the wiring; the line does not carry that machine's
+    schema and this reader cannot know it.
+    """
+    rows = db.execute(
+        "SELECT fetch_chars, COUNT(*) FROM stats WHERE segments > 0 "
+        "GROUP BY fetch_chars ORDER BY COUNT(*) DESC").fetchall()
+    named = [(d, n) for d, n in rows if d is not None]
+    unrecorded = sum(n for d, n in rows if d is None)
+    if not rows:
+        return
+    if len(named) == 1 and not unrecorded:
+        print(f"\n  fetch depth: {named[0][0]} characters "
+              f"(prefix_chars, over all {named[0][1]} window(s))")
+        return
+    if not named:
+        print(f"\n  fetch depth: unrecorded on all {unrecorded} window(s) -- every line "
+              f"here\n               predates v{SCHEMA_VERSION}. It was "
+              "max(surrounding_context_chars,\n               max_context_chars) on "
+              "whichever schema wrote them, which this\n               reader cannot "
+              "see. Do not read it as 8.")
+        return
+    print("\n  !!  The windows above were NOT all recorded at one fetch depth, so the")
+    print("      `config` share pools counts against caps that differ. Split the files")
+    print("      by depth before reading it as a rate.")
+    for depth, n in named:
+        print(f"        {depth:>4} characters   {n:>4} window(s)")
+    if unrecorded:
+        print(f"        {'?':>4}            {unrecorded:>4} window(s)  "
+              f"unrecorded (pre-v{SCHEMA_VERSION})")
+
+
 def _print_fetch_truncation(db):
     """How often the surrounding fetch is cut short, and how deep it gets.
 
@@ -957,6 +1058,7 @@ def _print_fetch_truncation(db):
     for kind, n in rows:
         print(f"  {kind:<18}{n:>10}{n / total:>8.1%}")
     print(f"  {'(total)':<18}{total:>10}")
+    _print_fetch_depth_provenance(db)
 
     unknown = dict(rows).get("unknown", 0)
     if unknown / total >= 0.5:
@@ -1008,9 +1110,14 @@ def _print_fetch_lever(rows):
     if dominant == "config":
         print("\n  `config` dominates: the source had MORE text and prefix_chars cut it.")
         print("  That is the bucket with a measured payoff -- 8 -> 64 characters is worth")
-        print("  +2.47 points (p=4.6e-07). copilot/rerank/llm/context_chars is a consumer")
-        print("  declaration only; it is not yet a term in copilot.cc's prefix_chars max,")
-        print("  so the fetch stops at 8 whatever it says. Raising that is the lever.")
+        print("  +2.47 points (p=4.6e-07). The lever is copilot/rerank/llm/context_chars,")
+        print("  which since 2026-08-28 IS a term in the fetch depth")
+        print("  (SurroundingPrefixChars, src/surrounding_source.h) rather than a")
+        print("  declaration the sources ignored. If this bucket still dominates on data")
+        print("  written after that, the schema's value is the cap -- raise it, up to")
+        print("  kMaxSurroundingPrefixChars (64). On data written before it, the fetch")
+        print("  stopped at 8 whatever the schema said, and this bucket says nothing")
+        print("  about the current build.")
     elif dominant in ("screen", "app"):
         print("\n  `screen`/`app` dominates: the source cannot see further, so raising")
         print("  prefix_chars buys nothing here. The levers are chrome stripping and")

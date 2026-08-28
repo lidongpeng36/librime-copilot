@@ -584,7 +584,12 @@ CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) 
       options.llm.length_exponent = static_cast<float>(exponent_double);
     }
   }
-  options.max_context_chars = std::clamp(options.max_context_chars, 1, 64);
+  options.max_context_chars = std::clamp(options.max_context_chars, 1, kMaxSurroundingPrefixChars);
+  // Clamped to the same ceiling the sources fetch to, and for the same
+  // reason copilot.cc clamps it: this key now sizes the per-keystroke
+  // surrounding query (SurroundingPrefixChars), so a value the sources can
+  // never return would make every fetch look truncated by config forever.
+  options.llm.context_chars = std::clamp(options.llm.context_chars, 1, kMaxSurroundingPrefixChars);
   options.window = std::clamp(options.window, 1, 200);
   options.max_rank = std::clamp(options.max_rank, 1, 100000);
   options.llm.top_n = std::clamp(options.llm.top_n, 1, options.window);

@@ -75,9 +75,14 @@ class StatsAccumulator {
   // actually reached the Writer, so a write the Writer silently drops
   // (telemetry.h: "must never break input") does not also lose the counts
   // that would have described it.
-  StatsLine Snapshot(const std::string& ts) const {
+  // `fetch_chars` is config-fixed and lives on the caller (Copilot reads it in
+  // its constructor), so it is passed in rather than accumulated -- passing it
+  // at Snapshot time also keeps Reset() from having to preserve it, which is
+  // the shape of bug a stored copy invites.
+  StatsLine Snapshot(const std::string& ts, int fetch_chars = -1) const {
     StatsLine s;
     s.ts = ts;
+    s.fetch_chars = fetch_chars;
     s.segments = segments_;
     s.llm_acted = llm_acted_;
     s.skip_counts = skip_counts_;
