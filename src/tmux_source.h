@@ -15,7 +15,8 @@
 #include <string>
 #include <vector>
 
-#include "imk_client.h"  // SurroundingText
+#include "context_memory.h"  // context_memory::Identity
+#include "imk_client.h"      // SurroundingText
 
 namespace rime {
 
@@ -85,5 +86,25 @@ void InvalidateTmuxSnapshot();
 // activity. Answers from the memoized snapshot when one is current; see
 // InvalidateTmuxSnapshot.
 std::optional<SurroundingText> GetTmuxSurroundingText();
+
+// The pane the caret is in, from the SAME memoized snapshot
+// GetTmuxSurroundingText() uses -- but stopping before ExtractContext.
+//
+// It must not be routed through GetTmuxSurroundingText(): that function
+// refuses for reasons about the *text* (cursor outside the captured pane,
+// rendering discontinuity), under which the pane id is still perfectly well
+// known. A dropped identity does not fail loudly -- it silently merges two
+// panes into one memory slot.
+//
+// Still nullopt for the refusals that ARE about identity, or that leave no
+// identity to report: disabled, wrong frontmost app, tmux missing, timeout,
+// no attached client, ambiguous clients, and an unparseable dump -- with no
+// parse there is no pane id either.
+std::optional<context_memory::Identity> GetTmuxPaneIdentity();
+
+// Whether the frontmost application is on the terminal list this source
+// answers for. Exposed so GetContextIdentity() can gate the pushed rung with
+// the same predicate the polled rung already uses internally.
+bool FrontmostIsTerminal();
 
 }  // namespace rime

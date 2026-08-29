@@ -12,6 +12,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "context_memory.h"
 #include "copilot_plugin.h"
 #include "imk_client.h"
 
@@ -95,6 +96,15 @@ class ImeBridgeState {
   void HandleDeactivate(const std::string& client_key);
   void TouchClient(const std::string& client_key);
 
+  // A pane identity pushed by the tmux hook. Handled OUTSIDE the client
+  // registry on purpose: the reporter connects and disconnects on every pane
+  // switch, and a registered client gets a synthesized reset on disconnect
+  // (see RetainClientConnection) which would flip ascii_mode on an idle
+  // machine. Nothing here touches client_states_ or conn_refs_.
+  void HandleIdentity(const std::string& socket, const std::string& pane_id,
+                      const std::string& command);
+  std::optional<context_memory::Identity> GetPushedIdentity() const;
+
   // Per-connection refcount for a client key. A reconnecting client briefly has
   // two live connections, so only the last one going away means it is really
   // gone — at which point we synthesize a reset(restore) so a killed client
@@ -106,6 +116,21 @@ class ImeBridgeState {
   std::queue<ImeBridgePendingAction> TakePendingActions();
   ApplyResult ApplyAction(const ImeBridgePendingAction& action, bool current_ascii);
   void CleanupStaleClients();
+
+  // How many times ApplyAction has told its caller to write ascii_mode, over
+  // the life of the process. Monotonic, never reset.
+  //
+  // It exists for the per-context memory feature, which reads ascii_mode at
+  // the end of a key event and attributes it to the pane the event resolved
+  // to. This queue is context-blind -- an action queued by pane A's nvim is
+  // applied on whatever pane the next keystroke lands in -- so a tail that
+  // saw this counter move must not record what it reads. Counting every
+  // should_set rather than only kSet: kRestore and kReset write the mode too,
+  // and a restore landing on the wrong pane misattributes just as badly.
+  //
+  // Atomic rather than mutex_-guarded so the input thread can sample it at
+  // the head of a key event without contending with a connection thread.
+  uint64_t applied_mode_writes() const { return applied_mode_writes_.load(); }
 
   static std::string MakeClientKey(const std::string& app, const std::string& instance);
 
@@ -131,6 +156,9 @@ class ImeBridgeState {
   std::unordered_map<std::string, int> conn_refs_;
   std::queue<ImeBridgePendingAction> pending_actions_;
   std::chrono::steady_clock::time_point last_cleanup_;
+  bool has_identity_ = false;
+  context_memory::Identity identity_;
+  std::atomic<uint64_t> applied_mode_writes_{0};
 };
 
 // 共享的 ImeBridge 服务器状态（跨所有 session 共享）
@@ -163,6 +191,9 @@ class ImeBridgeServer {
   // 获取活跃客户端的上下文信息（线程安全）
   std::optional<SurroundingText> GetActiveContext() { return state_.GetActiveContext(); }
 
+  // The most recently pushed pane identity, if any.
+  std::optional<context_memory::Identity> GetPushedIdentity() { return state_.GetPushedIdentity(); }
+
   // 获取待处理的 actions（线程安全）
   std::queue<ImeBridgePendingAction> TakePendingActions() { return state_.TakePendingActions(); }
 
@@ -174,6 +205,9 @@ class ImeBridgeServer {
 
   // 清理超时客户端
   void CleanupStaleClients() { state_.CleanupStaleClients(); }
+
+  // See ImeBridgeState::applied_mode_writes().
+  uint64_t applied_mode_writes() const { return state_.applied_mode_writes(); }
 
  private:
   void RunServer();

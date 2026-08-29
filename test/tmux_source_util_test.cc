@@ -330,7 +330,9 @@ TEST(TmuxArgs, EachSemicolonIsItsOwnArgvElement) {
     if (a == ";") ++semicolons;
     EXPECT_EQ(a.find(';'), a == ";" ? 0u : std::string::npos);
   }
-  EXPECT_EQ(semicolons, 3);
+  // One per subcommand boundary: list-clients ; display-message(FOC) ;
+  // display-message(SCK) ; display-message(CUR) ; capture-pane.
+  EXPECT_EQ(semicolons, 4);
 }
 
 TEST(TmuxArgs, AsksForFocusEventsInTheSameExec) {
@@ -340,17 +342,24 @@ TEST(TmuxArgs, AsksForFocusEventsInTheSameExec) {
 }
 
 TEST(TmuxArgs, EveryMarkerIsEmittedBeforeThePaneDump) {
-  // ParseTmuxOutput only treats CLI|/FOC| specially before the CUR header, so
-  // a pane row that starts with a marker stays a row. That only holds if the
-  // argv really does put both markers ahead of capture-pane.
+  // ParseTmuxOutput only treats CLI|/FOC|/SCK| specially before the CUR
+  // header, so a pane row that starts with a marker stays a row. That only
+  // holds if the argv really does put every marker ahead of capture-pane.
+  //
+  // Matched on the "CUR|" PREFIX, never on the whole header format string:
+  // this test is about marker ordering, and spelling the format out here
+  // makes adding a field to the header fail a test that has nothing to say
+  // about fields. AsksForPaneCurrentCommandLast is where the format belongs.
   auto args = BuildTmuxArgs("");
   auto cli = std::find(args.begin(), args.end(), "CLI|#{client_activity}");
   auto foc = std::find(args.begin(), args.end(), "FOC|#{focus-events}");
-  auto cur =
-      std::find(args.begin(), args.end(), "CUR|#{pane_id}|#{cursor_x}|#{cursor_y}|#{pane_width}");
+  auto sck = std::find(args.begin(), args.end(), "SCK|#{socket_path}");
+  auto cur = std::find_if(args.begin(), args.end(),
+                          [](const std::string& a) { return a.rfind("CUR|", 0) == 0; });
   ASSERT_NE(cur, args.end());
   EXPECT_LT(cli, cur);
   EXPECT_LT(foc, cur);
+  EXPECT_LT(sck, cur);
 }
 
 TEST(TmuxArgs, NoDashTAnywhere) {
@@ -671,4 +680,88 @@ TEST(TmuxSourceUtil, AfterDepthCountsCharactersNotBytes) {
   ASSERT_TRUE(ctx.has_value());
   EXPECT_EQ("天", ctx->after);
   EXPECT_EQ(1, ctx->after_depth);
+}
+
+TEST(TmuxParse, ReadsPaneCommand) {
+  const std::string raw =
+      "CLI|100\nFOC|on\nCUR|%7|3|1|80|claude\nprompt\ntyping here\n";
+  auto snap = rime::tmux_detail::ParseTmuxOutput(raw);
+  ASSERT_TRUE(snap.has_value());
+  EXPECT_EQ(snap->pane_id, "%7");
+  EXPECT_EQ(snap->pane_command, "claude");
+}
+
+TEST(TmuxParse, PaneCommandIsOptionalForOlderFormat) {
+  const std::string raw = "CLI|100\nFOC|on\nCUR|%7|3|1|80\nprompt\n";
+  auto snap = rime::tmux_detail::ParseTmuxOutput(raw);
+  ASSERT_TRUE(snap.has_value());
+  EXPECT_EQ(snap->pane_id, "%7");
+  EXPECT_EQ(snap->pane_command, "");
+}
+
+TEST(TmuxParse, PaneCommandKeepsEmbeddedPipes) {
+  // pane_current_command is the LAST field precisely so a command containing
+  // '|' cannot shift the fields that follow it. Everything after the fifth
+  // separator belongs to it.
+  const std::string raw = "CLI|100\nFOC|on\nCUR|%7|3|1|80|sh -c a|b\nprompt\n";
+  auto snap = rime::tmux_detail::ParseTmuxOutput(raw);
+  ASSERT_TRUE(snap.has_value());
+  EXPECT_EQ(snap->pane_command, "sh -c a|b");
+}
+
+TEST(TmuxArgs, AsksForPaneCurrentCommandLast) {
+  auto args = rime::tmux_detail::BuildTmuxArgs("");
+  bool found = false;
+  for (const auto& a : args) {
+    if (a.find("#{pane_current_command}") != std::string::npos) {
+      found = true;
+      EXPECT_NE(a.find("CUR|"), std::string::npos);
+      EXPECT_EQ(a.substr(a.size() - std::string("|#{pane_current_command}").size()),
+                "|#{pane_current_command}");
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+// The socket path is what makes the two identity rungs agree on a key; see
+// Snapshot::socket_path. Without it in the argv the polled rung is back to
+// `copilot/tmux_source/socket`, which is empty on the default socket while
+// the pushed rung reports an absolute path.
+TEST(TmuxArgs, AsksForTheSocketPath) {
+  auto args = rime::tmux_detail::BuildTmuxArgs("");
+  bool found = false;
+  for (const auto& a : args) {
+    if (a == "SCK|#{socket_path}") found = true;
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST(TmuxParse, ReadsSocketPath) {
+  const std::string raw = "CLI|100\nFOC|on\nSCK|/tmp/tmux-501/work\nCUR|%7|3|1|80|claude\nprompt\n";
+  auto snap = rime::tmux_detail::ParseTmuxOutput(raw);
+  ASSERT_TRUE(snap.has_value());
+  EXPECT_EQ(snap->socket_path, "/tmp/tmux-501/work");
+  EXPECT_EQ(snap->pane_id, "%7");
+  EXPECT_EQ(snap->pane_command, "claude");
+}
+
+TEST(TmuxParse, SocketPathIsOptional) {
+  // A tmux too old to know `#{socket_path}` expands it to nothing; the whole
+  // marker line may equally be absent. Either must parse, and leave the
+  // caller to fall back to the configured socket.
+  auto absent = rime::tmux_detail::ParseTmuxOutput("CLI|100\nFOC|on\nCUR|%7|3|1|80\nprompt\n");
+  ASSERT_TRUE(absent.has_value());
+  EXPECT_EQ(absent->socket_path, "");
+  auto empty = rime::tmux_detail::ParseTmuxOutput("CLI|100\nFOC|on\nSCK|\nCUR|%7|3|1|80\nprompt\n");
+  ASSERT_TRUE(empty.has_value());
+  EXPECT_EQ(empty->socket_path, "");
+}
+
+TEST(TmuxParse, SocketPathKeepsEmbeddedPipes) {
+  // Its own marker line exists so a path may hold the separator; everything
+  // after "SCK|" is the path.
+  const std::string raw = "CLI|100\nFOC|on\nSCK|/tmp/a|b/default\nCUR|%7|3|1|80|zsh\nprompt\n";
+  auto snap = rime::tmux_detail::ParseTmuxOutput(raw);
+  ASSERT_TRUE(snap.has_value());
+  EXPECT_EQ(snap->socket_path, "/tmp/a|b/default");
 }

@@ -13,7 +13,8 @@
 #include <vector>
 
 #include "auto_spacer_util.h"  // Utf8SequenceLength, Utf8ToCodepoint
-#include "history.h"           // copilot::UTF8, copilot::CharCount
+#include "history.h"           // copilot::UTF8, copilot::CharCount -- should be utf8_index.h; see
+                               // MakeClientKey below. Not changed in this wave.
 #include "imk_client.h"        // Truncation
 
 namespace rime {
@@ -61,6 +62,20 @@ struct StyledRow {
 // One query's worth of state, parsed out of the single exec's stdout.
 struct Snapshot {
   std::string pane_id;
+  // `#{pane_current_command}`. Part of the context identity, not of the
+  // surrounding text -- it costs nothing here because it rides the same
+  // display-message the cursor header already needs.
+  std::string pane_command;
+  // `#{socket_path}`: the server socket this pane lives on, as an absolute
+  // path. Asked for because it is the ONE thing that makes the two identity
+  // rungs agree. The pushed rung (tools/rime_ctx_report.sh) can only know
+  // ${TMUX%%,*}, an absolute path; the polled rung previously used
+  // `copilot/tmux_source/socket`, which is EMPTY on the default socket and a
+  // path otherwise -- so the two agreed only by the coincidence that
+  // MakeKey's placeholder for empty happens to be the word "default", which
+  // is also that socket's basename. Empty here when tmux is too old to know
+  // the variable, in which case the caller falls back to the configured one.
+  std::string socket_path;
   int cursor_x = 0;  // display column, 0-based
   int cursor_y = 0;  // row within the visible pane, 0-based
   int pane_width = 0;
@@ -454,6 +469,15 @@ inline std::optional<Snapshot> ParseTmuxOutput(const std::string& raw) {
       snap.focus_events = ParseTmuxFlag(line.substr(4));
       continue;
     }
+    // Its own marker line rather than another CUR| field: a socket path is
+    // arbitrary bytes, and appending it to the header would put a second
+    // greedy field beside pane_current_command -- one of the two would have
+    // to stop being able to hold a '|'. Everything after the marker is the
+    // path, so this one can.
+    if (line.rfind("SCK|", 0) == 0) {
+      snap.socket_path = line.substr(4);
+      continue;
+    }
     if (line.rfind("CUR|", 0) == 0) {
       std::vector<std::string> f;
       size_t s = 0;
@@ -468,6 +492,14 @@ inline std::optional<Snapshot> ParseTmuxOutput(const std::string& raw) {
       snap.cursor_x = std::atoi(f[2].c_str());
       snap.cursor_y = std::atoi(f[3].c_str());
       snap.pane_width = std::atoi(f[4].c_str());
+      // Everything past the fifth separator is the command, rejoined: it is
+      // last in the format exactly so an embedded '|' cannot shift any field.
+      // Absent in output from a build that predates this field, which parses
+      // as before -- the size check above is still `< 5`.
+      for (size_t k = 5; k < f.size(); ++k) {
+        if (k > 5) snap.pane_command += "|";
+        snap.pane_command += f[k];
+      }
       saw_header = true;
       continue;
     }
@@ -641,10 +673,21 @@ inline std::vector<std::string> BuildTmuxArgs(const std::string& socket) {
   args.push_back("-F");
   args.push_back("FOC|#{focus-events}");
   args.push_back(";");
+  // Rides this same exec for the same reason focus-events does: a spawn of
+  // its own would cost more than everything tmux does here put together
+  // (measurement 3 in the context-ascii-memory design -- 2.75 ms of the
+  // 3.37 ms is starting the process). An older tmux that does not know
+  // `socket_path` expands it to nothing, which reads back as "unknown" and
+  // falls back to the configured socket, i.e. to the previous behaviour.
   args.push_back("display-message");
   args.push_back("-p");
   args.push_back("-F");
-  args.push_back("CUR|#{pane_id}|#{cursor_x}|#{cursor_y}|#{pane_width}");
+  args.push_back("SCK|#{socket_path}");
+  args.push_back(";");
+  args.push_back("display-message");
+  args.push_back("-p");
+  args.push_back("-F");
+  args.push_back("CUR|#{pane_id}|#{cursor_x}|#{cursor_y}|#{pane_width}|#{pane_current_command}");
   args.push_back(";");
   args.push_back("capture-pane");
   args.push_back("-p");
@@ -658,6 +701,14 @@ inline std::vector<std::string> BuildTmuxArgs(const std::string& socket) {
 // The pane id MUST be in the key: AutoSpacer indexes per-client state by it
 // (src/auto_spacer.cc:282-286), so a constant key would let one pane's
 // spacing state bleed into the next.
+//
+// Byte-identical to context_memory::MakeKey (src/context_memory.h) for the
+// same socket and pane, and duplicated on purpose: this header includes
+// history.h, which drags in glog, and context_memory.h must stay Rime-free so
+// the pure test can drive it without an engine. Keep them in step by hand;
+// see the fuller note there, including what would let the two collapse into
+// one (history.h here should be utf8_index.h -- it merely re-exports
+// copilot::UTF8/CharCount).
 inline std::string MakeClientKey(const std::string& socket, const std::string& pane_id) {
   const std::string socket_tag = socket.empty() ? "default" : socket;
   return "tmux:" + socket_tag + ":" + pane_id;

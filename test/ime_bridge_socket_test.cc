@@ -246,3 +246,62 @@ TEST(ImeBridgeSocket, StopDrainsConnectionThreads) {
 
   close(fd);
 }
+
+// The load-bearing contrast: an `ascii` client's disconnect DOES synthesize a
+// reset (mirrors DroppedConnectionSynthesizesReset above), but an
+// identity-only connection's disconnect does not, because ProcessMessage
+// returns "" for it and HandleConnection's `note` lambda only retains a
+// connection ref for a non-empty key (ime_bridge.cc:237-241). Without the
+// second half this would just be DroppedConnectionSynthesizesReset again;
+// without the GetPushedIdentity() check it could pass by the identity message
+// having been silently dropped rather than by the no-registration path.
+TEST(ImeBridgeSocket, IdentityDisconnectDoesNotResetUnlikeAscii) {
+  ImeBridgeServer server;
+  ImeBridgeServer::Config cfg;
+  cfg.socket_path =
+      "/tmp/rime_copilot_test_identity_contrast_" + std::to_string(getpid()) + ".sock";
+  server.Start(cfg);
+
+  // Baseline: a real client's disconnect synthesizes a reset.
+  int ascii_fd = ConnectClient(cfg.socket_path);
+  ASSERT_GE(ascii_fd, 0);
+  SendLine(ascii_fd, Msg("nvim", "contrast", R"({"action":"set","ascii":true})"));
+  ImeBridgePendingAction set_action;
+  ASSERT_TRUE(WaitForAction(server, ImeBridgePendingAction::kSet, &set_action));
+  close(ascii_fd);
+  ImeBridgePendingAction reset_action;
+  ASSERT_TRUE(WaitForAction(server, ImeBridgePendingAction::kReset, &reset_action));
+  EXPECT_EQ("nvim:contrast", reset_action.client_key);
+
+  // An identity connection registers no client at all, so its disconnect
+  // must produce no reset.
+  int id_fd = ConnectClient(cfg.socket_path);
+  ASSERT_GE(id_fd, 0);
+  SendLine(id_fd, R"({"v":1,"ns":"rime.ime","type":"identity",)"
+                  R"("data":{"socket":"default","pane":"%7","command":"claude"}})");
+
+  bool got_identity = false;
+  for (int i = 0; i < 200; ++i) {  // up to ~2s
+    auto id = server.GetPushedIdentity();
+    if (id && id->pane_id == "%7") {
+      got_identity = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  // Proves the message actually arrived, so the reset-free assertion below
+  // cannot pass simply because nothing happened.
+  ASSERT_TRUE(got_identity) << "identity never arrived";
+
+  close(id_fd);
+  ASSERT_TRUE(WaitForLiveConnections(server, 0));
+
+  auto q = server.TakePendingActions();
+  while (!q.empty()) {
+    EXPECT_NE(ImeBridgePendingAction::kReset, q.front().type)
+        << "an identity-only connection must not synthesize a reset on disconnect";
+    q.pop();
+  }
+
+  server.Stop();
+}

@@ -7,6 +7,8 @@ set(copilot_test_src
   auto_spacer_util_test.cc
   candidate_order_test.cc
   commit_text_test.cc
+  context_identity_test.cc
+  context_memory_test.cc
   history_test.cc
   ime_bridge_socket_test.cc
   ime_bridge_state_test.cc

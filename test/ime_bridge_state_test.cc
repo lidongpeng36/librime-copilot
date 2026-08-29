@@ -421,3 +421,127 @@ TEST(ImeBridgeState, ContextDepthIsCountedAndTruncationIsUnknown) {
   EXPECT_EQ(1, ctx->after_depth);
   EXPECT_EQ(rime::Truncation::kUnknown, ctx->truncation);
 }
+
+namespace {
+std::string IdentityMessage(const char* pane, const char* command) {
+  return std::string(
+             R"({"v":1,"ns":"rime.ime","type":"identity","data":{"socket":"default","pane":")") +
+         pane + R"(","command":")" + command + R"("}})";
+}
+}  // namespace
+
+TEST(ImeBridgeIdentity, UpdatesTheIdentityCell) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%7", "claude"));
+  auto id = state.GetPushedIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->socket, "default");
+  EXPECT_EQ(id->pane_id, "%7");
+  EXPECT_EQ(id->command, "claude");
+}
+
+TEST(ImeBridgeIdentity, LastPushWins) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%7", "claude"));
+  state.ProcessMessage(IdentityMessage("%3", "zsh"));
+  auto id = state.GetPushedIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->pane_id, "%3");
+}
+
+// The load-bearing one. The reporter connects and disconnects on EVERY pane
+// switch. If an identity message registered a client, every one of those
+// disconnects would synthesize a reset and flip ascii_mode on a machine nobody
+// is typing on. ProcessMessage returning "" is exactly what stops
+// HandleConnection from taking a connection refcount (ime_bridge.cc:237-241).
+TEST(ImeBridgeIdentity, RegistersNoClient) {
+  rime::ImeBridgeState state;
+  const std::string key = state.ProcessMessage(IdentityMessage("%7", "claude"));
+  EXPECT_EQ(key, "");
+  auto pending = state.TakePendingActions();
+  EXPECT_TRUE(pending.empty());
+}
+
+TEST(ImeBridgeIdentity, MalformedIdentityLeavesTheCellAlone) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%7", "claude"));
+  state.ProcessMessage(R"({"v":1,"ns":"rime.ime","type":"identity","data":{}})");
+  auto id = state.GetPushedIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->pane_id, "%7");
+}
+
+// An ascii message must keep behaving exactly as before.
+TEST(ImeBridgeIdentity, AsciiMessagesStillRegisterTheirClient) {
+  rime::ImeBridgeState state;
+  const std::string key = state.ProcessMessage(
+      R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+      R"("data":{"action":"set","ascii":true}})");
+  EXPECT_EQ(key, "nvim:1");
+}
+
+// ---------------------------------------------------------------------------
+// applied_mode_writes(): the seam per-context memory uses to tell "the user's
+// mode in this pane" from "a mode this queue applied here by accident".
+// ---------------------------------------------------------------------------
+
+TEST(ImeBridgeModeWrites, CountsEveryAppliedWriteAndNothingElse) {
+  ImeBridgeState s;
+  EXPECT_EQ(s.applied_mode_writes(), 0u);
+
+  ImeBridgePendingAction set;
+  set.type = ImeBridgePendingAction::kSet;
+  set.client_key = "nvim:1";
+  set.ascii = true;
+  ASSERT_TRUE(s.ApplyAction(set, /*current_ascii=*/false).should_set);
+  EXPECT_EQ(s.applied_mode_writes(), 1u);
+
+  // A restore that returns to base writes the mode too, and lands on whatever
+  // pane the keystroke is in just as a set does -- so it must count.
+  ImeBridgePendingAction restore;
+  restore.type = ImeBridgePendingAction::kRestore;
+  restore.client_key = "nvim:1";
+  ASSERT_TRUE(s.ApplyAction(restore, /*current_ascii=*/true).should_set);
+  EXPECT_EQ(s.applied_mode_writes(), 2u);
+
+  // An action that resolves to no write must NOT count: a tail that saw the
+  // counter move refuses to record, so an over-count silently costs the
+  // feature the keystrokes it exists to remember.
+  ImeBridgePendingAction extra_restore;
+  extra_restore.type = ImeBridgePendingAction::kRestore;
+  extra_restore.client_key = "nvim:1";  // depth is already 0
+  ASSERT_FALSE(s.ApplyAction(extra_restore, /*current_ascii=*/true).should_set);
+  EXPECT_EQ(s.applied_mode_writes(), 2u);
+
+  ImeBridgePendingAction unknown_unregister;
+  unknown_unregister.type = ImeBridgePendingAction::kUnregister;
+  unknown_unregister.client_key = "nobody:0";
+  ASSERT_FALSE(s.ApplyAction(unknown_unregister, /*current_ascii=*/true).should_set);
+  EXPECT_EQ(s.applied_mode_writes(), 2u);
+}
+
+// Monotonic and never reset: the memory feature samples it at the head of a
+// key event and compares at the tail, so any wrap-to-zero or per-event reset
+// would read as "the bridge did nothing" on exactly the event it did something.
+TEST(ImeBridgeModeWrites, IsMonotonicAcrossClientsAndResets) {
+  ImeBridgeState s;
+  ImeBridgePendingAction a;
+  a.type = ImeBridgePendingAction::kSet;
+  a.client_key = "nvim:1";
+  a.ascii = true;
+  s.ApplyAction(a, /*current_ascii=*/false);
+
+  ImeBridgePendingAction reset;
+  reset.type = ImeBridgePendingAction::kReset;
+  reset.client_key = "nvim:1";
+  reset.restore = true;
+  ASSERT_TRUE(s.ApplyAction(reset, /*current_ascii=*/true).should_set);
+
+  ImeBridgePendingAction b;
+  b.type = ImeBridgePendingAction::kSet;
+  b.client_key = "nvim:2";
+  b.ascii = false;
+  s.ApplyAction(b, /*current_ascii=*/true);
+
+  EXPECT_EQ(s.applied_mode_writes(), 3u);
+}

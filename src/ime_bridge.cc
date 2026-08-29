@@ -290,6 +290,19 @@ std::string ImeBridgeState::ProcessMessage(const std::string& message) {
     }
 
     std::string type = j.value("type", "");
+
+    if (type == "identity") {
+      auto data = j.value("data", json::object());
+      const std::string pane = data.value("pane", "");
+      if (pane.empty()) {
+        LOG(WARNING) << "[ImeBridge] identity message with no pane; ignored";
+      } else {
+        HandleIdentity(data.value("socket", ""), pane, data.value("command", ""));
+      }
+      // "" so HandleConnection takes no connection refcount for this message.
+      return "";
+    }
+
     if (type != "ascii") {
       LOG(WARNING) << "[ImeBridge] Unknown type: " << type;
       return "";
@@ -387,6 +400,24 @@ void ImeBridgeState::TouchClient(const std::string& client_key) {
   if (it != client_states_.end()) {
     it->second.last_active = std::chrono::steady_clock::now();
   }
+}
+
+void ImeBridgeState::HandleIdentity(const std::string& socket, const std::string& pane_id,
+                                    const std::string& command) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  identity_.socket = socket;
+  identity_.pane_id = pane_id;
+  identity_.command = command;
+  has_identity_ = true;
+  if (config_.debug) {
+    LOG(INFO) << "[ImeBridge] identity pushed: pane=" << pane_id << ", command=" << command;
+  }
+}
+
+std::optional<context_memory::Identity> ImeBridgeState::GetPushedIdentity() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!has_identity_) return std::nullopt;
+  return identity_;
 }
 
 void ImeBridgeState::RetainClientConnection(const std::string& client_key) {
@@ -750,6 +781,12 @@ ImeBridgeState::ApplyResult ImeBridgeState::ApplyAction(const ImeBridgePendingAc
       break;
   }
 
+  // Counted here rather than at the ctx->set_option() call site so every path
+  // that returns should_set is covered by construction -- a future action type
+  // cannot be added and forgotten. See applied_mode_writes().
+  if (result.should_set) {
+    applied_mode_writes_.fetch_add(1);
+  }
   return result;
 }
 

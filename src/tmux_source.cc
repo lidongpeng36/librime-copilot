@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -39,7 +40,14 @@ uint64_t g_generation = 1;
 bool g_snapshot_valid = false;
 uint64_t g_snapshot_generation = 0;
 std::string g_snapshot_frontmost;
-std::optional<SurroundingText> g_snapshot;
+// The memo holds the raw tmux snapshot, not the final SurroundingText: it is
+// shared by GetTmuxSurroundingText() (which applies ExtractContext to it) and
+// GetTmuxPaneIdentity() (which never needs ExtractContext at all). See
+// AcquireSnapshot(). A shared_ptr, not a value: a memo hit is consulted 2-3
+// times per key event, and Snapshot carries a pane dump plus two style
+// vectors -- a value memo would deep-copy several KB on every one of those
+// hits instead of bumping a refcount.
+std::shared_ptr<const tmux_detail::Snapshot> g_snapshot;
 
 // Test seams; null means "use the real thing". Read under g_mutex is
 // unnecessary -- tests install them before any query runs.
@@ -239,6 +247,156 @@ bool RunTmux(const std::string& bin, const std::vector<std::string>& args, int t
                     : tmux_detail::RunTmuxProcess(bin, args, timeout_ms, out);
 }
 
+// Requires g_mutex held. The gate runs against the live list rather than a
+// copy: this is the hot path, and deep-copying ten bundle ids on every
+// keystroke in every application -- before even knowing the app is a
+// terminal -- was pure waste.
+bool IsTerminalAppLocked(const std::string& frontmost) {
+  return !frontmost.empty() &&
+         std::find(g_config.app_bundle_ids.begin(), g_config.app_bundle_ids.end(), frontmost) !=
+             g_config.app_bundle_ids.end();
+}
+
+// The socket string the current config resolves to; "" means tmux's default.
+std::string CurrentSocket() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return g_config.socket;
+}
+
+// Everything GetTmuxSurroundingText() did before ExtractContext: the config
+// read, the frontmost gate, the binary probe, RunTmux, ParseTmuxOutput,
+// JudgeClients, and the memo. Split out so the identity path shares every
+// refusal that is about *reaching tmux*, and none of the ones about the text.
+std::shared_ptr<const tmux_detail::Snapshot> AcquireSnapshot() {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_config.enabled) {
+      return nullptr;
+    }
+  }
+
+  // The IME process is never frontmost while handling a key event, so this is
+  // the app being typed into. Without this gate, any app whose text field
+  // answers NSNotFound -- Electron, Java, assorted web inputs -- would be
+  // handed the terminal's text. ConfigureTmuxSource guarantees the list is
+  // non-empty, so a lookup miss means "not a terminal", not "unconfigured".
+  //
+  // Queried before the memo is consulted, and folded into the memo's key: it
+  // is far cheaper than a spawn, and it means a snapshot can never survive
+  // into a different application even if the generation somehow did.
+  const std::string frontmost = Frontmost();
+  // An empty id means "unknown app" (always true on non-Apple, and possible
+  // on Apple too), not "matches everything". Without this check, a user
+  // config with one empty app_bundle_ids entry -- or FrontmostBundleId()
+  // simply not knowing -- would turn the gate into "always pass".
+  if (frontmost.empty()) {
+    return nullptr;
+  }
+
+  std::string binary;
+  std::string configured_binary;
+  std::string socket;
+  int timeout_ms = 0;
+  uint64_t generation = 0;
+  bool probed_now = false;
+  bool debug = false;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!IsTerminalAppLocked(frontmost)) {
+      return nullptr;
+    }
+    if (g_snapshot_valid && g_snapshot_generation == g_generation &&
+        g_snapshot_frontmost == frontmost) {
+      return g_snapshot;
+    }
+    if (Clock::now() < g_backoff_until) {
+      return nullptr;
+    }
+    configured_binary = g_config.binary;
+    probed_now = ResolveBinaryLocked(configured_binary, &binary);
+    socket = g_config.socket;
+    timeout_ms = g_config.timeout_ms;
+    generation = g_generation;
+    debug = g_config.debug;
+  }
+
+  // Install a result for this generation. Skipped if a key event bumped the
+  // generation while the query was in flight: that snapshot describes a pane
+  // state the new generation has not vouched for, and a stale pane handed to
+  // AutoSpacer is exactly the cross-talk this source exists to prevent.
+  auto remember = [&](std::shared_ptr<const tmux_detail::Snapshot> value) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_generation == generation) {
+      g_snapshot = value;
+      g_snapshot_generation = generation;
+      g_snapshot_frontmost = frontmost;
+      g_snapshot_valid = true;
+    }
+    return value;
+  };
+
+  if (binary.empty()) {
+    if (probed_now) {
+      // One-shot: the probe result is cached until the next reconfigure, so
+      // this cannot fire per keystroke. Without it a user whose tmux is not at
+      // one of these paths enables the feature and gets nothing at all, with
+      // no way to tell whether the gate, the binary or the parse failed.
+      std::string paths;
+      if (!configured_binary.empty()) {
+        paths = configured_binary + " (from copilot/tmux_source/binary)";
+      } else {
+        for (const auto& candidate : tmux_detail::TmuxBinaryCandidates()) {
+          if (!paths.empty()) paths += ", ";
+          paths += candidate;
+        }
+      }
+      LOG(WARNING) << "[tmux] No executable tmux found; the tmux surrounding source is off. "
+                   << "Probed: " << paths
+                   << ". Set copilot/tmux_source/binary to an absolute path.";
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_backoff_until = Clock::now() + std::chrono::seconds(60);
+    return nullptr;
+  }
+
+  const std::vector<std::string> args = tmux_detail::BuildTmuxArgs(socket);
+
+  std::string out;
+  if (!RunTmux(binary, args, timeout_ms, &out)) {
+    // Logged at the transition, not while polling: we only reach here when the
+    // backoff has expired, so this is at most one line per backoff window.
+    if (debug) {
+      LOG(INFO) << "[tmux] Query failed (no server, timeout past " << timeout_ms
+                << "ms, or non-zero exit); backing off 5s";
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_backoff_until = Clock::now() + std::chrono::seconds(5);
+    return nullptr;
+  }
+
+  auto snap = tmux_detail::ParseTmuxOutput(out);
+  if (!snap) {
+    // A tmux that answers garbage will keep answering garbage.
+    if (debug) {
+      LOG(INFO) << "[tmux] Unparseable output (" << out.size() << " bytes); backing off 5s";
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_backoff_until = Clock::now() + std::chrono::seconds(5);
+    return nullptr;
+  }
+
+  // Transient, so no backoff: refuse this one query and try again next time.
+  const auto verdict = tmux_detail::JudgeClients(snap->client_activity, snap->focus_events);
+  if (verdict != tmux_detail::ClientVerdict::kAccept) {
+    if (debug) {
+      LOG(INFO) << "[tmux] Refusing to answer: " << tmux_detail::DescribeVerdict(verdict);
+    }
+    return remember(nullptr);
+  }
+
+  return remember(std::make_shared<tmux_detail::Snapshot>(std::move(*snap)));
+}
+
 }  // namespace
 
 const std::vector<std::string>& DefaultTerminalBundleIds() {
@@ -297,137 +455,17 @@ void InvalidateTmuxSnapshot() {
 }
 
 std::optional<SurroundingText> GetTmuxSurroundingText() {
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_config.enabled) {
-      return std::nullopt;
-    }
-  }
-
-  // The IME process is never frontmost while handling a key event, so this is
-  // the app being typed into. Without this gate, any app whose text field
-  // answers NSNotFound -- Electron, Java, assorted web inputs -- would be
-  // handed the terminal's text. ConfigureTmuxSource guarantees the list is
-  // non-empty, so a lookup miss means "not a terminal", not "unconfigured".
-  //
-  // Queried before the memo is consulted, and folded into the memo's key: it
-  // is far cheaper than a spawn, and it means a snapshot can never survive
-  // into a different application even if the generation somehow did.
-  const std::string frontmost = Frontmost();
-  // An empty id means "unknown app" (always true on non-Apple, and possible
-  // on Apple too), not "matches everything". Without this check, a user
-  // config with one empty app_bundle_ids entry -- or FrontmostBundleId()
-  // simply not knowing -- would turn the gate into "always pass".
-  if (frontmost.empty()) {
+  auto snap = AcquireSnapshot();
+  if (!snap) {
     return std::nullopt;
   }
 
-  std::string binary;
-  std::string configured_binary;
-  std::string socket;
-  int timeout_ms = 0;
   int prefix_chars = 1;
-  uint64_t generation = 0;
-  bool probed_now = false;
   bool debug = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    // The gate runs against the live list rather than a copy: this is the hot
-    // path, and deep-copying ten bundle ids on every keystroke in every
-    // application -- before even knowing the app is a terminal -- was pure
-    // waste.
-    if (std::find(g_config.app_bundle_ids.begin(), g_config.app_bundle_ids.end(), frontmost) ==
-        g_config.app_bundle_ids.end()) {
-      return std::nullopt;
-    }
-    if (g_snapshot_valid && g_snapshot_generation == g_generation &&
-        g_snapshot_frontmost == frontmost) {
-      return g_snapshot;
-    }
-    if (Clock::now() < g_backoff_until) {
-      return std::nullopt;
-    }
-    configured_binary = g_config.binary;
-    probed_now = ResolveBinaryLocked(configured_binary, &binary);
-    socket = g_config.socket;
-    timeout_ms = g_config.timeout_ms;
     prefix_chars = g_config.prefix_chars;
-    generation = g_generation;
     debug = g_config.debug;
-  }
-
-  // Install a result for this generation. Skipped if a key event bumped the
-  // generation while the query was in flight: that snapshot describes a pane
-  // state the new generation has not vouched for, and a stale pane handed to
-  // AutoSpacer is exactly the cross-talk this source exists to prevent.
-  auto remember = [&](std::optional<SurroundingText> value) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_generation == generation) {
-      g_snapshot = value;
-      g_snapshot_generation = generation;
-      g_snapshot_frontmost = frontmost;
-      g_snapshot_valid = true;
-    }
-    return value;
-  };
-
-  if (binary.empty()) {
-    if (probed_now) {
-      // One-shot: the probe result is cached until the next reconfigure, so
-      // this cannot fire per keystroke. Without it a user whose tmux is not at
-      // one of these paths enables the feature and gets nothing at all, with
-      // no way to tell whether the gate, the binary or the parse failed.
-      std::string paths;
-      if (!configured_binary.empty()) {
-        paths = configured_binary + " (from copilot/tmux_source/binary)";
-      } else {
-        for (const auto& candidate : tmux_detail::TmuxBinaryCandidates()) {
-          if (!paths.empty()) paths += ", ";
-          paths += candidate;
-        }
-      }
-      LOG(WARNING) << "[tmux] No executable tmux found; the tmux surrounding source is off. "
-                   << "Probed: " << paths
-                   << ". Set copilot/tmux_source/binary to an absolute path.";
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_backoff_until = Clock::now() + std::chrono::seconds(60);
-    return std::nullopt;
-  }
-
-  const std::vector<std::string> args = tmux_detail::BuildTmuxArgs(socket);
-
-  std::string out;
-  if (!RunTmux(binary, args, timeout_ms, &out)) {
-    // Logged at the transition, not while polling: we only reach here when the
-    // backoff has expired, so this is at most one line per backoff window.
-    if (debug) {
-      LOG(INFO) << "[tmux] Query failed (no server, timeout past " << timeout_ms
-                << "ms, or non-zero exit); backing off 5s";
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_backoff_until = Clock::now() + std::chrono::seconds(5);
-    return std::nullopt;
-  }
-
-  auto snap = tmux_detail::ParseTmuxOutput(out);
-  if (!snap) {
-    // A tmux that answers garbage will keep answering garbage.
-    if (debug) {
-      LOG(INFO) << "[tmux] Unparseable output (" << out.size() << " bytes); backing off 5s";
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_backoff_until = Clock::now() + std::chrono::seconds(5);
-    return std::nullopt;
-  }
-
-  // Transient, so no backoff: refuse this one query and try again next time.
-  const auto verdict = tmux_detail::JudgeClients(snap->client_activity, snap->focus_events);
-  if (verdict != tmux_detail::ClientVerdict::kAccept) {
-    if (debug) {
-      LOG(INFO) << "[tmux] Refusing to answer: " << tmux_detail::DescribeVerdict(verdict);
-    }
-    return remember(std::nullopt);
   }
 
   auto ctx = tmux_detail::ExtractContext(*snap, prefix_chars);
@@ -437,10 +475,10 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
                 << ", y=" << snap->cursor_y << ", width=" << snap->pane_width
                 << ", rows=" << snap->rows.size() << ")";
     }
-    return remember(std::nullopt);
+    return std::nullopt;
   }
 
-  const std::string client_key = tmux_detail::MakeClientKey(socket, snap->pane_id);
+  const std::string client_key = tmux_detail::MakeClientKey(CurrentSocket(), snap->pane_id);
   SurroundingText result;
   result.before = ctx->before;
   result.after = ctx->after;
@@ -448,7 +486,31 @@ std::optional<SurroundingText> GetTmuxSurroundingText() {
   result.before_depth = ctx->before_depth;
   result.after_depth = ctx->after_depth;
   result.truncation = ctx->truncation;
-  return remember(result);
+  return result;
+}
+
+std::optional<context_memory::Identity> GetTmuxPaneIdentity() {
+  auto snap = AcquireSnapshot();  // the same memoized acquire GetTmuxSurroundingText uses
+  if (!snap) return std::nullopt;
+  context_memory::Identity id;
+  // tmux's own answer first, the configured socket only as a fallback. The
+  // pushed rung reports ${TMUX%%,*} -- an absolute path in every case,
+  // including the default socket -- and the two rungs must build byte-identical
+  // keys or a pane gets two slots and its mode is restored from whichever one
+  // answered last. `CurrentSocket()` cannot supply that: it is empty on the
+  // default socket. It stays the fallback for a tmux too old to know
+  // `#{socket_path}`, which is the pre-existing behaviour.
+  id.socket = snap->socket_path.empty() ? CurrentSocket() : snap->socket_path;
+  id.pane_id = snap->pane_id;
+  id.command = snap->pane_command;
+  if (id.pane_id.empty()) return std::nullopt;
+  return id;
+}
+
+bool FrontmostIsTerminal() {
+  const std::string frontmost = Frontmost();
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return IsTerminalAppLocked(frontmost);
 }
 
 }  // namespace rime

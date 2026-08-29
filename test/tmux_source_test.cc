@@ -295,3 +295,90 @@ TEST_F(TmuxMemoTest, TheConfiguredTimeoutIsClampedToTheSharedFloor) {
   ASSERT_TRUE(rime::GetTmuxSurroundingText().has_value());
   EXPECT_EQ(seen_timeout, rime::kMaxTimeoutMs);
 }
+
+// The identity must survive the refusals that are about the *text*: a cursor
+// outside the captured pane makes the surrounding text unusable but says
+// nothing about which pane the caret is in. Routing identity through
+// GetTmuxSurroundingText() would drop it at random, silently merging two panes
+// into one memory slot.
+TEST_F(TmuxMemoTest, IdentitySurvivesCursorOutOfPane) {
+  // cursor_y past the last captured row: ExtractContext refuses.
+  g_stub_output = "CLI|1786506891\nFOC|1\nCUR|%7|0|9|80|zsh\nprompt\n";
+  rime::InvalidateTmuxSnapshot();
+  const int before = g_run_calls;
+  EXPECT_FALSE(rime::GetTmuxSurroundingText().has_value());
+  auto id = rime::GetTmuxPaneIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->pane_id, "%7");
+  EXPECT_EQ(id->command, "zsh");
+  // The snapshot memo is what saves this from a second spawn now that the
+  // ExtractContext refusal is no longer memoized on its own -- see
+  // AcquireSnapshot().
+  EXPECT_EQ(g_run_calls, before + 1);
+}
+
+TEST_F(TmuxMemoTest, IdentityRefusedForNonTerminalApp) {
+  g_stub_frontmost = "com.tencent.xinWeChat";
+  g_stub_output = "CLI|1786506891\nFOC|1\nCUR|%7|0|0|80|zsh\nprompt\n";
+  rime::InvalidateTmuxSnapshot();
+  EXPECT_FALSE(rime::GetTmuxPaneIdentity().has_value());
+  EXPECT_FALSE(rime::FrontmostIsTerminal());
+}
+
+TEST_F(TmuxMemoTest, IdentityRefusedWhenClientsAmbiguous) {
+  // Two attached clients stamped in the same second, focus-events off: the
+  // pre-existing JudgeClients refusal. It is about reaching tmux, not about
+  // the text, so identity must refuse with it.
+  g_stub_output =
+      "CLI|1786506891\nCLI|1786506891\nFOC|0\nCUR|%7|0|0|80|zsh\nprompt\n";
+  rime::InvalidateTmuxSnapshot();
+  EXPECT_FALSE(rime::GetTmuxPaneIdentity().has_value());
+}
+
+// The cross-rung key invariant, on the side that actually derives the socket.
+// The pushed rung (tools/rime_ctx_report.sh) can only report ${TMUX%%,*}, an
+// absolute path in EVERY case including the default socket, so the polled rung
+// must key on tmux's own `#{socket_path}` -- not on `copilot/tmux_source/socket`,
+// which is empty by default. They used to agree only by the coincidence that
+// MakeKey renders an empty socket as "default", which is also the default
+// socket's basename; that made every non-default socket build two slots for
+// one pane, and its mode came back from whichever rung answered last.
+TEST_F(TmuxMemoTest, IdentitySocketIsTmuxsOwnPathNotTheConfiguredOne) {
+  g_stub_output = "CLI|1786506891\nFOC|1\nSCK|/tmp/tmux-501/work\nCUR|%7|0|0|80|zsh\nprompt\n";
+  rime::InvalidateTmuxSnapshot();
+  auto id = rime::GetTmuxPaneIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->socket, "/tmp/tmux-501/work");
+  // The literal the reporter emits for TMUX=/tmp/tmux-501/work,... -- pinned
+  // on the shell side by tools/test/rime_ctx_report_test.py's
+  // test_socket_field_is_the_full_path_the_plugin_keys_on.
+  EXPECT_EQ(rime::context_memory::MakeKey(*id, true), "tmux:/tmp/tmux-501/work:%7|zsh");
+}
+
+TEST_F(TmuxMemoTest, IdentityFallsBackToTheConfiguredSocketWhenTmuxCannotSayIt) {
+  // A tmux too old to know `#{socket_path}` expands it to nothing. Falling
+  // back to the configured socket is exactly the pre-existing behaviour, so
+  // such a machine is no worse off than before this field was asked for.
+  rime::TmuxSourceConfig config;
+  config.enabled = true;
+  config.binary = "/bin/echo";
+  config.prefix_chars = 1;
+  config.socket = "/tmp/configured.sock";
+  rime::ConfigureTmuxSource(config);
+  g_stub_output = "CLI|1786506891\nFOC|1\nCUR|%7|0|0|80|zsh\nprompt\n";
+  rime::InvalidateTmuxSnapshot();
+  auto id = rime::GetTmuxPaneIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->socket, "/tmp/configured.sock");
+}
+
+TEST_F(TmuxMemoTest, IdentityAndSurroundingShareOneSpawn) {
+  // The whole cost argument for rung 2 is that identity rides the snapshot
+  // AutoSpacer forces anyway. If these ever stop sharing, that argument is
+  // void and nothing else would say so.
+  rime::InvalidateTmuxSnapshot();
+  const int before = g_run_calls;
+  rime::GetTmuxPaneIdentity();
+  rime::GetTmuxSurroundingText();
+  EXPECT_EQ(g_run_calls, before + 1);
+}
