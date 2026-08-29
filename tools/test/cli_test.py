@@ -1856,3 +1856,120 @@ class StatusImportTableTest(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 cli.main(["--rime-dir", str(rime_dir), "status"])
             self.assertNotIn("dictionary build will fail", output.getvalue())
+
+
+class ContextMemoryStatusTest(unittest.TestCase):
+    def _line(self, body: "str | None", enabled: bool = True) -> "str | None":
+        with tempfile.TemporaryDirectory() as d:
+            conf = Path(d) / "tmux.conf"
+            if body is not None:
+                conf.write_text(body)
+            return cli._context_memory_status(conf, enabled)
+
+    def _hooks(self, script: str, flag: str = "-ga") -> str:
+        return "".join(
+            f"set-hook {flag} {hook} 'run-shell -b \"{script}\"'\n" for hook in cli._CTX_HOOKS)
+
+    def _script(self, d: Path, *, executable: bool = True) -> Path:
+        path = d / "rime_ctx_report.sh"
+        path.write_text("#!/bin/sh\n")
+        if executable:
+            path.chmod(0o755)
+        return path
+
+    def test_reports_missing_tmux_hook(self):
+        line = self._line("set -g mouse on\n")
+        self.assertIn("polling", line)
+        self.assertIn("after-select-pane", line)
+
+    def test_reports_present_tmux_hook(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            line = self._line(self._hooks(str(script)))
+        self.assertIn("hook installed", line)
+        self.assertNotIn("polling", line)
+
+    def test_reports_half_installed_hook(self):
+        line = self._line(
+            "set-hook -ga after-select-pane 'run-shell -b \"rime_ctx_report.sh\"'\n"
+        )
+        self.assertIn("after-select-window", line)
+        self.assertIn("polling", line)
+
+    def test_reports_absent_tmux_conf(self):
+        line = self._line(None)
+        self.assertIn("polling", line)
+
+    # `set-hook -g` REPLACES an existing hook of that name; `-ga` appends, and
+    # is what the README now recommends. Matching the literal `set-hook -g `
+    # reported `missing` on a machine configured the right way.
+    def test_accepts_the_flag_variants_a_correct_config_uses(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            for flag in ("-g", "-ga", "-g -a", "-ga  "):
+                with self.subTest(flag=flag):
+                    self.assertIn("hook installed", self._line(self._hooks(str(script), flag)))
+
+    # The hook names a path, and matching the set-hook lines alone reported
+    # `hook installed` for a hook pointing into a checkout that had since been
+    # moved -- at which point it fires and does nothing, forever.
+    def test_flags_a_hook_naming_a_script_that_is_not_there(self):
+        line = self._line(self._hooks("/nonexistent/rime_ctx_report.sh"))
+        self.assertIn("does not exist", line)
+
+    def test_flags_a_hook_naming_a_script_that_is_not_executable(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d), executable=False)
+            line = self._line(self._hooks(str(script)))
+        self.assertIn("not executable", line)
+
+    # An off-by-default feature must not print a line on every run on every
+    # machine; that is how "read every line of status" stops being a
+    # discipline. Silence, unless the user did half the setup.
+    def test_silent_when_the_feature_is_off_and_nothing_was_configured(self):
+        self.assertIsNone(self._line("set -g mouse on\n", enabled=False))
+        self.assertIsNone(self._line(None, enabled=False))
+
+    def test_speaks_up_when_the_hooks_are_installed_but_the_feature_is_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            line = self._line(self._hooks(str(script)), enabled=False)
+        self.assertIsNotNone(line)
+        self.assertIn("off", line)
+        self.assertIn(cli.CTX_MEMORY_ENABLE_KEY, line)
+
+    def _enabled(self, body: str) -> bool:
+        with tempfile.TemporaryDirectory() as d:
+            built = Path(d) / "x.schema.yaml"
+            built.write_text(body)
+            return cli._context_memory_enabled([built])
+
+    # The same three shapes `_config_leaves` exists for: a flat patch key, a
+    # nested block, and the flow map Rime's deployer writes.
+    def test_enable_is_read_in_every_shape_the_key_reaches_a_schema_in(self):
+        self.assertTrue(self._enabled('"copilot/context_memory/enable": true\n'))
+        self.assertTrue(self._enabled("copilot:\n  context_memory:\n    enable: true\n"))
+        self.assertTrue(self._enabled("copilot:\n  context_memory: {enable: true, debug: false}\n"))
+        self.assertFalse(self._enabled("copilot:\n  context_memory:\n    enable: false\n"))
+        self.assertFalse(self._enabled("copilot:\n  rerank:\n    enable: true\n"))
+
+    def _order(self, processors: "list[str]") -> str:
+        with tempfile.TemporaryDirectory() as d:
+            built = Path(d) / "x.schema.yaml"
+            body = "engine:\n  processors:\n" + "".join(f"    - {p}\n" for p in processors)
+            built.write_text(body)
+            return cli._processor_order_status([built])
+
+    def test_order_ok_when_copilot_precedes_ascii_composer(self):
+        line = self._order(["copilot", "ascii_composer", "key_binder"])
+        self.assertIn("ok", line)
+
+    def test_order_flagged_when_copilot_follows_ascii_composer(self):
+        line = self._order(["ascii_composer", "copilot", "key_binder"])
+        self.assertIn("ascii_composer", line)
+        self.assertIn("x.schema.yaml", line)
+
+    def test_order_silent_when_copilot_absent(self):
+        # A schema that does not use this plugin is not a misconfiguration.
+        line = self._order(["ascii_composer", "key_binder"])
+        self.assertIn("n/a", line)

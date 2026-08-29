@@ -65,6 +65,161 @@ GRAMMAR_NAME = "zh-hans-t-essay-bgw.gram"
 MIN_GRAMMAR_SIZE = 20_000_000
 
 
+_CTX_HOOKS = ("after-select-pane", "after-select-window")
+
+CTX_MEMORY_ENABLE_KEY = "copilot/context_memory/enable"
+
+# Tolerant of how the hook is actually written, because `set-hook -g` is not
+# the only correct spelling and matching it literally reported `missing` on a
+# machine that was configured right. `-ga` (append) is in fact the form the
+# README recommends -- plain `-g` REPLACES any existing hook of that name and
+# silently loses it. Flags are matched as a group so `-ga`, `-g -a`, doubled
+# spaces and no flag at all all read as present.
+_CTX_HOOK_RES = {
+    hook: re.compile(r"set-hook\s+(?:-\w+\s+)*" + re.escape(hook) + r"\b")
+    for hook in _CTX_HOOKS
+}
+# The reporter path named inside a hook body, so `status` can check the script
+# is actually there. Quotes and the surrounding `run-shell -b "..."` are not
+# parsed -- only the path token is needed.
+_CTX_SCRIPT_RE = re.compile(r"""([^\s'"]*rime_ctx_report\.sh)""")
+
+
+def _context_memory_enabled(built_schemas: "list[Path]") -> bool:
+    """Whether any built schema turns per-context ascii_mode memory on.
+
+    The BUILT schema, not the source one, for the reason `_processor_order_status`
+    reads it: a `.custom.yaml` patch can set this without touching any
+    `.schema.yaml`. Read through `_config_leaves` so the flat key, the nested
+    block and the flow map Rime deploys all count as the same setting.
+    """
+    for path in built_schemas:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for leaf, value in _config_leaves(text):
+            if leaf == CTX_MEMORY_ENABLE_KEY and value.strip().lower() == "true":
+                return True
+    return False
+
+
+def _context_memory_status(tmux_conf: Path, enabled: bool) -> "str | None":
+    """One status line for the context-memory tmux hooks, or None for silence.
+
+    `None` when the feature is off and nothing suggests the user meant to turn
+    it on. This is an off-by-default feature, and a line printed on every run
+    on every machine -- most of which have no tmux at all -- is exactly the
+    always-on noise that teaches people to stop reading `status`.
+
+    The one exception is a machine whose `.tmux.conf` HAS the hooks while
+    `enable` is false: that user followed the README, got no behaviour, and
+    the old line said `hook installed` at them. Half-done setup is worth a
+    line; nothing at all is not.
+
+    With the feature on, this reports a degraded mode, never an error --
+    without the hooks it still works through the polling rung. It exists
+    because the difference is invisible from outside.
+    """
+    text = tmux_conf.read_text(errors="replace") if tmux_conf.exists() else ""
+    missing = [hook for hook in _CTX_HOOKS if not _CTX_HOOK_RES[hook].search(text)]
+
+    if not enabled:
+        if missing:
+            return None
+        return (f"context memory: off ({CTX_MEMORY_ENABLE_KEY} is false), but the tmux "
+                f"hooks are installed -- set it true in your schema patch, or drop them")
+
+    if missing:
+        where = "no ~/.tmux.conf" if not text else "not found in ~/.tmux.conf"
+        return ("context memory: polling; missing tmux hook(s): "
+                + ", ".join(missing)
+                + f" ({where}; a hook set from a source-file'd fragment is not visible here)"
+                + " -- see README 'Context memory'")
+
+    # The hooks are there, so the path they name had better be too. `status`
+    # used to match the set-hook lines and stop, which reported `hook
+    # installed` for a hook naming a script inside a checkout that had since
+    # been moved -- at which point the hook fires and does nothing, forever.
+    for match in _CTX_SCRIPT_RE.finditer(text):
+        script = Path(match.group(1)).expanduser()
+        if not script.is_file():
+            return f"context memory: tmux hook names {script}, which does not exist"
+        if not os.access(script, os.X_OK):
+            return (f"context memory: tmux hook names {script}, which is not executable "
+                    f"-- `chmod +x` it, or run `rime-copilot install` again")
+    return "context memory: hook installed (identity is pushed, no per-keystroke query)"
+
+
+def _ordered_list_block(text: str, opener: str, item: "re.Pattern" = None) -> "list[str]":
+    """Items of the list under `opener`, in file order.
+
+    The opener line opens the block; any non-item, non-blank line closes it,
+    so the next key's contents cannot leak in. `_processor_order_status` needs
+    relative position, and `_scan_block` wraps this for the callers that only
+    need membership -- one scanner, two shapes.
+    """
+    if item is None:
+        item = _LIST_ITEM
+    found: "list[str]" = []
+    inside = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith(opener):
+            inside = True
+            continue
+        if not inside:
+            continue
+        match = item.match(line)
+        if match:
+            found.append(match.group(1))
+        elif stripped:
+            inside = False
+    return found
+
+
+def _processor_order_status(built_schemas: "list[Path]") -> str:
+    """One status line for whether `copilot` precedes `ascii_composer`.
+
+    `AsciiComposer` returns `kRejected` for letter keys while `ascii_mode` is
+    true, and the engine breaks the processor loop on `kRejected`, so a
+    `copilot` ordered after it never runs in English mode at all -- context
+    memory then dies in the English-to-Chinese direction only, which reads as
+    flakiness rather than misconfiguration. The constructor already logs a
+    `LOG(WARNING)` for this; this line is a second witness, in the place
+    people actually look. A schema that does not list `copilot` at all does
+    not use this plugin -- that is not a misconfiguration, so it is silent.
+    Reads the BUILT schema, not the source `.schema.yaml`: a `.custom.yaml`
+    patch can reorder `engine/processors` without touching the source.
+    """
+    flagged: "list[str]" = []
+    any_copilot = False
+    for path in built_schemas:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        order = _ordered_list_block(text, "processors:")
+        if "copilot" not in order:
+            continue
+        any_copilot = True
+        if ("ascii_composer" in order
+                and order.index("ascii_composer") < order.index("copilot")):
+            flagged.append(path.name)
+    if flagged:
+        return (
+            "context memory: processor order WRONG in "
+            + ", ".join(flagged)
+            + " -- copilot must precede ascii_composer in engine/processors, "
+              "or context memory dies English-to-Chinese only"
+        )
+    if not any_copilot:
+        return "context memory: processor order n/a (no schema lists copilot)"
+    return "context memory: processor order ok (copilot precedes ascii_composer)"
+
+
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -289,24 +444,13 @@ def _scan_block(path: Path, opener: str, item: re.Pattern) -> set[str]:
     Scanned, not parsed, for the reason the rest of this module is: no YAML
     dependency for a handful of keys. Any non-item line closes the block, so
     the next key's contents cannot leak in.
+
+    Membership only. `_ordered_list_block` is the same scan and is the one
+    truth for it; two near-copies of a hand-rolled scanner would drift the
+    first time either grows a case.
     """
-    found: set[str] = set()
-    inside = False
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        if stripped.startswith(opener):
-            inside = True
-            continue
-        if not inside:
-            continue
-        match = item.match(line)
-        if match:
-            found.add(match.group(1))
-        elif stripped:
-            inside = False
-    return found
+    return set(_ordered_list_block(path.read_text(encoding="utf-8", errors="replace"),
+                                   opener, item))
 
 
 def enabled_schemas(rime_dir: Path) -> set[str] | None:
@@ -669,6 +813,18 @@ def cmd_status(args) -> int:
     _print_grammar_status(rime_dir)
     _print_model_status(rime_dir)
     _print_installed_status(rime_dir)
+    # Both lines are gated on the feature actually being on. It ships off, and
+    # a line that prints on every run on every machine -- including the ones
+    # with no tmux -- is how "read every line of `status`" stops being a
+    # discipline. The processor-order check still fires for everyone who
+    # enabled it, which is the only population it protects.
+    built_schemas = sorted((rime_dir / "build").glob("*.schema.yaml"))
+    ctx_enabled = _context_memory_enabled(built_schemas)
+    ctx_line = _context_memory_status(Path.home() / ".tmux.conf", ctx_enabled)
+    if ctx_line:
+        print(ctx_line)
+    if ctx_enabled:
+        print(_processor_order_status(built_schemas))
     return 0
 
 
