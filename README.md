@@ -207,8 +207,15 @@ bench_scorer --model ~/Library/Rime/private/rime40m-q8.gguf --iters 1000 \
 ## Usage
 
 * Put the db file (by default `copilot.db`) in rime user directory.
-* In `*.schema.yaml`, add `copilot` to the list of `engine/processors` before `key_binder`,
-add `copilot_translator` to the list of `engine/translators`;
+* In `*.schema.yaml`, add `copilot` to the list of `engine/processors` **before
+`ascii_composer`** — not merely before `key_binder`. `AsciiComposer` returns
+`kRejected` for letter keys while `ascii_mode` is true (librime
+`ascii_composer.cc:129-140`) and the engine breaks the processor loop on
+`kRejected` (`engine.cc:104-105`), so a `copilot` ordered after it never runs
+in English mode at all. Context memory is then dead in the English-to-Chinese
+direction only, which reads as flakiness rather than as misconfiguration; the
+constructor logs a `LOG(WARNING)` when it detects this.
+Also add `copilot_translator` to the list of `engine/translators`;
 or patch the schema with:
 ```yaml
 patch:
@@ -291,14 +298,39 @@ copilot:
     # default: true
     enable_right_space: true
 
+  # Per-tmux-pane memory of ascii_mode (macOS only). A terminal is ONE IMK
+  # client, so Squirrel gives it one Rime session and one ascii_mode shared by
+  # every pane in it; this splits that variable into N. See "Context memory"
+  # below, including how the plugin learns which pane you are in.
+  context_memory:
+    enable: false          # default false; the feature ships off
+    use_pane_command: true # default true; pane_current_command is part of the
+                           # identity, so a shell and `claude` in one pane hold
+                           # independent modes. The cost is that a short-lived
+                           # command (`git commit`, `less`) briefly makes the
+                           # pane a different key.
+    max_entries: 256       # default 256; LRU bound. pane ids grow monotonically
+                           # as panes come and go, so on a machine that is never
+                           # rebooted an unbounded table grows without limit.
+    debug: false           # default false; one LOG(INFO) line per identity
+                           # change. Every way this feature can fail is silent,
+                           # so this line is how "broken" is told from "off".
+
   # tmux pane scrape (macOS only, for terminal emulators IMK can never answer
   # for; see "tmux Source" below). default: disabled
   tmux_source:
-    enabled: true                    # default false; opt-in
+    enabled: true                    # default false; opt-in. Also the
+                                     # prerequisite for context_memory's polled
+                                     # rung -- without it only the tmux hook
+                                     # can say which pane you are in.
     binary: /opt/homebrew/bin/tmux   # optional; probed if empty
     socket: ""                       # optional; a full socket *path* for
                                      # `tmux -S`, not a `-L` name. Empty uses
-                                     # tmux's own default socket.
+                                     # tmux's own default socket. Not the
+                                     # context_memory key: that comes from
+                                     # tmux's own `#{socket_path}`, and this is
+                                     # only the fallback for a tmux too old to
+                                     # report it.
     app_bundle_ids: []               # optional; empty = the built-in terminal
                                      # list. A non-empty list *replaces* it.
     timeout_ms: 50                   # clamped to [5, 500]
@@ -863,6 +895,86 @@ using it.
 | `context` | Push surrounding text. `before` may hold several characters (its last one is the spacing boundary, the whole run is the prediction context); `after` is a single character |
 | `clear_context` | Clear stored surrounding text for this client |
 | `ping` | Health check |
+
+#### Context memory: telling the plugin which pane you are in
+
+`copilot/context_memory` can remember `ascii_mode` per tmux pane. **It ships
+off** — set `copilot/context_memory/enable: true` to turn it on (see
+[Configuration](#configuration) for the rest of the keys). Switched on, it
+learns which pane you are in two ways.
+
+**Which rung you want depends on one thing: whether
+`copilot/tmux_source/enabled` is on.** If it is — and it has to be for
+auto-spacing to work in a winit terminal like Alacritty — then AutoSpacer
+already queries tmux on every non-composing keystroke, the polled rung reads
+that same memoized snapshot, and its marginal cost is **zero**. On such a
+machine the hooks below buy nothing today and are not worth the coupling they
+add to `.tmux.conf`. They earn their keep when `tmux_source` is off, or if
+AutoSpacer ever stops fetching unconditionally.
+
+**Pushed.** tmux already knows when the pane changed, so it does not have to be
+asked:
+
+```tmux
+set-hook -ga after-select-pane   'run-shell -b "~/Library/Rime/private/bin/rime_ctx_report.sh"'
+set-hook -ga after-select-window 'run-shell -b "~/Library/Rime/private/bin/rime_ctx_report.sh"'
+```
+
+`-ga`, not `-g`: **`-g` replaces** any existing hook of that name, so a config
+that already hooks `after-select-pane` loses it silently. `-ga` appends.
+
+That path is where `rime-copilot install` puts the script, and naming it
+rather than a path inside a git checkout is the point: move or delete the
+checkout and a hook naming it stops firing, silently. `rime-copilot status`
+checks the script the hook names is actually there.
+
+The script writes one line and exits:
+
+```json
+{"v":1,"ns":"rime.ime","type":"identity","data":{"socket":"/tmp/tmux-501/default","pane":"%7","command":"claude"}}
+```
+
+`socket` is the whole socket path (`${TMUX%%,*}`), because the polled rung
+below keys on tmux's own `#{socket_path}` and the two must build the same key
+for the same pane — otherwise a pane gets two memory slots and its mode comes
+back from whichever rung answered last.
+
+`type: "identity"` is **not** an `ascii` message and deliberately registers no
+bridge client. The reporter connects and disconnects on every pane switch; a
+registered client would have a reset synthesized on each disconnect and flip
+`ascii_mode` on a machine nobody is typing on.
+
+**Polled (needs `copilot/tmux_source/enabled: true`).** Without the hooks the
+plugin reads the pane from the tmux snapshot it takes for surrounding text —
+but that snapshot is itself opt-in, and with stock config there is none, so
+this rung is dead and the feature never acts.
+
+With it on, the cost is **not** a tmux query per keystroke, which an earlier
+draft of this section claimed. `AutoSpacer::Process` already calls
+`GetSurroundingContext()` unconditionally, so that query happens anyway, and
+the identity rides the same memoized snapshot — one `posix_spawn` per key
+event, exactly as before this feature existed. `IdentityAndSurroundingShareOneSpawn`
+in `test/tmux_source_test.cc` is what pins that, and it is the whole cost
+argument for this rung: if it ever goes red, this paragraph is wrong.
+
+That zero is inherited, not structural. It holds only while AutoSpacer fetches
+unconditionally. `rime-copilot status` reports which rung is in effect.
+
+**Known limit: with the hooks installed, a macOS window switch is invisible.**
+This is the one case where adding the hooks makes behaviour *less* correct
+than polling, and it is worth knowing before you add them.
+
+The pushed value answers whenever a terminal is frontmost and the cell is
+non-empty, so it bypasses every refusal the polled rung makes — including its
+refusal when several tmux clients are attached indistinguishably. Two terminal
+*windows* attached to one tmux server is exactly that case: selecting a pane in
+window A fires the hook, and then switching macOS windows to B **fires no tmux
+hook at all**, so the cell still names A's pane and B's mode is recorded into
+A's slot.
+
+Not fixed rather than not noticed. Validating the pushed value needs the very
+query rung 1 exists to avoid, and a staleness window does not help either — the
+cell is fresh, it is simply wrong.
 
 ### Multi-Client Behavior
 

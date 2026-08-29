@@ -915,6 +915,7 @@ other**, and most changes touch more than one:
 | `*.custom.yaml`, the lexicon, `dict.json`, `private.dict.yaml` + `private/personal.dict.yaml`, the model | the vault, via `backup` / `restore` |
 | the **user dictionary** (`private.userdb`) | Rime's own user-data sync, from Squirrel's menu — NOT the vault |
 | the design records (`docs/superpowers/`) | iCloud, plus a symlink made by hand |
+| the **tmux hooks** (`~/.tmux.conf`) | nothing — hand-edited per machine, then `tmux source-file ~/.tmux.conf` or a fresh server. A fourth channel with no automation at all: `rime-copilot install` places `private/bin/rime_ctx_report.sh`, but nothing writes the two `set-hook -ga` lines that call it, and a machine without them silently falls back to context memory's polled rung (which itself needs `copilot/tmux_source/enabled`). `status` reports whether they are there, and whether the script they name still is |
 | the **telemetry** (`private/copilot_telemetry/`) | `<sync_dir>/copilot_telemetry/` — `tools/sync_telemetry.sh` by hand, or `copilot/telemetry/auto_sync: true` on a 30-min timer. NOT the vault, and never merged: one file per machine, so collecting is concatenation |
 
 **The telemetry filename is `installation_id`, and it used to go stale.** The
@@ -1111,7 +1112,14 @@ Invariants to preserve when touching this:
   drove the wrong laptop.
 
 ## Deployment / config
-Users add `copilot` to `engine/processors` (before `key_binder`) and `copilot_translator`
+Users add `copilot` to `engine/processors` **before `ascii_composer`** — not
+merely before `key_binder`. `AsciiComposer` returns `kRejected` for letter
+keys while `ascii_mode` is true (librime `ascii_composer.cc:129-140`) and the
+engine breaks the processor loop on `kRejected` (`engine.cc:104-105`), so a
+`copilot` ordered after it never runs in English mode at all. Context memory
+is then dead in the English-to-Chinese direction only, which reads as
+flakiness rather than as misconfiguration; the constructor logs a
+`LOG(WARNING)` when it detects this. Also add `copilot_translator`
 to `engine/translators`, plus a `copilot` switch. Full schema-config reference (db path,
 `max_candidates`, `max_iterations`, LLM `model`/`n_predict`, `ime_bridge`, `auto_spacer`)
 lives in `README.md`.
