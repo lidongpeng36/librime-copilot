@@ -27,6 +27,19 @@ INSTALL_MANIFEST = ".installed.json"
 ENTRY_POINT = "rime-copilot"
 PACKAGE = "rime_copilot"
 
+# Payload files that are neither the entry point nor a package module.
+#
+# `rime_ctx_report.sh` is here because a `.tmux.conf` hook has to name a
+# stable path, and the only stable path is the installed one: the bootstrap
+# promises "no checkout needed after that", so a hook pointing into a git
+# working tree stops firing the moment that tree is moved or deleted --
+# silently, and `status` went on reporting `hook installed` because it
+# matched on the set-hook lines and never asked whether the script was there.
+#
+# Installed with copy2 like every non-entry-point file, which preserves the
+# executable bit; `run-shell` needs it.
+_EXTRA_PAYLOAD = ("rime_ctx_report.sh",)
+
 # Present in a real checkout, never in an installed copy: apply_install only
 # ever writes payload_files() plus the builder into dest, and test/ is not
 # among them. Used to refuse installing *from* an installed copy, which would
@@ -43,7 +56,7 @@ class Installed:
 
 
 def payload_files(source_root: Path) -> list[str]:
-    """The entry point plus every `rime_copilot/*.py`, relative to `source_root`.
+    """The entry point, every `rime_copilot/*.py`, and `_EXTRA_PAYLOAD`.
 
     Derived from the filesystem, not a hardcoded list, so a module added
     later is installed without editing this function. The package listing is
@@ -57,6 +70,9 @@ def payload_files(source_root: Path) -> list[str]:
     if package.is_dir():
         for path in sorted(package.glob("*.py")):
             files.append(f"{PACKAGE}/{path.name}")
+    for rel in _EXTRA_PAYLOAD:
+        if (source_root / rel).is_file():
+            files.append(rel)
     return files
 
 

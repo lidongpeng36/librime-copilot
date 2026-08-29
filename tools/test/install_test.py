@@ -75,6 +75,25 @@ class PayloadFiles(InstallFixture):
         after = set(I.payload_files(self.source_root))
         self.assertIn("rime_copilot/dictdb.py", after)
 
+    # The .tmux.conf hook has to name a stable path, and the installed copy is
+    # the only stable path there is -- the bootstrap promises no checkout is
+    # needed after `install`. Left out of the payload, the README could only
+    # tell people to point a hook into a git working tree, which stops firing
+    # the moment that tree moves while `status` still says `hook installed`.
+    def test_installs_the_tmux_reporter_with_its_executable_bit(self):
+        _write(self.source_root / "rime_ctx_report.sh", "#!/bin/sh\nreport\n", executable=True)
+        self.assertIn("rime_ctx_report.sh", I.payload_files(self.source_root))
+        self.install()
+        installed = self.dest / "rime_ctx_report.sh"
+        self.assertTrue(installed.is_file())
+        self.assertEqual(installed.read_text(), "#!/bin/sh\nreport\n")
+        # `run-shell` execs it; without the bit the hook fires and does nothing.
+        self.assertTrue(os.access(installed, os.X_OK))
+        # Recorded in the manifest, so `status` reports it edited in place or
+        # fallen behind the repo, exactly as it does for the modules.
+        manifest = I.read_install_manifest(self.dest)
+        self.assertIn("rime_ctx_report.sh", manifest.files)
+
     def test_excludes_pycache(self):
         # __pycache__ holds .pyc files, but plant a .py-named file inside it
         # too: payload_files must not descend into it regardless of name.
