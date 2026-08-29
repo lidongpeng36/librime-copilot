@@ -2,6 +2,7 @@
 
 #include <rime/candidate.h>
 #include <rime/composition.h>
+#include <rime/config.h>
 #include <rime/context.h>
 #include <rime/deployer.h>
 #include <rime/dict/db_pool_impl.h>
@@ -15,9 +16,12 @@
 
 #include <algorithm>
 #include <ctime>
+#include <memory>
 #include <set>
+#include <string>
 
 #include "auto_spacer.h"
+#include "context_identity.h"
 #include "copilot_engine.h"
 #include "ime_bridge.h"
 #include "prediction_context.h"
@@ -89,6 +93,13 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
     config->GetInt("copilot/telemetry/sample_ok", &telemetry_options_.sample_ok);
     config->GetBool("copilot/telemetry/auto_sync", &telemetry_options_.auto_sync);
     telemetry::ClampOptions(telemetry_options_);
+
+    config->GetBool("copilot/context_memory/enable", &context_memory_options_.enable);
+    config->GetBool("copilot/context_memory/use_pane_command",
+                    &context_memory_options_.use_pane_command);
+    config->GetInt("copilot/context_memory/max_entries", &context_memory_options_.max_entries);
+    config->GetBool("copilot/context_memory/debug", &context_memory_options_.debug);
+    if (context_memory_options_.max_entries < 1) context_memory_options_.max_entries = 1;
 
     // Both the IMK hook and the tmux pane scrape return this many characters
     // — the prediction context and the re-ranking filter each have their own
@@ -185,6 +196,35 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
         }
       }
     }
+
+    // AsciiComposer returns kRejected for letter keys while ascii_mode is true
+    // (librime ascii_composer.cc:129-140) and the engine breaks the processor
+    // loop on kRejected (engine.cc:104-105). Ordered after it, this processor
+    // never runs in English mode, and context memory is dead in the
+    // English-to-Chinese direction only -- which reads as flakiness, not as
+    // misconfiguration. Warn loudly rather than let that be diagnosed by hand.
+    //
+    // Inside this block rather than re-fetching the config for itself: the
+    // re-fetch also dereferenced the result without a null check, which the
+    // `if` opening this block is exactly what provides.
+    if (context_memory_options_.enable) {
+      if (auto processors = config->GetList("engine/processors")) {
+        int copilot_at = -1, ascii_at = -1;
+        for (size_t i = 0; i < processors->size(); ++i) {
+          auto value = processors->GetValueAt(i);
+          if (!value) continue;
+          const std::string name = value->str();
+          if (copilot_at < 0 && name == "copilot") copilot_at = static_cast<int>(i);
+          if (ascii_at < 0 && name == "ascii_composer") ascii_at = static_cast<int>(i);
+        }
+        if (copilot_at >= 0 && ascii_at >= 0 && copilot_at > ascii_at) {
+          LOG(WARNING) << "[ctxmem] `copilot` is ordered AFTER `ascii_composer` in "
+                          "engine/processors. Context memory will not work in the "
+                          "English-to-Chinese direction. Move `copilot` before "
+                          "`ascii_composer`.";
+        }
+      }
+    }
   }
 
   // Only worth tracking AC/battery state -- and paying for the monitor
@@ -228,6 +268,12 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
       CopilotAndUpdate(ctx, text);  // ✨ 立即启动后续预测
     }));
   }
+  // The table is process-wide (context_memory.h); only last_key_ lives here,
+  // in the per-session Step. Built unconditionally so ProcessKeyEvent never
+  // has to null-check it -- with `enable` false the Step itself is inert.
+  context_memory_step_ =
+      std::make_unique<context_memory::Step>(&context_memory::Instance(), context_memory_options_);
+
   LOG(INFO) << "Copilot plugin Loaded. Disabled plugins: " << disabled_plugins.size();
 }
 
@@ -283,8 +329,93 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
   // tmux's grid cannot change until something is committed. That freezes the
   // snapshot at composition start, which is also what GetPredictionContext
   // already documents itself as relying on.
+
+  // A scope guard because ProcessKeyEvent has seven return points. Seven
+  // hand-written assignments will eventually be six, and the branch that loses
+  // one is where the mode was just toggled -- after which the feature records
+  // the wrong value silently, which is exactly the bug it exists to fix.
+  //
+  // `step` stays null unless the head below actually ran, and `resolved` stays
+  // false unless the head resolved an identity THIS event: without that
+  // condition an event whose identity is momentarily unavailable (tmux timed
+  // out, the server went away) would have the guard write the current mode
+  // into the slot of the pane the user was in before.
+  //
+  // `bridge_writes` is sampled at the head and compared here because
+  // ImeBridge's pending-action queue carries no context: an action queued by
+  // pane A's nvim is applied by RunProcessors on whatever pane the next
+  // keystroke lands in, and without this the tail would read the bridge's
+  // value and record it as that pane's -- turning a one-keystroke
+  // misapplication into a remembered one. Precedence is unchanged: the bridge
+  // still wins the mode, it just does not get to name a pane.
+  struct ContextMemoryTail {
+    context_memory::Step* step;
+    Context* ctx;
+    std::string key;
+    bool resolved;
+    uint64_t bridge_writes;
+    ~ContextMemoryTail() {
+      if (!step) return;
+      if (resolved && ctx) {
+        const bool bridge_moved =
+            ImeBridgeServer::Instance().applied_mode_writes() != bridge_writes;
+        step->OnTail(key, ctx->get_option("ascii_mode"), bridge_moved);
+      } else {
+        step->OnTailUnresolved();
+      }
+    }
+  } tail{nullptr, ctx, std::string(), false, 0};
+
   if (!ctx || !ctx->IsComposing()) {
     InvalidateTmuxSnapshot();
+
+    // Inside this guard on purpose, and not as an optimisation: the preedit is
+    // drawn by the frontend and never reaches the PTY, so the pane provably
+    // cannot change mid-composition -- and changing ascii_mode there would be
+    // destructive.
+    if (context_memory_options_.enable && ctx) {
+      tail.step = context_memory_step_.get();
+      // Sampled BEFORE RunProcessors, which is where ImeBridge::Process drains
+      // the queue -- a sample taken any later would already include the write
+      // it exists to detect.
+      tail.bridge_writes = ImeBridgeServer::Instance().applied_mode_writes();
+      if (auto resolved = GetContextIdentity()) {
+        const std::string key =
+            context_memory::MakeKey(resolved->id, context_memory_options_.use_pane_command);
+        const std::string previous = context_memory_step_->last_key();
+        // Contains, not Get: Get splices the LRU, and a read with a side
+        // effect has no place in what is only ever a diagnostic. Evaluated
+        // unconditionally rather than under `debug` on purpose -- hoisting it
+        // under the flag would make the flag a behaviour switch.
+        const bool had = context_memory_step_->Contains(key);
+        const bool before = ctx->get_option("ascii_mode");
+        context_memory_step_->OnHead(key, before,
+                                     [ctx](bool v) { ctx->set_option("ascii_mode", v); });
+        if (context_memory_options_.debug && key != previous) {
+          // Three outcomes, not two. OnHead sets the mode only when a
+          // remembered value exists AND differs, so "restored" was printed
+          // over events where nothing was written: the value was truthful and
+          // the verb was not, which in the one line this feature has to be
+          // debugged through is the difference between "it acted" and "it
+          // agreed".
+          const bool after = ctx->get_option("ascii_mode");
+          std::string what;
+          if (!had) {
+            what = " no memory; leaving ascii_mode as-is";
+          } else if (after != before) {
+            what = std::string(" restored ascii_mode=") + (after ? "1" : "0");
+          } else {
+            what = std::string(" remembered ascii_mode=") + (after ? "1" : "0") + ", already set";
+          }
+          LOG(INFO) << "[ctxmem] " << (previous.empty() ? "(none)" : previous) << " -> " << key
+                    << " via " << DescribeIdentitySource(resolved->source) << what;
+        }
+        tail.key = key;
+        tail.resolved = true;
+      } else {
+        context_memory_step_->OnUnresolved();
+      }
+    }
   }
 
   // LOG(INFO) << "IsCompusing: " << ctx->IsComposing() << ", HasMenu:" << ctx->HasMenu()

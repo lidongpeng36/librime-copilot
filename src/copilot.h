@@ -3,7 +3,9 @@
 #include <rime/processor.h>
 
 #include <ctime>
+#include <memory>
 
+#include "context_memory_step.h"
 #include "rerank_trace.h"
 #include "telemetry.h"
 #include "telemetry_stats.h"
@@ -168,6 +170,12 @@ class Copilot : public Processor {
   // affecting change -- PushInput/Pop/DeleteInput/Clear), so the warm fires
   // exactly on the false->true edge instead of once per keystroke.
   bool was_composing_ = false;
+  // copilot/context_memory/*. `enable` defaults to false: the feature ships
+  // off, and every read below only ever narrows that.
+  context_memory::Options context_memory_options_;
+  // Holds last_key_; see context_memory_step.h for why it is per-session while
+  // the table behind it is process-wide.
+  std::unique_ptr<context_memory::Step> context_memory_step_;
   std::vector<std::shared_ptr<Processor>> processors_;
 };
 
