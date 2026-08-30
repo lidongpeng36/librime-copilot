@@ -26,7 +26,7 @@
 
 #include <gtest/gtest.h>
 
-#include "auto_spacer.h"
+#include "plugin_commit.h"
 
 #include <rime/candidate.h>
 #include <rime/commit_history.h>

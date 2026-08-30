@@ -11,10 +11,12 @@ set(copilot_test_src
   commit_text_test.cc
   context_identity_test.cc
   context_memory_test.cc
+  history_spacing_table_test.cc
   history_test.cc
   ime_bridge_socket_test.cc
   ime_bridge_state_test.cc
   learning_commit_test.cc
+  plugin_commit_test.cc
   prediction_context_test.cc
   raw_input_order_test.cc
   replay_align_test.cc

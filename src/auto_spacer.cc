@@ -11,7 +11,8 @@
 #include <cctype>
 
 #include "auto_spacer_util.h"
-#include "surrounding_source.h"
+#include "caret_context.h"
+#include "plugin_commit.h"
 
 namespace rime {
 
@@ -47,10 +48,6 @@ inline bool IsPairPunctKey(int keycode) {
 inline bool IsModifierPunctKey(int keycode) {
   return keycode == XK_exclam || keycode == XK_question || keycode == XK_colon ||
          IsPairPunctKey(keycode);
-}
-
-inline bool IsAsciiPunctuationCode(int keycode) {
-  return keycode >= 0 && keycode < 0x80 && std::ispunct(static_cast<unsigned char>(keycode));
 }
 
 // 从 schema 的 punctuator/full_shape 里查找 keycode 对应的"默认" 中文标点.
@@ -216,10 +213,7 @@ ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_even
     // ctx->set_input(input + std::string(1, keycode));
     auto str = input + std::string(1, keycode);
     auto commit_str = NeedAddSpace(ctx, key_event) ? " " + str : str;
-    engine_->CommitText(commit_str);
-    if (!commit_str.empty()) ctx->commit_history().push_back({"raw", commit_str});
-    ctx->Clear();
-    return kAccepted;
+    return CommitThroughPlugin(engine_, ctx, commit_str, /*learn=*/false);
   }
   int n_cand = -1;
   const auto& composition = ctx->composition();
@@ -236,10 +230,7 @@ ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_even
   if (num > n_cand && !input.empty()) {
     auto str = input + std::string(1, keycode);
     auto commit_str = NeedAddSpace(ctx, key_event) ? " " + str : str;
-    engine_->CommitText(commit_str);
-    if (!commit_str.empty()) ctx->commit_history().push_back({"raw", commit_str});
-    ctx->Clear();
-    return kAccepted;
+    return CommitThroughPlugin(engine_, ctx, commit_str, /*learn=*/false);
   }
   return kNoop;
 }
@@ -273,66 +264,6 @@ std::string ComputeSpaceCommitText(Context* ctx, const std::string& before,
   return DecorateCommitText(text, before, after, content_is_ascii, enable_right_space);
 }
 
-bool NotifyForLearning(Context* ctx) {
-  // Same guard Context::Commit() itself uses (context.cc:19-20) -- notifying
-  // Memory::OnCommit with nothing composed is pointless work, not a bug, but
-  // there is no reason to pay for it.
-  if (!ctx->IsComposing()) {
-    return false;
-  }
-  // Mark the segment the user just confirmed as confirmed, or Memory will
-  // queue it and never save it.
-  //
-  // ScriptTranslator::ProcessSegmentOnCommit (script_translator.cc:273-287)
-  // pushes each recognized phrase into a MEMBER queue_ and flushes it only
-  // when `!recognized || seg.status >= Segment::kConfirmed`. That status is
-  // assigned in exactly one place in all of librime -- ConcreteEngine::OnSelect
-  // (engine.cc:264) -- reached only through select_notifier_, and AutoSpacer's
-  // commit paths go through neither Context::Select() nor
-  // ConfirmCurrentSelection() (the number-key site assigns seg.selected_index
-  // directly, precisely to avoid Rime's select path). Rime's own Space handling
-  // does confirm, which is why the machine predating the surrounding-text
-  // sources learned normally.
-  //
-  // Left unmarked the phrase is not merely unsaved: it sits in the queue until
-  // some later commit has an unrecognized candidate, and is then written as ONE
-  // entry spanning several unrelated commits -- the cross-word-boundary
-  // fragment class tools/rime_copilot/clean.py exists to prune, generated into
-  // the user dictionary rather than imported into it. Measured before this
-  // line existed: two single-segment Space commits produced two EMPTY LevelDB
-  // WriteBatches and learned nothing, while an earlier multi-commit sentence
-  // was memorised as a single 30-character run.
-  //
-  // Setting the flag rather than calling ConfirmCurrentSelection() is
-  // deliberate: that fires select_notifier_ -> ConcreteEngine::OnSelect, which
-  // also runs seg.Close() and composition().Forward(), and under `_auto_commit`
-  // calls ctx->Commit() -- committing again text the caller has already emitted
-  // itself. The flag is the whole of what Memory reads, and it is true: Space
-  // IS the user confirming this segment.
-  if (!ctx->composition().empty()) {
-    Segment& last = ctx->composition().back();
-    if (last.status < Segment::kConfirmed) {
-      last.status = Segment::kConfirmed;
-    }
-  }
-  // Restored by scope exit, not by a trailing statement: the notifier reaches
-  // Memory::Memorize and through it LevelDB, and if anything there throws, a
-  // `dumb` left set makes Context::GetCommitText() return "" for the life of
-  // the context -- the input method would stop committing text, silently and
-  // with no symptom pointing here.
-  struct DumbRestorer {
-    Context* ctx;
-    bool previous;
-    ~DumbRestorer() { ctx->set_option("dumb", previous); }
-  } restorer{ctx, ctx->get_option("dumb")};
-  ctx->set_option("dumb", true);
-  // Deliberately NOT ctx->Commit(): see the declaration comment in
-  // auto_spacer.h for why this stops short of the Clear() that Commit() would
-  // perform, and leaves it to the caller.
-  ctx->commit_notifier()(ctx);
-  return true;
-}
-
 // Path 1: Process with real surrounding context (completely independent)
 ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyEvent& key_event,
                                                         const SurroundingText& surrounding,
@@ -346,13 +277,19 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
 
   auto& client_state = client_states_[effective_client_key];
   const auto& latest_text = ctx->commit_history().latest_text();
+  // Guarded: a fresh session where a real surrounding source answers on the
+  // very first keystroke has an empty commit_history, and back() on an empty
+  // history is undefined behaviour. DLOG expands to a real statement whenever
+  // NDEBUG is undefined -- a plain `cmake -B build` -- so this is not just a
+  // debug-build cosmetic.
+  const std::string last_type =
+      ctx->commit_history().empty() ? std::string() : ctx->commit_history().back().type;
   DLOG(INFO) << "[SurroundingText]" << std::showbase << std::hex << " keycode=" << keycode << "("
              << string(1, keycode) << ")" << ", input='" << input << "'"
              << ", ascii_mode=" << ascii_mode << ", latest_text='" << latest_text << "'["
-             << ctx->commit_history().back().type << "], modifier=" << key_event.modifier()
-             << ", raw_before='" << raw_before << "', raw_after='" << raw_after
-             << "', client_before='" << client_state.before << "', client_after='"
-             << client_state.after << "'";
+             << last_type << "], modifier=" << key_event.modifier() << ", raw_before='"
+             << raw_before << "', raw_after='" << raw_after << "', client_before='"
+             << client_state.before << "', client_after='" << client_state.after << "'";
 
   // 带 Ctrl/Alt/Super 的通常是快捷键, 不走标点/输入处理. Shift 要放行, 因为
   // ASCII 标点键本身就依赖 Shift (例如 '@' = Shift+2, '#' = Shift+3).
@@ -369,7 +306,7 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   //      用户在连续输入中并不希望看到.
   // 这里直接从 schema 读取 punctuator/full_shape 下的映射, 取默认候选
   // (ConfigValue 本身 / ConfigList 第 0 项 / ConfigMap 的 commit 或 pair[0])
-  // 通过 sink 直接上屏, 并写入 commit_history 为 "punct" 类型.
+  // 通过 CommitThroughPlugin 上屏, 和其它上屏路径走同一个原语.
   // 注意: 此分支在 input empty / composing / ascii_mode 等检查之前, 所以无论
   // 当前 composing 状态如何, 只要非 ASCII 且非英文标点模式, 标点键一律走
   // 强制上屏路径 (composition 如果存在, Rime 的 Punctuator 本来也会在
@@ -381,9 +318,38 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
                << std::hex << keycode << std::dec << ") modifier=0x" << std::hex
                << key_event.modifier() << std::dec << " -> '" << punct_text << "'";
     if (!punct_text.empty()) {
-      engine_->sink()(punct_text);
-      ctx->commit_history().push_back({"punct", punct_text});
-      return kAccepted;
+      // Was engine_->sink() plus a forged {"punct", ...} record. Three
+      // consequences of routing it through the primitive, all deliberate:
+      //
+      // 1. The record librime pushes inside CommitText is {"raw", ...}. An
+      //    earlier version of this comment said no reader in this tree
+      //    distinguishes the two; that was wrong. copilot.cc:590 does union
+      //    punct/raw/thru and filters.cc:63 does ask only for thru, but
+      //    NeedAddSpace (this file) is a third reader, and it branches on
+      //    `type == "raw" || type == "thru"` -- a block a punct record used to
+      //    skip and now enters. What keeps that inert is not the absence of a
+      //    reader but the block's second condition:
+      //    IsAlphabetKey(LastAsciiCharCode(latest_text)), and no
+      //    punctuator/full_shape or punctuator/symbols value ends in an ASCII
+      //    letter or digit. The path is reachable -- a surrounding source can
+      //    answer for the punct keystroke and stop answering before the next
+      //    Enter or number key, which is what puts NeedAddSpace on this
+      //    record -- so anyone widening that block must re-check this.
+      // 2. The text now passes through ConcreteEngine::FormatText, which
+      //    sink() bypassed. Visible only on a schema with a `formatters:`
+      //    section; this one has none.
+      // 3. The commit now ends in ctx->Clear(), which sink() never did.
+      //    Clear() fires update_notifier_ synchronously into
+      //    Copilot::OnContextUpdate, which is where a stray record would do
+      //    damage -- but a punct key fails Copilot::IsContinuingInput, so
+      //    ProcessKeyEvent set last_action_ = kSpecial before RunProcessors
+      //    (copilot.cc:476-477) and OnContextUpdate returns at its
+      //    `last_action_ == kSpecial` guard (copilot.cc:572) before reaching
+      //    history->add(). That branch also cleared the context itself when
+      //    the tail segment was copilot's, so this Clear() is usually the
+      //    second. The two sites where the same new Clear() is NOT inert are
+      //    marked below.
+      return CommitThroughPlugin(engine_, ctx, punct_text, /*learn=*/false);
     }
     // 该键在 full_shape / symbols 里都没有中文映射 (如纯英文符号):
     // 让后续默认流程处理.
@@ -399,9 +365,24 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     }
     if (NeedSpaceBefore(raw_before, true)) {
       auto commit_str = AddSpace(keycode);
-      engine_->CommitText(commit_str);
-      if (!commit_str.empty()) ctx->commit_history().push_back({"raw", commit_str});
-      return kAccepted;
+      // NEW Clear(), and unlike the punct site above it is not inert. On
+      // master this site ran CommitText + push_back and never cleared; the
+      // primitive always clears, and the trace of what that reaches is:
+      //
+      //   letter key -> Copilot::IsContinuingInput -> last_action_ =
+      //   kUnspecified (copilot.cc:498) -> here -> CommitText pushes
+      //   {"raw", " x"} -> Clear() -> update_notifier_ ->
+      //   Copilot::OnContextUpdate -> history->add(" x") (copilot.cc:589,
+      //   before the type check) -> type == "raw" -> copilot_engine_->Clear()
+      //   -> return.
+      //
+      // copilot::History::add appends verbatim and CopilotEngine::Clear()
+      // clears query_/cands_/providers, NOT history_ (copilot_engine.cc:57),
+      // so " x" stays in the n-gram key material DbProvider and the LLM
+      // prompt are built from. The size of that effect is UNMEASURED. It is
+      // recorded rather than fixed because a `clear` flag on the primitive
+      // would put back the multi-knob shape the primitive removed.
+      return CommitThroughPlugin(engine_, ctx, commit_str, /*learn=*/false);
     }
     return kNoop;
   }
@@ -437,23 +418,23 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   // Enter: raw commit as ASCII.
   if (keycode == XK_Return || keycode == XK_KP_Enter) {
     auto decorated_text = DecorateCommitText(input, before, after, true, enable_right_space_);
-    engine_->CommitText(decorated_text);
-    if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
-    // This bypasses Context::Commit() -- commit_notifier_ never fires for it
-    // -- so Copilot::OnCommit can never warm the scorer for it. This is the
-    // substitute; see the constructor comment (auto_spacer.h). `false`: this
-    // is a bail-out -- the user committed raw ASCII input, discarding
-    // whatever candidate the composition still shows as highlighted.
+    // Before the commit, and outside it: this bypasses Context::Commit() --
+    // commit_notifier_ never fires for it -- so Copilot::OnCommit can never
+    // warm the scorer for it. This is the substitute; see the constructor
+    // comment (auto_spacer.h). `false`: this is a bail-out -- the user
+    // committed raw ASCII input, discarding whatever candidate the
+    // composition still shows as highlighted.
     if (on_commit_) on_commit_(ctx, decorated_text, false);
-    // No NotifyForLearning here, deliberately. `false` above means the user
-    // discarded every candidate and committed raw ASCII; the composition
-    // still shows a highlighted one, and Memory::ProcessSegmentOnCommit
-    // memorises exactly that (memory.cc:111-126). Learning here would train
-    // the user dictionary on the answers its owner turned down.
-    ctx->Clear();
+    // `learn=false`, deliberately, for the same reason `false` is passed
+    // above: the user discarded every candidate and committed raw ASCII; the
+    // composition still shows a highlighted one, and
+    // Memory::ProcessSegmentOnCommit memorises exactly that
+    // (memory.cc:111-126). Learning here would train the user dictionary on
+    // the answers its owner turned down.
+    const ProcessResult result = CommitThroughPlugin(engine_, ctx, decorated_text, /*learn=*/false);
     client_state.before.clear();
     client_state.after.clear();
-    return kAccepted;
+    return result;
   }
 
   // Space: commit the whole composition (usually CJK).
@@ -466,34 +447,29 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
       return kNoop;
     }
     auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
-    engine_->CommitText(decorated_text);
     // `true`: this commits the actual selected candidate(s)
     // (ComputeSpaceCommitText), not a bail-out -- when there is no selected
     // candidate at all it falls back to raw input, but BuildCommitEvents
     // already skips a segment with no GetSelectedCandidate(), so that case
     // cannot be misreported either way.
     //
-    // Before NotifyForLearning: this callback's telemetry reads
+    // Outside the commit and before it: this callback's telemetry reads
     // GetSelectedCandidate() off the live composition (see the CommitCallback
-    // contract in auto_spacer.h), and NotifyForLearning does not clear.
+    // contract in auto_spacer.h), which the commit sequence's learning
+    // notification also reads and its Clear() destroys.
     if (on_commit_) on_commit_(ctx, decorated_text, true);
     // Space is the dominant commit key in this configuration, so this is the
-    // site that matters most for learning. `true` above is exactly the
-    // predicate learning needs: on a bail-out the composition still shows a
-    // highlighted candidate the user rejected, and Memory::OnCommit would
-    // memorise it (memory.cc:111-126). Still before the history push and the
-    // Clear() below: Memory::OnCommit also reads the live composition.
-    NotifyForLearning(ctx);
-    // After NotifyForLearning, before Clear(): NotifyForLearning does not
-    // clear (deliberately -- see its declaration comment), so the decorated
-    // record pushed here is still what Clear()'s update_notifier_ sees at
-    // back() -- not the undecorated per-segment record
-    // ConcreteEngine::OnCommit would otherwise have left there.
-    if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
-    ctx->Clear();
+    // site that matters most for learning -- CLAUDE.md's "AutoSpacer's commits
+    // and Rime's user dictionary". `learn=true` is what runs
+    // NotifyForLearning inside the sequence, between the commit and the
+    // re-assert of the decorated record; `true` above is the matching
+    // predicate, since on a bail-out the composition still shows a
+    // highlighted candidate the user rejected and Memory::OnCommit would
+    // memorise it (memory.cc:111-126).
+    const ProcessResult result = CommitThroughPlugin(engine_, ctx, decorated_text, /*learn=*/true);
     client_state.before.clear();
     client_state.after.clear();
-    return kAccepted;
+    return result;
   }
 
   if (!IsNumKey(keycode)) {
@@ -510,21 +486,19 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   auto commit_raw = [&]() {
     std::string raw = input + std::string(1, static_cast<char>(keycode));
     auto decorated_text = DecorateCommitText(raw, before, after, true, enable_right_space_);
-    engine_->CommitText(decorated_text);
-    if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
     // `false`: a bail-out, same reasoning as Enter above -- num was out of
     // range or the candidate at that slot did not exist, so whatever the
     // composition still shows highlighted was never committed.
     if (on_commit_) on_commit_(ctx, decorated_text, false);
-    // No NotifyForLearning here, deliberately. `false` above means the user
-    // discarded every candidate and committed raw ASCII; the composition
-    // still shows a highlighted one, and Memory::ProcessSegmentOnCommit
-    // memorises exactly that (memory.cc:111-126). Learning here would train
-    // the user dictionary on the answers its owner turned down.
-    ctx->Clear();
+    // `learn=false`, deliberately, for the same reason: the user discarded
+    // every candidate and committed raw ASCII; the composition still shows a
+    // highlighted one, and Memory::ProcessSegmentOnCommit memorises exactly
+    // that (memory.cc:111-126). Learning here would train the user dictionary
+    // on the answers its owner turned down.
+    const ProcessResult result = CommitThroughPlugin(engine_, ctx, decorated_text, /*learn=*/false);
     client_state.before.clear();
     client_state.after.clear();
-    return kAccepted;
+    return result;
   };
 
   if (num == 0 || num > page_size || ctx->composition().empty()) {
@@ -555,38 +529,46 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
   // segments (Context::GetCommitText), so multi-segment input is preserved.
   seg.selected_index = idx;
   auto decorated_text = ComputeSpaceCommitText(ctx, before, after, enable_right_space_);
-  engine_->CommitText(decorated_text);
   // `true`: the number key just selected `cand` above, so this genuinely
-  // commits the candidate the user picked -- not a bail-out. Before
-  // NotifyForLearning for the same reason as the Space site: this callback
-  // reads the live composition, and NotifyForLearning does not clear it.
+  // commits the candidate the user picked -- not a bail-out. Outside the
+  // commit and before it, for the same reason as the Space site: this
+  // callback reads the live composition, which the sequence's learning
+  // notification also reads and its Clear() destroys.
   if (on_commit_) on_commit_(ctx, decorated_text, true);
-  // Still before the history push and Clear() below: Memory::OnCommit also
-  // reads the live composition.
-  NotifyForLearning(ctx);
-  // After NotifyForLearning, before Clear(): so AutoSpacer's decorated record
-  // is still what's at back() when Clear()'s update_notifier_ fires, not the
-  // undecorated per-segment one ConcreteEngine::OnCommit would otherwise have
-  // left there.
-  if (!decorated_text.empty()) ctx->commit_history().push_back({"raw", decorated_text});
-  ctx->Clear();
+  const ProcessResult result = CommitThroughPlugin(engine_, ctx, decorated_text, /*learn=*/true);
   client_state.before.clear();
   client_state.after.clear();
-  return kAccepted;
+  return result;
 }
 
 // Path 2: Process with commit_history (original logic)
-ProcessResult AutoSpacer::ProcessWithCommitHistory(Context* ctx, const KeyEvent& key_event) {
+ProcessResult AutoSpacer::ProcessWithCommitHistory(Context* ctx, const KeyEvent& key_event,
+                                                   const std::string& before) {
   const auto keycode = key_event.keycode();
 
-  const auto& latest_text = ctx->commit_history().latest_text();
+  // Supplied by the caret-context chain's rung 4 rather than read here, so
+  // there is one place that answers "what is before the caret". Identical
+  // value today (both are commit_history().latest_text()); the point is that
+  // it is now one place, not two.
+  const std::string& latest_text = before;
 
   const auto& input = ctx->input();
   const bool ascii_mode = ctx->get_option("ascii_mode");
+  // Guarded: this path is reachable with an empty commit_history (a
+  // caret-less call from Process() falls straight through to here -- a fresh
+  // session where nothing has been committed yet, and no real surrounding
+  // source answered either), and back() on an empty history is undefined
+  // behaviour. DLOG expands to a real statement whenever NDEBUG is undefined
+  // -- a plain `cmake -B build` -- so this is not just a debug-build
+  // cosmetic. ProcessWithSurroundingContext's copy of this log line has the
+  // same problem for the same reason (a fresh session on the first
+  // keystroke) and is guarded the same way just above.
+  const std::string last_type =
+      ctx->commit_history().empty() ? std::string() : ctx->commit_history().back().type;
   DLOG(INFO) << "[AutoSpacer] " << std::showbase << std::hex << " keycode=" << keycode << "("
              << string(1, keycode) << ")" << ", input='" << input << "'"
              << ", ascii_mode=" << ascii_mode << ", latest_text='" << latest_text << "'["
-             << ctx->commit_history().back().type << "], modifier=" << key_event.modifier();
+             << last_type << "], modifier=" << key_event.modifier();
 
   if (IsDelete(key_event)) {
     if (input.empty()) {
@@ -658,39 +640,38 @@ ProcessResult AutoSpacer::ProcessWithCommitHistory(Context* ctx, const KeyEvent&
 
   const bool has_input = !ctx->input().empty();
   if (!has_input && latest_text != " ") {
-    int last_ascii_char = LastAsciiCharCode(latest_text);
-    bool is_thru_commit = false;
-
-    // 检查是否是回车直接上屏的英文（type = "thru")
-    // 如果是，不应该添加空格，因为这是连续的英文输入
-    const auto& history = ctx->commit_history();
-    if (!history.empty()) {
-      const auto& last_record = history.back();
-      // "thru" 类型表示按键直接上屏（如回车键让拼音直接上屏）
-      if (last_record.type == "thru" || last_record.type == "raw") {
-        DLOG(INFO) << "[SKIP] 最后输入为 thru, 跳过";
-        is_thru_commit = true;
+    // The decision itself lives in DecideHistorySpacing (auto_spacer_util.h),
+    // where test/history_spacing_table_test.cc can drive it without an engine.
+    HistorySpaceInput decision_in;
+    decision_in.before = latest_text;
+    decision_in.ascii_mode = ascii_mode;
+    decision_in.has_input = has_input;
+    switch (DecideHistorySpacing(decision_in)) {
+      case HistorySpaceAction::kPrependSpaceToInput:
+        DLOG(INFO) << "[ADD] 为**中文**添加空格 (from history): " << string(1, keycode);
+        ctx->set_input(AddSpace(keycode));
+        return kAccepted;
+      case HistorySpaceAction::kCommitWithSpace: {
+        DLOG(INFO) << "[ADD] 为 ascii mode 添加空格 (from history)";
+        auto commit_str = AddSpace(keycode);
+        // NEW Clear(), same route as the ascii-mode site in
+        // ProcessWithSurroundingContext (see the trace written out there):
+        // Clear() -> update_notifier_ -> Copilot::OnContextUpdate ->
+        // history->add(" x") -> type == "raw" -> return, and
+        // CopilotEngine::Clear() does not reset history_. On master this site
+        // ran CommitText + push_back and never cleared.
+        //
+        // It is sharper here than there. This path runs only when no
+        // surrounding source answered, which is exactly when
+        // Copilot::GetPredictionContext returns {} and the providers fall
+        // back to history_ -- so the one configuration with no caret text is
+        // the one whose only prediction key this pollutes. Also UNMEASURED,
+        // and left for the same reason: a `clear` flag on the primitive is
+        // the shape this branch removed.
+        return CommitThroughPlugin(engine_, ctx, commit_str, /*learn=*/false);
       }
-    }
-
-    const bool is_space_punct = IsAsciiPunctuationCode(last_ascii_char) && last_ascii_char != '`';
-    if ((IsAlphabetKey(last_ascii_char) || is_space_punct) && !ascii_mode) {
-      // 如果是回车直接上屏的英文，不添加空格
-      if (is_thru_commit && IsAlphabetKey(last_ascii_char)) {
-        DLOG(INFO) << "[SKIP] previous was thru/raw commit";
-        return kNoop;
-      }
-      DLOG(INFO) << "[ADD] 为**中文**添加空格 (from history): " << string(1, keycode);
-      ctx->set_input(AddSpace(keycode));
-      return kAccepted;
-    }
-
-    if (last_ascii_char < 0 && ascii_mode) {
-      DLOG(INFO) << "[ADD] 为 ascii mode 添加空格 (from history)";
-      auto commit_str = AddSpace(keycode);
-      engine_->CommitText(commit_str);
-      if (!commit_str.empty()) ctx->commit_history().push_back({"raw", commit_str});
-      return kAccepted;
+      case HistorySpaceAction::kNone:
+        break;
     }
   }
 
@@ -698,17 +679,36 @@ ProcessResult AutoSpacer::ProcessWithCommitHistory(Context* ctx, const KeyEvent&
 }
 
 ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
-  // Try to get real surrounding context first
-  auto surrounding = GetSurroundingContext();
-
-  // Path 1: Use real surrounding context (completely independent)
-  if (surrounding.has_value()) {
-    return ProcessWithSurroundingContext(ctx, key_event, surrounding.value(),
-                                         surrounding->client_key);
+  // One question, one chain. AutoSpacer accepts a reconstruction because it
+  // always did: the second implementation this replaces WAS one.
+  //
+  // No `!caret` early return: ProcessWithCommitHistory has branches that
+  // never read `before` at all (IsLetterKey's forced-refresh, IsNumKey's
+  // HandleNumberKey) and must still run when nothing -- not even a
+  // reconstruction -- can answer. Its own `latest_text.empty()` guard
+  // further down is what used to gate the before-dependent branches, and
+  // still does; a caret-less call just means that guard fires immediately
+  // where a caret-bearing one used to have a real value to test.
+  auto caret = GetCaretContext(ctx, AllowReconstruction::kYes);
+  if (caret && caret->source != SurroundingSource::kReconstructed) {
+    // Every field the chain carries, not just the two this path happens to
+    // read: before this branch existed the real query result was passed
+    // through intact, and a struct that silently loses provenance on the way
+    // to a consumer is how the next reader of `.truncation` gets a zero that
+    // looks like an answer. `after_depth` is the one field CaretContext does
+    // not carry (see caret_context.h) and the one field no reader of this
+    // struct asks for -- ProcessWithSurroundingContext reads `.before` and
+    // `.after` and nothing else.
+    SurroundingText s;
+    s.before = caret->before;
+    s.after = caret->after;
+    s.client_key = caret->client_key;
+    s.source = caret->source;
+    s.before_depth = caret->before_depth;
+    s.truncation = caret->truncation;
+    return ProcessWithSurroundingContext(ctx, key_event, s, caret->client_key);
   }
-
-  // Path 2: Fallback to commit_history (original logic)
-  return ProcessWithCommitHistory(ctx, key_event);
+  return ProcessWithCommitHistory(ctx, key_event, caret ? caret->before : std::string());
 }
 
 ProcessResult AutoSpacer::Process(const KeyEvent& key_event) {

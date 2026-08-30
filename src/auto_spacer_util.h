@@ -8,6 +8,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <ostream>
 #include <string>
 
 namespace rime {
@@ -130,6 +131,10 @@ inline bool IsAsciiAlphaNumCode(int c) {
   return c >= 0 && c < 0x80 && std::isalnum(static_cast<unsigned char>(c));
 }
 
+inline bool IsAsciiPunctuationCode(int c) {
+  return c >= 0 && c < 0x80 && std::ispunct(static_cast<unsigned char>(c));
+}
+
 inline bool IsChinesePunctuationChar(const std::string& s) {
   return !s.empty() && IsChinesePunctuation(s);
 }
@@ -218,4 +223,56 @@ inline std::string DecorateCommitText(const std::string& text, const std::string
 }
 
 }  // namespace auto_spacer_detail
+
+// The history path's spacing decision, lifted verbatim out of
+// ProcessWithCommitHistory (auto_spacer.cc) so it can be driven without a Rime
+// engine.
+//
+// It now applies the same predicates as the surrounding path
+// (`NeedSpaceBefore`), so there is one set of spacing rules rather than two.
+// What that substitution cost is recorded, row by row, in the two tables of
+// test/history_spacing_table_test.cc.
+enum class HistorySpaceAction { kNone, kPrependSpaceToInput, kCommitWithSpace };
+
+// Without this gtest prints an enum class as its raw bytes
+// ("4-byte object <01-00 00-00>"), which is unreadable exactly when it matters:
+// a table row that moves is reported as old and new *values*.
+inline void PrintTo(HistorySpaceAction action, std::ostream* os) {
+  switch (action) {
+    case HistorySpaceAction::kNone:
+      *os << "kNone";
+      return;
+    case HistorySpaceAction::kPrependSpaceToInput:
+      *os << "kPrependSpaceToInput";
+      return;
+    case HistorySpaceAction::kCommitWithSpace:
+      *os << "kCommitWithSpace";
+      return;
+  }
+  *os << "HistorySpaceAction(" << static_cast<int>(action) << ")";
+}
+
+struct HistorySpaceInput {
+  std::string before;  // commit_history().latest_text()
+  bool ascii_mode = false;
+  bool has_input = false;  // !ctx->input().empty()
+};
+
+inline HistorySpaceAction DecideHistorySpacing(const HistorySpaceInput& in) {
+  if (in.has_input || in.before == " ") {
+    return HistorySpaceAction::kNone;
+  }
+  // The same predicates the surrounding path applies to real text. They
+  // additionally handle right-hand punctuation and exclude Chinese
+  // punctuation, which the hand-rolled tests they replace did not.
+  if (!in.ascii_mode &&
+      auto_spacer_detail::NeedSpaceBefore(in.before, /*content_is_ascii=*/false)) {
+    return HistorySpaceAction::kPrependSpaceToInput;
+  }
+  if (in.ascii_mode && auto_spacer_detail::NeedSpaceBefore(in.before, /*content_is_ascii=*/true)) {
+    return HistorySpaceAction::kCommitWithSpace;
+  }
+  return HistorySpaceAction::kNone;
+}
+
 }  // namespace rime

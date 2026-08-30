@@ -35,54 +35,6 @@ bool SelectionLeavesUnconvertedInput(Context* ctx, const an<Candidate>& cand);
 std::string ComputeSpaceCommitText(Context* ctx, const std::string& before,
                                    const std::string& after, bool enable_right_space);
 
-// Fire Context::commit_notifier_ for a commit AutoSpacer has already emitted
-// itself, so Rime's user dictionary learns from it -- WITHOUT clearing the
-// context. The caller clears.
-//
-// AutoSpacer commits with engine_->CommitText() + ctx->Clear() and never
-// ctx->Commit(), so commit_notifier_ never fires -- and that notifier is the
-// only route to Memory::OnCommit, which is the only thing that writes to
-// private.userdb. Measured consequence: 220 bytes and /tick 0 after a week of
-// daily use.
-//
-// The text must not be emitted twice, and `dumb` is how Rime already says
-// "notify, but do not commit anything" -- Switcher sets it for the same
-// reason (switcher.cc:24). Under it Context::GetCommitText() returns "", so
-// ConcreteEngine::OnCommit's sink_(text) appends nothing and
-// Session::HasCommit() stays false (service.cc:56, :42), while
-// Memory::OnCommit reads ctx->composition() and is unaffected.
-//
-// The previous value of `dumb` is restored rather than hard-set to false:
-// this function does not own that flag.
-//
-// This does NOT call ctx->Commit(): that is commit_notifier_(this) followed
-// by Clear() (context.cc:18-26), and Clear() fires update_notifier_
-// SYNCHRONOUSLY (context.cc:106-111) -- before this function, or the caller,
-// has pushed the caller's own decorated record onto commit_history(). A
-// consumer of update_notifier_ that reads commit_history().back() at that
-// instant (Copilot::OnContextUpdate does) would see whatever
-// ConcreteEngine::OnCommit's per-segment push left there instead, and act on
-// the wrong, undecorated text. So this fires commit_notifier_ directly and
-// leaves Clear() to the caller, to run after the caller's own push. See each
-// call site for the exact ordering this requires.
-//
-// PRECONDITION, and the one a new caller is most likely to miss: call this
-// only where the user actually chose the candidate being committed -- where
-// `on_commit_`'s `selection_commit` is true. Memory memorises
-// seg.GetSelectedCandidate(), the still-highlighted one, so on a bail-out
-// (Enter's raw commit, the number-key fallback) this would memorise the
-// candidate the user just rejected. Language::intelligible does not save you:
-// that candidate is usually a perfectly legitimate Han phrase.
-//
-// Marks the last segment kConfirmed before notifying -- see the definition for
-// why the notification is inert without it. Returns whether it notified
-// (false when the context was not composing); both current callers ignore the
-// result, since they clear unconditionally either way.
-//
-// Declared here rather than kept file-local so it can be unit-tested with a
-// hand-built Context, without standing up a full Rime engine.
-bool NotifyForLearning(Context* ctx);
-
 class AutoSpacer : public CopilotPlugin<AutoSpacer> {
  public:
   // `on_commit` fires for every commit AutoSpacer itself performs (Space,
@@ -93,10 +45,31 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
   // is also the only configuration the re-ranking filter runs in, so
   // Copilot::OnCommit (hung off commit_notifier()) never sees them -- this
   // is how Copilot reaches them instead, to warm the scorer for the next
-  // input. Called with the same Context and the exact decorated text just
-  // handed to engine_->CommitText(), before ctx->Clear() -- see each call
-  // site below. Default null: the standalone `auto_spacer` processor
-  // registration (copilot_module.cc) has no CopilotEngine to warm anyway.
+  // input. Called with the same Context and the exact decorated text about to
+  // be committed.
+  //
+  // ORDER, corrected: this fires BEFORE the commit, not after. On master the
+  // order differed by site: the two bail-outs (Enter, the number-key
+  // fallback) ran CommitText -> push_back -> on_commit_; the two sites that
+  // actually commit a selected candidate (Space, the number-key select) ran
+  // CommitText -> on_commit_ -> NotifyForLearning -> push_back. Every call
+  // site now runs on_commit_ -> CommitThroughPlugin, because the commit
+  // primitive ends in ctx->Clear() and those same two callbacks read the live
+  // composition that Clear() destroys. Restoring the old order is therefore
+  // not available at those sites.
+  //
+  // What makes the new order safe TODAY, and it is luck rather than design:
+  // the only `on_commit` installed is Copilot's WarmRerankContext +
+  // EmitCommitTelemetry (copilot.cc), neither of which reads
+  // ctx->commit_history() -- so neither can observe whether the record for
+  // this commit has been pushed yet -- and WarmRerankContext takes its caret
+  // text from GetCaretContext(..., kNo), i.e. rungs 1-3 only, which are
+  // snapshots frozen for the duration of a key event. A future consumer that
+  // wanted commit_history().back() to already name this commit would be
+  // relying on the order this comment used to promise, and would be wrong.
+  //
+  // Default null: the standalone `auto_spacer` processor registration
+  // (copilot_module.cc) has no CopilotEngine to warm anyway.
   //
   // The bool is `selection_commit`: true when the committed text reflects a
   // candidate the user actually picked (Space; the number-key select at the
@@ -121,7 +94,8 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
                                               const std::string& client_key);
 
   // Path 2: Process with commit_history (original logic)
-  ProcessResult ProcessWithCommitHistory(Context* ctx, const KeyEvent& key_event);
+  ProcessResult ProcessWithCommitHistory(Context* ctx, const KeyEvent& key_event,
+                                         const std::string& before);
 
   ProcessResult HandleNumberKey(Context* ctx, const KeyEvent& key_event) const;
 
