@@ -21,6 +21,7 @@
 #include <string>
 
 #include "auto_spacer.h"
+#include "caret_context.h"
 #include "context_identity.h"
 #include "copilot_engine.h"
 #include "ime_bridge.h"
@@ -611,13 +612,13 @@ string Copilot::GetPredictionContext(const string& committed) const {
   if (!use_surrounding_context_) {
     return {};
   }
-  auto surrounding = GetSurroundingContext();
-  if (!surrounding) {
+  auto caret = GetCaretContext(engine_->context(), AllowReconstruction::kNo);
+  if (!caret) {
     return {};  // no real context; the providers fall back to commit history
   }
   // The snapshot was taken before this key event was handled (and is frozen
   // while composing), so it does not contain the text this commit just added.
-  return BuildPredictionContext(surrounding->before, committed);
+  return BuildPredictionContext(caret->before, committed);
 }
 
 void Copilot::CopilotAndUpdate(Context* ctx, const string& context_query) {
@@ -660,8 +661,8 @@ void Copilot::WarmRerankContext(Context* ctx, const string& extra_committed) {
     DLOG(INFO) << "[copilot] rerank warm: skipped, on battery";
     return;
   }
-  auto surrounding = GetSurroundingContext();
-  if (!surrounding) {
+  auto caret = GetCaretContext(ctx, AllowReconstruction::kNo);
+  if (!caret) {
     return;  // no real surrounding text -- same guard the filter applies
   }
   // BuildScoringContextFor, not TrailingCjkRun: the warm cache is keyed by the
@@ -669,8 +670,14 @@ void Copilot::WarmRerankContext(Context* ctx, const string& extra_committed) {
   // result. Warming a different string does not fail loudly -- every warm
   // succeeds and every Apply() finds the cache cold, so the feature silently
   // never runs.
+  //
+  // BuildScoringContextFor takes a SurroundingText and reads only `.before` --
+  // the rest plays no role here, so a stub built from caret->before is
+  // equivalent to passing the real query result.
+  SurroundingText for_scoring;
+  for_scoring.before = caret->before;
   const string context =
-      BuildScoringContextFor(*surrounding, extra_committed, rerank_llm_context_chars_);
+      BuildScoringContextFor(for_scoring, extra_committed, rerank_llm_context_chars_);
   if (context.empty()) {
     return;
   }

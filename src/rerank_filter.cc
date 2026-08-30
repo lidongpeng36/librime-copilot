@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 
+#include "caret_context.h"
 #include "copilot_engine.h"
 #include "history.h"  // copilot::UTF8
 #include "prediction_context.h"
@@ -450,25 +451,48 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   }
   // No real text before the caret (Chrome/Electron, terminals, Linux) means we
   // would be guessing from commit history, which cannot see a mouse click.
-  auto surrounding = GetSurroundingContext();
-  if (!surrounding) {
+  auto caret = GetCaretContext(engine_->context(), AllowReconstruction::kNo);
+  if (!caret) {
     return translation;
   }
-  // surrounding->before is real application text and stops at whatever is
-  // already committed there — it cannot see segments the user has just
-  // selected within the current, still-uncommitted composition (typing 这个顺
-  // 序是故意的 as one run and selecting 这个 leaves 顺序's candidates re-ranked
-  // with no idea 这个 was just chosen). ConfirmedPrefix supplies exactly that.
+  // Everything below comes from that ONE query. This used to call
+  // GetSurroundingContext() a second time for before_depth/truncation and for
+  // the SurroundingText shape BuildScoringContextFor takes, under a comment
+  // claiming rungs 1-3 share a memo so the second call was free and that the
+  // first having answered guaranteed the second would. Both clauses were
+  // false: GetSurroundingContext() (surrounding_source.cc) is three
+  // independent lookups of which only tmux memoises, and
+  // ImeBridgeServer::GetActiveContext() takes its mutex and re-evaluates the
+  // TTL on every call, so the socket thread can invalidate the bridge's answer
+  // between the two statements. The bug that made it worth fixing is not a
+  // crash but a trace that lies: with the bridge answering the first call and
+  // tmux the second, the trace recorded source="bridge" beside a
+  // before_depth/truncation describing the tmux snapshot, with `context` from
+  // one snapshot and `llm_context` from the other.
+  //
+  // caret->before is real application text and stops at whatever is already
+  // committed there — it cannot see segments the user has just selected
+  // within the current, still-uncommitted composition (typing 这个顺序是故意
+  // 的 as one run and selecting 这个 leaves 顺序's candidates re-ranked with no
+  // idea 这个 was just chosen). ConfirmedPrefix supplies exactly that.
   const std::string confirmed_prefix = ConfirmedPrefix(engine_->context()->composition(), segment);
-  const std::string before = surrounding->before + confirmed_prefix;
+  const std::string before = caret->before + confirmed_prefix;
   // Two contexts, because the two scorers can use different things. The db is
   // keyed by Han sequences and can look up nothing else; the model reads
   // whatever is there. Collapsing them applies the db's gate to the model,
   // which measured over 27245 replay segments blocks 42.9% of them -- see
   // BuildScoringContextFor in rerank.h.
   const std::string context = TrailingCjkRun(before, options_.max_context_chars);
+  // BuildScoringContextFor takes a SurroundingText and reads only `.before`
+  // (rerank.h:94-97), so a stub built from the caret is equivalent to the
+  // query result it used to be handed -- and, unlike that result, is certain
+  // to be the same snapshot `context` above was built from. Copilot::
+  // WarmRerankContext builds the same stub for the same reason, and the two
+  // must agree or every warm lands on a string nobody asks about.
+  SurroundingText for_scoring;
+  for_scoring.before = caret->before;
   const std::string llm_context =
-      BuildScoringContextFor(*surrounding, confirmed_prefix, options_.llm.context_chars);
+      BuildScoringContextFor(for_scoring, confirmed_prefix, options_.llm.context_chars);
 
   // The LLM fallback chain, checked in the exact order
   // docs/superpowers/specs/2026-08-17-llm-rerank-design.md ("Fallback chain")
@@ -518,8 +542,8 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   if (llm_rerank::BailOnEmptyDbContext(context.empty(), llm_eligible,
                                        options_.llm.require_han_context)) {
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
-                    SurroundingSourceName(surrounding->source), surrounding->before_depth,
-                    surrounding->truncation, llm_rerank::SkipForEmptyDbContext(llm_skip));
+                    SurroundingSourceName(caret->source), caret->before_depth, caret->truncation,
+                    llm_rerank::SkipForEmptyDbContext(llm_skip));
     return translation;
   }
   // A missing db only takes the db branch down with it -- the LLM branch above
@@ -533,8 +557,8 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
     // context (or no db loaded at all), and the LLM guard chain above already
     // ruled out the LLM path.
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
-                    SurroundingSourceName(surrounding->source), surrounding->before_depth,
-                    surrounding->truncation, llm_skip);
+                    SurroundingSourceName(caret->source), caret->before_depth, caret->truncation,
+                    llm_skip);
     return translation;
   }
   DLOG(INFO) << "[copilot] rerank context: '" << context
@@ -546,8 +570,8 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   // exactly the same either way.
   return New<RerankTranslation>(
       translation, continuations, options_, span ? traces_ : an<RerankTraceStore>(),
-      engine_->context()->input(), context, llm_context, SurroundingSourceName(surrounding->source),
-      surrounding->before_depth, surrounding->truncation, span.value_or(TraceSpan{}),
+      engine_->context()->input(), context, llm_context, SurroundingSourceName(caret->source),
+      caret->before_depth, caret->truncation, span.value_or(TraceSpan{}),
       llm_eligible ? scorer_ : nullptr, llm_skip);
 }
 

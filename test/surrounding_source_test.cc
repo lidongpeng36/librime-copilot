@@ -10,6 +10,11 @@ TEST(SurroundingSourceName, CoversEveryEnumerator) {
   EXPECT_STREQ(SurroundingSourceName(SurroundingSource::kIMK), "imk");
   EXPECT_STREQ(SurroundingSourceName(SurroundingSource::kBridge), "bridge");
   EXPECT_STREQ(SurroundingSourceName(SurroundingSource::kTmux), "tmux");
+  // The fifth was added with the caret-context chain's rung 4 and pinned
+  // nowhere: caret_context_test.cc asserts the enumerator, never its name.
+  // The name is what reaches telemetry, so enum and string drifting apart is
+  // a silent mislabel in the one place the rung is observable.
+  EXPECT_STREQ(SurroundingSourceName(SurroundingSource::kReconstructed), "reconstructed");
 }
 
 // A snapshot nobody has attributed must not claim a source.

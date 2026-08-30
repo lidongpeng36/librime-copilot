@@ -6,6 +6,8 @@ set(copilot_test_src
   test_main.cc
   auto_spacer_util_test.cc
   candidate_order_test.cc
+  caret_context_test.cc
+  caret_reconstruct_test.cc
   commit_text_test.cc
   context_identity_test.cc
   context_memory_test.cc

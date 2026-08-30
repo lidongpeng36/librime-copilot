@@ -15,7 +15,7 @@ namespace rime {
 // Which subsystem answered "what text surrounds the caret?". Lives here rather
 // than in surrounding_source.h because that header already includes this one
 // for SurroundingText, and the reverse include would be a cycle.
-enum class SurroundingSource { kNone, kIMK, kBridge, kTmux };
+enum class SurroundingSource { kNone, kIMK, kBridge, kTmux, kReconstructed };
 
 inline const char* SurroundingSourceName(SurroundingSource source) {
   switch (source) {
@@ -25,6 +25,8 @@ inline const char* SurroundingSourceName(SurroundingSource source) {
       return "bridge";
     case SurroundingSource::kTmux:
       return "tmux";
+    case SurroundingSource::kReconstructed:
+      return "reconstructed";
     case SurroundingSource::kNone:
       break;
   }
