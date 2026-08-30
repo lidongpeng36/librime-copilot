@@ -985,6 +985,31 @@ The dylib is the channel with no automation, and it is the one carrying every
 C++ change. `git pull` and `restore` both succeeding says nothing about
 whether the plugin's behaviour changed on that machine.
 
+**Before that: building the tests is not building the dylib.** `cmake --build
+build --target copilot_test` is the fast loop and it is what you will run all
+day. It does **not** produce `build/lib/rime-plugins/librime-copilot.dylib` —
+that is a different target. So a session can end with a green suite, a clean
+`status`, and a `cp` of a dylib that predates every change it just made. This
+happened on 2026-08-30, to the same person who was writing the verification
+checklist at the time.
+
+**And the timestamp will not catch it.** The installed copy is newer than the
+build artifact in exactly this case — you copied it more recently than you last
+built it — so `stat` on both looks correct and `ps -o lstart` against the
+install looks correct. The only check that fails is one that asks whether the
+binary contains something only the new code has:
+
+```sh
+cmake --build build -j8          # ALL targets, not --target copilot_test
+strings "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/librime-copilot.dylib" \
+  | grep -c "<a string added by the change you are shipping>"
+```
+
+Pick a string the change introduces — a new log line, a new config key name.
+Zero means the file predates your work, whatever its mtime says. This is the
+same class as the three below, and it is the one that has no timestamp
+signature at all.
+
 **And copying the dylib is not loading it — the running Squirrel has to be
 killed.** A process maps its dynamic libraries at launch and never re-reads the
 files; Rime's redeploy re-reads *config* and re-creates the processors, not the
