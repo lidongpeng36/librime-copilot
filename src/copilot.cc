@@ -361,17 +361,28 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
     std::string key;
     bool resolved;
     uint64_t bridge_writes;
+    bool debug;
     ~ContextMemoryTail() {
       if (!step) return;
       if (resolved && ctx) {
         const bool bridge_moved =
             ImeBridgeServer::Instance().applied_mode_writes() != bridge_writes;
-        step->OnTail(key, ctx->get_option("ascii_mode"), bridge_moved);
+        const bool recorded = ctx->get_option("ascii_mode");
+        step->OnTail(key, recorded, bridge_moved);
+        // The other half of the diagnostic, and the half that was missing: the
+        // head says what was restored, and only this says what was WRITTEN.
+        // A wrong value in the table is invisible until the next visit reads
+        // it back, by which time the keystroke that wrote it is long gone.
+        if (debug) {
+          LOG(INFO) << "[ctxmem] tail " << key
+                    << (bridge_moved ? " NOT recorded (bridge wrote)" : " recorded ascii_mode=")
+                    << (bridge_moved ? "" : (recorded ? "1" : "0"));
+        }
       } else {
         step->OnTailUnresolved();
       }
     }
-  } tail{nullptr, ctx, std::string(), false, 0};
+  } tail{nullptr, ctx, std::string(), false, 0, context_memory_options_.debug};
 
   if (!ctx || !ctx->IsComposing()) {
     InvalidateTmuxSnapshot();
@@ -394,29 +405,38 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
         // effect has no place in what is only ever a diagnostic. Evaluated
         // unconditionally rather than under `debug` on purpose -- hoisting it
         // under the flag would make the flag a behaviour switch.
-        const bool had = context_memory_step_->Contains(key);
         const bool before = ctx->get_option("ascii_mode");
         // The same MakeKey, with the command left off: the pane alone. Built
         // here rather than split back out of `key` so the delimiter rule stays
         // in one place -- see Step::OnHead.
         const std::string pane_key = context_memory::MakeKey(resolved->id, false);
-        context_memory_step_->OnHead(key, pane_key, before,
-                                     [ctx](bool v) { ctx->set_option("ascii_mode", v); });
+        const auto outcome = context_memory_step_->OnHead(
+            key, pane_key, before, [ctx](bool v) { ctx->set_option("ascii_mode", v); });
         if (context_memory_options_.debug && key != previous) {
-          // Three outcomes, not two. OnHead sets the mode only when a
-          // remembered value exists AND differs, so "restored" was printed
-          // over events where nothing was written: the value was truthful and
-          // the verb was not, which in the one line this feature has to be
-          // debugged through is the difference between "it acted" and "it
-          // agreed".
+          // Reported by OnHead, not inferred here from before/after. The
+          // inferred version printed "no memory" over an event where the
+          // default had just been applied -- and this is the one line the
+          // feature is debugged through.
           const bool after = ctx->get_option("ascii_mode");
           std::string what;
-          if (!had) {
-            what = " no memory; leaving ascii_mode as-is";
-          } else if (after != before) {
-            what = std::string(" restored ascii_mode=") + (after ? "1" : "0");
-          } else {
-            what = std::string(" remembered ascii_mode=") + (after ? "1" : "0") + ", already set";
+          using Outcome = context_memory::Step::HeadOutcome;
+          switch (outcome) {
+            case Outcome::kRestored:
+              what = std::string(" restored ascii_mode=") + (after ? "1" : "0");
+              break;
+            case Outcome::kAlreadyMatched:
+              what = std::string(" remembered ascii_mode=") + (after ? "1" : "0") + ", already set";
+              break;
+            case Outcome::kDefaulted:
+              what = std::string(" new pane; default_ascii_mode -> ") + (after ? "1" : "0") +
+                     (after == before ? " (already set)" : "");
+              break;
+            case Outcome::kNothingKnown:
+              what = " no memory and no default; leaving ascii_mode as-is";
+              break;
+            case Outcome::kSameContext:
+              what = " (same context)";
+              break;
           }
           LOG(INFO) << "[ctxmem] " << (previous.empty() ? "(none)" : previous) << " -> " << key
                     << " via " << DescribeIdentitySource(resolved->source) << what;

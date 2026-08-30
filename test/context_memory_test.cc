@@ -314,3 +314,27 @@ TEST(ContextMemoryDefault, ZeroIsAMeaningfulValueNotAnUnsetOne) {
   step.OnHead("tmux:s:%7|zsh", "tmux:s:%7", ascii, [&](bool v) { ascii = v; });
   EXPECT_FALSE(ascii) << "0 must mean Chinese, not \"no default configured\"";
 }
+
+// The head must report what it DID, not leave the caller to infer it from a
+// before/after comparison. The inferred version printed "no memory" over an
+// event where the default had just been applied -- and when the default's
+// value happens to equal the current mode, before == after, so no comparison
+// can ever recover the difference.
+TEST(ContextMemoryDefault, TheHeadReportsDefaultedEvenWhenNothingChanged) {
+  Table table;
+  Step step(&table, WithDefault(1));
+  bool ascii = true;  // ALREADY English: applying the default changes nothing
+  auto outcome = step.OnHead("tmux:s:%8|zsh", "tmux:s:%8", ascii, [&](bool v) { ascii = v; });
+  EXPECT_EQ(outcome, Step::HeadOutcome::kDefaulted);
+  EXPECT_TRUE(ascii);
+}
+
+TEST(ContextMemoryDefault, TheHeadDistinguishesNoDefaultFromDefaulted) {
+  Table table;
+  Options opt;
+  opt.enable = true;  // no default configured
+  Step step(&table, opt);
+  bool ascii = false;
+  auto outcome = step.OnHead("tmux:s:%8|zsh", "tmux:s:%8", ascii, [&](bool v) { ascii = v; });
+  EXPECT_EQ(outcome, Step::HeadOutcome::kNothingKnown);
+}

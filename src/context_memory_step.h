@@ -48,29 +48,43 @@ class Step {
 
   // Called at the head of a key event, with the key this event resolved to.
   // `set_mode` is called only when a remembered value exists AND differs.
+  // What the head step did, reported BY the code that decided it rather than
+  // inferred by the caller from a before/after comparison. The inferred
+  // version printed "no memory" over an event where the default had just been
+  // applied -- the one line this feature is debugged through, saying the
+  // opposite of what happened.
+  enum class HeadOutcome { kSameContext, kRestored, kAlreadyMatched, kDefaulted, kNothingKnown };
+
   // `pane_key` is `key` without the trailing command -- the identity of the
   // pane alone. It is passed rather than derived here because splitting a key
   // back apart means re-deriving a delimiter rule that MakeKey already owns,
   // and a pane id is a prefix of longer pane ids (%3 of %30), so getting that
   // wrong is silent.
-  void OnHead(const std::string& key, const std::string& pane_key, bool current_ascii,
-              const std::function<void(bool)>& set_mode) {
-    if (!options_.enable || !table_) return;
+  HeadOutcome OnHead(const std::string& key, const std::string& pane_key, bool current_ascii,
+                     const std::function<void(bool)>& set_mode) {
+    if (!options_.enable || !table_) return HeadOutcome::kSameContext;
     resolved_ = true;
-    if (key != last_key_) {
-      if (auto remembered = table_->Get(key)) {
-        // A remembered value always wins. The default is for a context with no
-        // history; it is not re-asserted on every visit.
-        if (*remembered != current_ascii) set_mode(*remembered);
-      } else if (options_.default_ascii_mode >= 0 && table_->MarkPaneSeen(pane_key)) {
-        // First time this session has served this PANE, not merely this key:
-        // a new command inside a pane you have already used is not a new pane,
-        // or every first `nvim` in a long-lived pane would yank you back.
-        const bool want = options_.default_ascii_mode != 0;
-        if (want != current_ascii) set_mode(want);
+    if (key == last_key_) return HeadOutcome::kSameContext;
+    HeadOutcome outcome = HeadOutcome::kNothingKnown;
+    if (auto remembered = table_->Get(key)) {
+      // A remembered value always wins. The default is for a context with no
+      // history; it is not re-asserted on every visit.
+      if (*remembered != current_ascii) {
+        set_mode(*remembered);
+        outcome = HeadOutcome::kRestored;
+      } else {
+        outcome = HeadOutcome::kAlreadyMatched;
       }
-      last_key_ = key;
+    } else if (options_.default_ascii_mode >= 0 && table_->MarkPaneSeen(pane_key)) {
+      // First time this session has served this PANE, not merely this key:
+      // a new command inside a pane you have already used is not a new pane,
+      // or every first `nvim` in a long-lived pane would yank you back.
+      const bool want = options_.default_ascii_mode != 0;
+      if (want != current_ascii) set_mode(want);
+      outcome = HeadOutcome::kDefaulted;
     }
+    last_key_ = key;
+    return outcome;
   }
 
   // Called when this event resolved no identity. Deliberately does NOT clear
