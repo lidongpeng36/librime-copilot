@@ -17,6 +17,19 @@ struct Options {
   bool use_pane_command = true;
   int max_entries = 256;
   bool debug = false;
+  // What a pane this session has never served should start from: 1 = English,
+  // 0 = Chinese, -1 = no opinion, which is the shipped default and leaves the
+  // behaviour below exactly as it was.
+  //
+  // It exists because Squirrel's app_options -- the thing that would otherwise
+  // supply this -- fires once per Rime SESSION, and a whole terminal is one
+  // session. A tmux pane created later therefore inherits whatever the pane
+  // you came from happened to be in, and nothing re-asserts a default for it.
+  //
+  // -1 rather than a bool because "no opinion" and "start in Chinese" are
+  // different instructions and must not collapse; it matches the same
+  // convention CaretContext::before_depth and RerankTrace use for unset.
+  int default_ascii_mode = -1;
 };
 
 class Step {
@@ -35,13 +48,26 @@ class Step {
 
   // Called at the head of a key event, with the key this event resolved to.
   // `set_mode` is called only when a remembered value exists AND differs.
-  void OnHead(const std::string& key, bool current_ascii,
+  // `pane_key` is `key` without the trailing command -- the identity of the
+  // pane alone. It is passed rather than derived here because splitting a key
+  // back apart means re-deriving a delimiter rule that MakeKey already owns,
+  // and a pane id is a prefix of longer pane ids (%3 of %30), so getting that
+  // wrong is silent.
+  void OnHead(const std::string& key, const std::string& pane_key, bool current_ascii,
               const std::function<void(bool)>& set_mode) {
     if (!options_.enable || !table_) return;
     resolved_ = true;
     if (key != last_key_) {
       if (auto remembered = table_->Get(key)) {
+        // A remembered value always wins. The default is for a context with no
+        // history; it is not re-asserted on every visit.
         if (*remembered != current_ascii) set_mode(*remembered);
+      } else if (options_.default_ascii_mode >= 0 && table_->MarkPaneSeen(pane_key)) {
+        // First time this session has served this PANE, not merely this key:
+        // a new command inside a pane you have already used is not a new pane,
+        // or every first `nvim` in a long-lived pane would yank you back.
+        const bool want = options_.default_ascii_mode != 0;
+        if (want != current_ascii) set_mode(want);
       }
       last_key_ = key;
     }

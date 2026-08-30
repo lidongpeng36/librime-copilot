@@ -96,6 +96,31 @@ class Table {
     return index_.size();
   }
 
+  // Records that this pane has been served, and says whether that was news.
+  //
+  // Deliberately a second, separate structure rather than a prefix scan of
+  // `index_`: a pane id is a prefix of longer pane ids (%3 of %30), so
+  // "does any key belong to this pane" cannot be answered by matching a
+  // prefix without re-deriving MakeKey's delimiter rule, and getting that
+  // wrong is silent -- %3 would report itself already seen the moment %30
+  // existed. Bounded by the same max_entries for the same reason the memory
+  // is: pane ids grow monotonically as panes come and go.
+  bool MarkPaneSeen(const std::string& pane_key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = pane_index_.find(pane_key);
+    if (it != pane_index_.end()) {
+      pane_order_.splice(pane_order_.begin(), pane_order_, it->second);
+      return false;
+    }
+    pane_order_.push_front(pane_key);
+    pane_index_[pane_key] = pane_order_.begin();
+    while (pane_index_.size() > max_entries_) {
+      pane_index_.erase(pane_order_.back());
+      pane_order_.pop_back();
+    }
+    return true;
+  }
+
   void set_max_entries(size_t n) {
     std::lock_guard<std::mutex> lock(mutex_);
     max_entries_ = n ? n : 1;
@@ -106,6 +131,8 @@ class Table {
     std::lock_guard<std::mutex> lock(mutex_);
     order_.clear();
     index_.clear();
+    pane_order_.clear();
+    pane_index_.clear();
   }
 
  private:
@@ -120,6 +147,11 @@ class Table {
   mutable std::mutex mutex_;
   std::list<Entry> order_;  // front == most recently used
   std::unordered_map<std::string, std::list<Entry>::iterator> index_;
+  // Which panes this process has served, for MarkPaneSeen. Separate from the
+  // memory above because "have I served this pane" and "what mode did this
+  // context end in" are different questions with different keys.
+  std::list<std::string> pane_order_;
+  std::unordered_map<std::string, std::list<std::string>::iterator> pane_index_;
   size_t max_entries_;
 };
 

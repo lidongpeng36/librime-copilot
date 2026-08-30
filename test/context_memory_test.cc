@@ -108,7 +108,7 @@ TEST(ContextMemoryStep, FirstSightingDoesNotTouchTheMode) {
   Step step(&table, opt);
   FakeMode mode;
   mode.ascii = true;
-  step.OnHead("tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%1", "tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
   EXPECT_TRUE(mode.ascii);
 }
 
@@ -120,14 +120,14 @@ TEST(ContextMemoryStep, RestoresOnSwitchBack) {
   FakeMode mode;
 
   mode.ascii = false;  // pane 1: Chinese
-  step.OnHead("tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%1", "tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
   step.OnTail("tmux:default:%1", mode.Get(), false);
 
   mode.ascii = true;  // pane 2: the user switches to English
-  step.OnHead("tmux:default:%2", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%2", "tmux:default:%2", mode.Get(), [&](bool v) { mode.Set(v); });
   step.OnTail("tmux:default:%2", mode.Get(), false);
 
-  step.OnHead("tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%1", "tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
   EXPECT_FALSE(mode.ascii);  // pane 1 is Chinese again
 }
 
@@ -141,7 +141,7 @@ TEST(ContextMemoryStep, RecordsTheTailValueNotTheHeadValue) {
   Step step(&table, opt);
   FakeMode mode;
   mode.ascii = false;
-  step.OnHead("tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%1", "tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
   mode.ascii = true;  // the keystroke toggled it
   step.OnTail("tmux:default:%1", mode.Get(), false);
   ASSERT_TRUE(table.Get("tmux:default:%1").has_value());
@@ -160,7 +160,7 @@ TEST(ContextMemoryStep, UnresolvedEventWritesNothing) {
   Step step(&table, opt);
   FakeMode mode;
   mode.ascii = false;
-  step.OnHead("tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%1", "tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
   step.OnTail("tmux:default:%1", mode.Get(), false);
 
   mode.ascii = true;
@@ -187,7 +187,7 @@ TEST(ContextMemoryStep, GuardsUnresolvedTailPathWritesNothing) {
   Step step(&table, opt);
   FakeMode mode;
   mode.ascii = false;
-  step.OnHead("tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%1", "tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
   step.OnTail("tmux:default:%1", mode.Get(), false);
 
   mode.ascii = true;
@@ -216,13 +216,13 @@ TEST(ContextMemoryStep, ABridgeWriteDuringTheEventIsNotAttributedToThePane) {
   FakeMode mode;
 
   mode.ascii = false;  // pane B is remembered as Chinese
-  step.OnHead("tmux:default:%2", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%2", "tmux:default:%2", mode.Get(), [&](bool v) { mode.Set(v); });
   step.OnTail("tmux:default:%2", mode.Get(), false);
   ASSERT_TRUE(table.Get("tmux:default:%2").has_value());
   EXPECT_FALSE(*table.Get("tmux:default:%2"));
 
   // Next keystroke in pane B: ImeBridge applies pane A's queued set(true).
-  step.OnHead("tmux:default:%2", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%2", "tmux:default:%2", mode.Get(), [&](bool v) { mode.Set(v); });
   mode.ascii = true;  // the bridge wrote it, mid-event
   step.OnTail("tmux:default:%2", mode.Get(), true);
 
@@ -237,7 +237,80 @@ TEST(ContextMemoryStep, DisabledDoesNothing) {
   Step step(&table, opt);
   FakeMode mode;
   mode.ascii = true;
-  step.OnHead("tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
+  step.OnHead("tmux:default:%1", "tmux:default:%1", mode.Get(), [&](bool v) { mode.Set(v); });
   step.OnTail("tmux:default:%1", mode.Get(), false);
   EXPECT_EQ(table.size(), 0u);
+}
+
+// --- default_ascii_mode: a brand-new pane starts from a configured mode ------
+//
+// The head step deliberately does not touch ascii_mode on a key it has never
+// seen -- that is what lets Squirrel's app_options act as the per-context
+// default. But app_options fires once per Rime SESSION, and a whole terminal
+// is one session, so a tmux pane created later inherits whatever the previous
+// pane left. These pin the opt-in that fixes that, and the boundary of it:
+// it keys on the PANE, not on the full key, so running a new command inside a
+// pane you have already used does not reset you.
+
+namespace {
+rime::context_memory::Options WithDefault(int mode) {
+  rime::context_memory::Options o;
+  o.enable = true;
+  o.default_ascii_mode = mode;
+  return o;
+}
+}  // namespace
+
+TEST(ContextMemoryDefault, UnsetLeavesTodaysBehaviourExactlyAsItIs) {
+  Table table;
+  Options opt;
+  opt.enable = true;  // default_ascii_mode stays -1
+  Step step(&table, opt);
+  bool ascii = false;
+  step.OnHead("tmux:s:%1|zsh", "tmux:s:%1", ascii, [&](bool v) { ascii = v; });
+  EXPECT_FALSE(ascii) << "an unset default must not touch the mode";
+}
+
+TEST(ContextMemoryDefault, AnUnseenPaneAdoptsTheConfiguredMode) {
+  Table table;
+  Step step(&table, WithDefault(1));
+  bool ascii = false;  // arrived in Chinese from the previous pane
+  step.OnHead("tmux:s:%9|zsh", "tmux:s:%9", ascii, [&](bool v) { ascii = v; });
+  EXPECT_TRUE(ascii);
+}
+
+// The boundary. A pane you have used before is not new just because the
+// command in it changed -- otherwise every first `nvim` in a long-lived pane
+// would yank you back to English.
+TEST(ContextMemoryDefault, ANewCommandInAKnownPaneIsNotANewPane) {
+  Table table;
+  Step step(&table, WithDefault(1));
+  bool ascii = true;
+  step.OnHead("tmux:s:%2|zsh", "tmux:s:%2", ascii, [&](bool v) { ascii = v; });
+  step.OnTail("tmux:s:%2|zsh", ascii, /*mode_written_elsewhere=*/false);
+  ascii = false;  // the user switched to Chinese in this pane
+  step.OnHead("tmux:s:%2|nvim", "tmux:s:%2", ascii, [&](bool v) { ascii = v; });
+  EXPECT_FALSE(ascii) << "same pane, new command: the default must not fire";
+}
+
+// A remembered value always wins over the default: the default is for
+// contexts with no history, not a re-assertion on every visit.
+TEST(ContextMemoryDefault, ARememberedValueBeatsTheDefault) {
+  Table table;
+  Step step(&table, WithDefault(1));
+  bool ascii = false;
+  step.OnHead("tmux:s:%3|zsh", "tmux:s:%3", ascii, [&](bool v) { ascii = v; });
+  step.OnTail("tmux:s:%3|zsh", false, /*mode_written_elsewhere=*/false);  // remembered: Chinese
+  step.OnHead("tmux:s:%4|zsh", "tmux:s:%4", ascii, [&](bool v) { ascii = v; });
+  ascii = true;
+  step.OnHead("tmux:s:%3|zsh", "tmux:s:%3", ascii, [&](bool v) { ascii = v; });
+  EXPECT_FALSE(ascii) << "returning to a known pane must restore, not default";
+}
+
+TEST(ContextMemoryDefault, ZeroIsAMeaningfulValueNotAnUnsetOne) {
+  Table table;
+  Step step(&table, WithDefault(0));
+  bool ascii = true;  // arrived in English
+  step.OnHead("tmux:s:%7|zsh", "tmux:s:%7", ascii, [&](bool v) { ascii = v; });
+  EXPECT_FALSE(ascii) << "0 must mean Chinese, not \"no default configured\"";
 }

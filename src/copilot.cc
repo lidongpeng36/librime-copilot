@@ -100,6 +100,12 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
                     &context_memory_options_.use_pane_command);
     config->GetInt("copilot/context_memory/max_entries", &context_memory_options_.max_entries);
     config->GetBool("copilot/context_memory/debug", &context_memory_options_.debug);
+    // Absent leaves it at -1, "no opinion", which is the pre-existing
+    // behaviour: a pane with no history keeps whatever mode it arrived in.
+    bool default_ascii = false;
+    if (config->GetBool("copilot/context_memory/default_ascii_mode", &default_ascii)) {
+      context_memory_options_.default_ascii_mode = default_ascii ? 1 : 0;
+    }
     if (context_memory_options_.max_entries < 1) context_memory_options_.max_entries = 1;
 
     // Both the IMK hook and the tmux pane scrape return this many characters
@@ -390,7 +396,11 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
         // under the flag would make the flag a behaviour switch.
         const bool had = context_memory_step_->Contains(key);
         const bool before = ctx->get_option("ascii_mode");
-        context_memory_step_->OnHead(key, before,
+        // The same MakeKey, with the command left off: the pane alone. Built
+        // here rather than split back out of `key` so the delimiter rule stays
+        // in one place -- see Step::OnHead.
+        const std::string pane_key = context_memory::MakeKey(resolved->id, false);
+        context_memory_step_->OnHead(key, pane_key, before,
                                      [ctx](bool v) { ctx->set_option("ascii_mode", v); });
         if (context_memory_options_.debug && key != previous) {
           // Three outcomes, not two. OnHead sets the mode only when a
