@@ -68,8 +68,9 @@ struct Snapshot {
   std::string pane_command;
   // `#{socket_path}`: the server socket this pane lives on, as an absolute
   // path. Asked for because it is the ONE thing that makes the two identity
-  // rungs agree. The pushed rung (tools/rime_ctx_report.sh) can only know
-  // ${TMUX%%,*}, an absolute path; the polled rung previously used
+  // rungs agree. The pushed rung (rime-copilot-clients' tmux reporter,
+  // scripts/report.sh) can only know ${TMUX%%,*}, an absolute path; the
+  // polled rung previously used
   // `copilot/tmux_source/socket`, which is EMPTY on the default socket and a
   // path otherwise -- so the two agreed only by the coincidence that
   // MakeKey's placeholder for empty happens to be the word "default", which

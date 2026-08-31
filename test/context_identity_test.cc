@@ -85,10 +85,11 @@ TEST_F(ContextIdentityTest, BothRungsProduceTheSameKey) {
 // BothRungsProduceTheSameKey above feeds ONE Identity to both hooks, so it can
 // only show MakeKey is deterministic -- the real divergence was in how each
 // rung DERIVES `socket`, and that lives half in C++ and half in
-// tools/rime_ctx_report.sh. This pins the C++ half against a literal, and
-// tools/test/rime_ctx_report_test.py pins the shell half against the same
-// one: the reporter's `data.socket` for TMUX=/tmp/tmux-501/work,... must be
-// exactly the string fed here. Change one and the other fails.
+// rime-copilot-clients' tmux reporter (scripts/report.sh). This pins the C++
+// half against a literal, and that repo's test/report_test.py pins the shell
+// half against the same one: the reporter's `data.socket` for
+// TMUX=/tmp/tmux-501/work,... must be exactly the string fed here. Change one
+// and the other fails.
 //
 // A NON-default socket on purpose. With the default socket the two used to
 // agree by coincidence (the polled rung had "", MakeKey renders that as

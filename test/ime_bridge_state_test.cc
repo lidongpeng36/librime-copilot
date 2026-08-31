@@ -427,7 +427,7 @@ TEST(ImeBridgeState, ContextDepthIsCountedAndTruncationIsUnknown) {
 // test/report_test.py pins the same string from the other side. Neither can
 // test the other -- this handler lives behind a real Rime engine -- so the two
 // goldens are kept in step by hand, the way MakeKey and MakeClientKey are
-// (src/context_memory.h:26-46).
+// (src/context_memory.h:45-59).
 //
 // Bumping kProtocolVersion is a coordinated change across both repos. A
 // mismatch is inert, never wrong: ProcessMessage logs a warning and ignores
@@ -544,9 +544,9 @@ TEST(ImeBridgeIdentity, CarriesTheHostFieldWhenPresent) {
   EXPECT_EQ(id->pane_id, "%2");
 }
 
-// 旧上报器（本机的 rime_ctx_report.sh）根本不发这个字段。空字符串必须
-// 保持「本机」的含义 —— 这是新插件配旧上报器的组合，spec 的 Degradation
-// 表里唯一允许发生的那一格。
+// 本机模式下的上报器（rime-copilot-clients 的 scripts/report.sh）本就不发
+// host 这个字段——它没有远端身份要区分。空字符串必须保持「本机」的含义，
+// 这是 spec 的 Degradation 表里允许发生的一格。
 TEST(ImeBridgeIdentity, AbsentHostFieldMeansThisMachine) {
   rime::ImeBridgeState state;
   state.ProcessMessage(IdentityMessage("%2", "zsh"));

@@ -1133,7 +1133,7 @@ identity message, `ascii_mode` set/restore. The two sides were never testable
 together, because the handler lives behind a real Rime engine the other repo
 has no way to stand up, so the contract is kept in step by two goldens that
 name each other, the same arrangement `MakeKey` and `MakeClientKey` already
-use (`src/context_memory.h:26-46`): the literal wire-format tests at the
+use (`src/context_memory.h:45-59`): the literal wire-format tests at the
 bottom of `test/ime_bridge_state_test.cc` name that repo's `scripts/report.sh`
 and `test/report_test.py`, and that repo's golden names this file back.
 Bumping `kProtocolVersion` (`src/ime_bridge.cc`) is therefore a coordinated

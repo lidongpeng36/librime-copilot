@@ -318,7 +318,8 @@ bool ClearSurrounding() {
 //
 // So this exits rather than warning. A red failure is far cheaper than a
 // plausible wrong number. The same lesson cost this repo two falsely-green
-// runs in clients/neovim/test/.
+// runs in what was clients/neovim/test/ here before it moved to
+// rime-copilot-clients.
 // ============================================================================
 int SelfCheck() {
   const std::string sentinel = "⟦SENTINEL⟧回放哨兵";

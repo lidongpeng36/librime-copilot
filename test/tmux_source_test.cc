@@ -336,8 +336,9 @@ TEST_F(TmuxMemoTest, IdentityRefusedWhenClientsAmbiguous) {
 }
 
 // The cross-rung key invariant, on the side that actually derives the socket.
-// The pushed rung (tools/rime_ctx_report.sh) can only report ${TMUX%%,*}, an
-// absolute path in EVERY case including the default socket, so the polled rung
+// The pushed rung (rime-copilot-clients' tmux reporter, scripts/report.sh)
+// can only report ${TMUX%%,*}, an absolute path in EVERY case including the
+// default socket, so the polled rung
 // must key on tmux's own `#{socket_path}` -- not on `copilot/tmux_source/socket`,
 // which is empty by default. They used to agree only by the coincidence that
 // MakeKey renders an empty socket as "default", which is also the default
@@ -350,7 +351,7 @@ TEST_F(TmuxMemoTest, IdentitySocketIsTmuxsOwnPathNotTheConfiguredOne) {
   ASSERT_TRUE(id.has_value());
   EXPECT_EQ(id->socket, "/tmp/tmux-501/work");
   // The literal the reporter emits for TMUX=/tmp/tmux-501/work,... -- pinned
-  // on the shell side by tools/test/rime_ctx_report_test.py's
+  // on the shell side by rime-copilot-clients' test/report_test.py,
   // test_socket_field_is_the_full_path_the_plugin_keys_on.
   EXPECT_EQ(rime::context_memory::MakeKey(*id, true), "tmux:/tmp/tmux-501/work:%7|zsh");
 }
