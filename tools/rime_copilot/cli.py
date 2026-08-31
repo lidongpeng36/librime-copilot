@@ -148,7 +148,34 @@ def _context_memory_status(tmux_conf: Path, enabled: bool) -> "str | None":
         if not os.access(script, os.X_OK):
             return (f"context memory: tmux hook names {script}, which is not executable "
                     f"-- `chmod +x` it, or run `rime-copilot install` again")
-    return "context memory: hook installed (identity is pushed, no per-keystroke query)"
+    # A hook that names the script but does not hand it the pane. Before
+    # 2026-08-31 that was the documented form, and the script asked tmux
+    # instead -- `display-message -p` with no `-t`, which resolves against the
+    # INVOKING client rather than the hook's target. Measured on tmux 3.7c: a
+    # `select-window -t copilot:3` issued from another session's pane made the
+    # hook report `librime:1 %3 claude` instead of `%5`. Interactive
+    # prefix-key switches are correct by accident (there the invoking client
+    # is the one being switched), so this is invisible in ordinary use, writes
+    # a plausible-looking key, and appears in no log. A status line is the
+    # only place it can surface.
+    stale = [ln.strip() for ln in text.splitlines()
+             if "rime_ctx_report" in ln and not ln.lstrip().startswith("#")
+             and "#{pane_id}" not in ln]
+    if stale:
+        return ("context memory: tmux hook does not pass the pane in -- append "
+                "'#{pane_id}' '#{pane_current_command}' '#{socket_path}' to the "
+                "run-shell command; without them the reporter asks tmux, which "
+                "answers for the invoking client and can name a pane in another "
+                "session -- see README 'Context memory'")
+
+    # NOT "no per-keystroke query", which this line claimed until 2026-08-31.
+    # The hooks stop CONTEXT MEMORY from polling; they do not stop AutoSpacer,
+    # which calls GetSurroundingContext() on every non-composing keystroke and
+    # spawns tmux there regardless. Measured live on the day the hooks were
+    # first installed on a machine: the pushed rung took over (`via bridge` in
+    # the ctxmem log) and the spawn count did not move. A status line that
+    # reports a saving nobody made is how a reader stops trusting the rest.
+    return "context memory: hook installed (identity is pushed, not polled)"
 
 
 def _ordered_list_block(text: str, opener: str, item: "re.Pattern" = None) -> "list[str]":

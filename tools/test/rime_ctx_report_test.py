@@ -83,7 +83,7 @@ class RimeCtxReportTest(unittest.TestCase):
         self.assertTrue(stat.S_ISSOCK(os.stat(self.sock_path).st_mode))
         return sock
 
-    def _run(self, extra_env=None):
+    def _run(self, extra_env=None, args=None):
         env = dict(os.environ)
         env["PATH"] = f"{self.fakebin}{os.pathsep}{env.get('PATH', '')}"
         env["RIME_COPILOT_IME_SOCK"] = self.sock_path
@@ -96,7 +96,7 @@ class RimeCtxReportTest(unittest.TestCase):
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
-            ["/bin/sh", str(SCRIPT)],
+            ["/bin/sh", str(SCRIPT), *(args or ())],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -156,6 +156,79 @@ class RimeCtxReportTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         captured = self._wait_for_capture()
         self.assertIn('"socket":"/tmp/tmux-501/work"', captured)
+
+    def test_arguments_win_over_asking_tmux(self):
+        """Told beats asked, and the fake tmux here disagrees on purpose.
+
+        `display-message -p` with no `-t` resolves against the INVOKING
+        client, not the hook's target. Measured on tmux 3.7c, 2026-08-31:
+        `tmux select-window -t copilot:3` run from a pane in another session
+        fired the hook, and the hook's own `display-message -p` reported that
+        other session's pane (`librime:1 %3 claude`) rather than `%5`. Both
+        `run-shell` and `run-shell -b` did it, so it is not an async race.
+
+        tmux expands `#{pane_id}` in the hook command against the hook's own
+        target, correctly -- verified in the same session. So the hook passes
+        the identity in and the script stops asking.
+
+        The fake tmux reports `%7|claude`; this test passes `%3 zsh`. A script
+        that falls back to asking emits `%7` and fails here.
+        """
+        sock = self._make_socket_file()
+        try:
+            result = self._run(args=["%3", "zsh"])
+        finally:
+            sock.close()
+            os.unlink(self.sock_path)
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        captured = self._wait_for_capture()
+        self.assertIn('"pane":"%3"', captured)
+        self.assertIn('"command":"zsh"', captured)
+        self.assertNotIn("%7", captured)
+        self.assertNotIn("claude", captured)
+
+    def test_socket_argument_wins_over_the_TMUX_variable(self):
+        """`#{socket_path}` is what the POLLED rung reads, so prefer it.
+
+        `${TMUX%%,*}` is correct too -- measured, a hook's environment carries
+        the hook target's own `$TMUX` even while `display-message` is looking
+        at another client -- and it stays as the fallback for a tmux too old
+        to report `#{socket_path}`. Taking the argument when it is there makes
+        both rungs read literally the same tmux format, which is the property
+        `MakeKey`'s note in src/context_memory.h demands.
+        """
+        sock = self._make_socket_file()
+        try:
+            result = self._run(
+                {"TMUX": "/tmp/tmux-501/wrong,12345,0"},
+                args=["%3", "zsh", "/tmp/tmux-501/right"],
+            )
+        finally:
+            sock.close()
+            os.unlink(self.sock_path)
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        captured = self._wait_for_capture()
+        self.assertIn('"socket":"/tmp/tmux-501/right"', captured)
+        self.assertNotIn("wrong", captured)
+
+    def test_still_asks_tmux_when_invoked_with_no_arguments(self):
+        """The fallback is not vestigial: it is what a hand-run invocation
+        and every .tmux.conf written before 2026-08-31 use. Dropping it would
+        turn an out-of-date hook from `slightly wrong under scripted
+        switches` into `silently does nothing`."""
+        sock = self._make_socket_file()
+        try:
+            result = self._run()
+        finally:
+            sock.close()
+            os.unlink(self.sock_path)
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        captured = self._wait_for_capture()
+        self.assertIn('"pane":"%7"', captured)
+        self.assertIn('"command":"claude"', captured)
 
     def test_nc_is_invoked_with_a_connection_timeout(self):
         """The committed script must pass a connection timeout to `nc`.

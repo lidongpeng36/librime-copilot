@@ -1010,6 +1010,33 @@ Zero means the file predates your work, whatever its mtime says. This is the
 same class as the three below, and it is the one that has no timestamp
 signature at all.
 
+**The plugin's own log is not a record until something forces a flush.** The
+diagnostics in `/var/folders/.../rime_copilot.*.log.INFO.*.log` go through
+glog, which buffers and drains only when the *next* message is written. A quiet
+plugin therefore leaves its most recent lines invisible — and the tail you read
+is routinely truncated mid-line, which looks like the end of the story. On
+2026-08-31 that produced three reversed conclusions about one question in a
+single session, because the missing lines were each time exactly the ones whose
+absence was being read as evidence (`[ImeBridge] Server stopped.` was buffered;
+its absence was taken to mean `Stop()` had not run). `killall Squirrel` makes it
+worse: the buffer dies with the process, so investigating by restarting destroys
+the record you were about to need.
+
+Two ways out, and prefer the second:
+
+- **Force a drain** by generating traffic the plugin logs — a redeploy emits
+  several unconditional `LOG(INFO)` lines, and anything written to the IME
+  bridge socket does too. Then re-read.
+- **Corroborate outside glog.** What actually settled the 2026-08-31 question
+  was `lsof -p "$(pgrep -x Squirrel)"` showing zero unix sockets held, which
+  proves `server_fd_` was closed and hence that `Stop()` ran — no log required.
+
+A corollary worth knowing on its own: **a redeploy leaves
+`/tmp/rime_copilot_ime.sock` absent until the next keystroke.** The refcount
+reaches zero, `Stop()` unlinks, and `Start()` binds again only when the next
+Rime session is created. That window is normal. Every client must tolerate it;
+`tools/rime_ctx_report.sh` does, with `[ -S "$SOCK" ] || exit 0`.
+
 **And copying the dylib is not loading it — the running Squirrel has to be
 killed.** A process maps its dynamic libraries at launch and never re-reads the
 files; Rime's redeploy re-reads *config* and re-creates the processors, not the

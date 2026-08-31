@@ -1866,9 +1866,11 @@ class ContextMemoryStatusTest(unittest.TestCase):
                 conf.write_text(body)
             return cli._context_memory_status(conf, enabled)
 
-    def _hooks(self, script: str, flag: str = "-ga") -> str:
+    def _hooks(self, script: str, flag: str = "-ga", args: bool = True) -> str:
+        tail = ' \\"#{pane_id}\\" \\"#{pane_current_command}\\" \\"#{socket_path}\\"' if args else ""
         return "".join(
-            f"set-hook {flag} {hook} 'run-shell -b \"{script}\"'\n" for hook in cli._CTX_HOOKS)
+            f"set-hook {flag} {hook} 'run-shell -b \"{script}{tail}\"'\n"
+            for hook in cli._CTX_HOOKS)
 
     def _script(self, d: Path, *, executable: bool = True) -> Path:
         path = d / "rime_ctx_report.sh"
@@ -1888,6 +1890,30 @@ class ContextMemoryStatusTest(unittest.TestCase):
             line = self._line(self._hooks(str(script)))
         self.assertIn("hook installed", line)
         self.assertNotIn("polling", line)
+
+    def test_reports_a_hook_that_does_not_pass_the_pane_in(self):
+        """The pre-2026-08-31 hook form, which asks tmux instead of being told.
+
+        `display-message -p` with no `-t` resolves against the INVOKING
+        client, so a scripted pane switch makes the reporter name a pane in
+        whatever session issued the command. Measured on tmux 3.7c: a switch
+        to `copilot:3` (%5) reported `librime:1 %3 claude`. Interactive
+        switches are correct by accident -- there the invoking client is the
+        one being switched -- so this never shows up in ordinary use and
+        never shows up in a log. A status line is the only way it surfaces.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            line = self._line(self._hooks(str(script), args=False))
+        self.assertIn("#{pane_id}", line)
+        self.assertNotIn("hook installed (", line)
+
+    def test_hook_passing_the_pane_in_is_reported_as_installed(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            line = self._line(self._hooks(str(script), args=True))
+        self.assertIn("hook installed", line)
+        self.assertNotIn("#{pane_id}", line)
 
     def test_reports_half_installed_hook(self):
         line = self._line(

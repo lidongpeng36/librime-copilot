@@ -903,25 +903,61 @@ off** — set `copilot/context_memory/enable: true` to turn it on (see
 [Configuration](#configuration) for the rest of the keys). Switched on, it
 learns which pane you are in two ways.
 
-**Which rung you want depends on one thing: whether
-`copilot/tmux_source/enabled` is on.** If it is — and it has to be for
-auto-spacing to work in a winit terminal like Alacritty — then AutoSpacer
-already queries tmux on every non-composing keystroke, the polled rung reads
-that same memoized snapshot, and its marginal cost is **zero**. On such a
-machine the hooks below buy nothing today and are not worth the coupling they
-add to `.tmux.conf`. They earn their keep when `tmux_source` is off, or if
-AutoSpacer ever stops fetching unconditionally.
+**The hooks buy no speed, and that is worth settling before you install
+them.** With `copilot/tmux_source/enabled` on — and it has to be for
+auto-spacing to work in a winit terminal like Alacritty — `AutoSpacer::Process`
+queries tmux on every non-composing keystroke regardless of this feature. The
+polled rung therefore already costs **zero** extra, and the pushed rung removes
+no `posix_spawn` at all. Measured on the machine where the hooks were first
+installed: the pushed rung took over (`via bridge` in the `ctxmem` log) and the
+per-keystroke spawn was still there, because `GetSurroundingContext`'s third
+priority is unconditional. An earlier draft of this section said the hooks
+"buy nothing"; that was right about cost and wrong about the reason to want
+them.
+
+What they buy is **correctness in two places the polled rung cannot reach**:
+
+- The pushed value is exact and immediate. The polled one reads a memoized
+  snapshot behind a frontmost-app gate and declines outright when several tmux
+  clients are attached indistinguishably.
+- It is the only rung that could ever carry an identity from a **remote** tmux.
+  The polled one sees `ssh` as the pane's command and nothing behind it, so
+  every pane on a given remote collapses into one memory slot.
+
+They would additionally become the only way to keep this feature without a
+per-keystroke query if AutoSpacer ever stopped fetching unconditionally.
 
 **Pushed.** tmux already knows when the pane changed, so it does not have to be
 asked:
 
 ```tmux
-set-hook -ga after-select-pane   'run-shell -b "~/Library/Rime/private/bin/rime_ctx_report.sh"'
-set-hook -ga after-select-window 'run-shell -b "~/Library/Rime/private/bin/rime_ctx_report.sh"'
+set-hook -ga after-select-pane   'run-shell -b "~/Library/Rime/private/bin/rime_ctx_report.sh \"#{pane_id}\" \"#{pane_current_command}\" \"#{socket_path}\""'
+set-hook -ga after-select-window 'run-shell -b "~/Library/Rime/private/bin/rime_ctx_report.sh \"#{pane_id}\" \"#{pane_current_command}\" \"#{socket_path}\""'
 ```
 
 `-ga`, not `-g`: **`-g` replaces** any existing hook of that name, so a config
 that already hooks `after-select-pane` loses it silently. `-ga` appends.
+
+**The three format arguments are not optional decoration.** tmux expands
+`#{pane_id}` in a hook's command against the *hook's own target*. The script's
+fallback — `tmux display-message -p` with no `-t` — resolves against the
+**invoking client** instead, which is a different thing whenever a pane switch
+is issued from somewhere else. Measured on tmux 3.7c, 2026-08-31: a
+`select-window -t copilot:3` run from a pane in another session fired the hook,
+and the hook's own `display-message` answered `librime:1 %3 claude` rather than
+`%5`. Plain `run-shell` did it too, so it is not a race with `-b`. Switching
+panes with the prefix key is correct only by accident — there the invoking
+client *is* the client being switched.
+
+Without the arguments the reporter still works and is still right for every
+interactive switch, so the failure is invisible: a plausible key, no error, no
+log line. `rime-copilot status` names a hook that omits them.
+
+`#{socket_path}` is the least necessary of the three — the hook's environment
+carries the hook target's own `$TMUX`, from which the script derives the same
+path, verified in the same session. It is passed anyway so that both identity
+rungs read literally the same tmux format, and the `$TMUX` derivation stays as
+the fallback for a tmux too old to report `#{socket_path}`.
 
 That path is where `rime-copilot install` puts the script, and naming it
 rather than a path inside a git checkout is the point: move or delete the
@@ -975,6 +1011,19 @@ A's slot.
 Not fixed rather than not noticed. Validating the pushed value needs the very
 query rung 1 exists to avoid, and a staleness window does not help either — the
 cell is fresh, it is simply wrong.
+
+**A pane whose program drives `ascii_mode` itself is excluded, by design.**
+Run Neovim with the `rime_ime` client in a pane and that client sets the mode
+on every normal/insert transition. On such a keystroke the tail step sees
+`ImeBridgeServer::applied_mode_writes()` move and records **nothing** —
+`[ctxmem] tail %1|nvim NOT recorded (bridge wrote)` with `debug` on. The
+bridge still wins the mode; it just does not get to name a pane. Recording
+there would memorise a value that belongs to the editor's current mode rather
+than to the pane, turning a one-keystroke misapplication into a remembered
+one — and the pane would then fight the editor on every return to it.
+
+The practical consequence is that such a pane is the wrong place to test this
+feature from. Use two panes running a plain shell.
 
 ### Multi-Client Behavior
 
