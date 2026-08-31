@@ -56,8 +56,10 @@ class InstallFixture(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def install(self, commit="abc123", now="2026-08-15T00:00:00Z"):
-        I.apply_install(self.source_root, self.dest, self.builder, commit, now)
+    def install(self, commit="abc123", now="2026-08-15T00:00:00Z",
+               tmux_dir: "Path | None" = None):
+        I.apply_install(self.source_root, self.dest, self.builder, commit, now,
+                        tmux_dir=tmux_dir)
 
 
 class PayloadFiles(InstallFixture):
@@ -103,6 +105,96 @@ class PayloadFiles(InstallFixture):
                "should never be picked up\n")
         for rel in I.payload_files(self.source_root):
             self.assertNotIn("__pycache__", rel)
+
+
+class TmuxDirInstall(InstallFixture):
+    """`private/bin`'s copy of the reporter is a versioned copy to `scp`
+    from; the OPERATIVE copy -- the one a synced `.tmux.conf` hook actually
+    names -- lives beside that file, in the tmux directory itself. Without
+    this, "hooks arrived, script did not" is a silent failure mode on every
+    remote a synced tmux.conf reaches.
+    """
+
+    def test_the_reporter_is_installed_into_the_tmux_dir(self):
+        """脚本和钩子必须是同一个同步单元。
+
+        用户把一份 tmux.conf 同步到所有机器；脚本留在 private/bin 就意味着
+        钩子会到而脚本不会到，那是个不会报错、只会什么都不做的失败模式。
+        ~/.tmux/ 顶层已经平铺着 install.sh / yank.sh / renew_env.sh。
+        """
+        _write(self.source_root / "rime_ctx_report.sh", "#!/bin/sh\nreport\n",
+               executable=True)
+        tmux_dir = Path(self.tmp.name) / "dot-tmux"
+        tmux_dir.mkdir()
+        self.install(tmux_dir=tmux_dir)
+        placed = tmux_dir / "rime_ctx_report.sh"
+        self.assertTrue(placed.is_file())
+        self.assertTrue(os.access(placed, os.X_OK))
+
+    def test_the_tmux_copy_is_covered_by_drift_detection(self):
+        """否则它就是第二份无版本的副本，等着以同样的方式腐烂 —— 这正是
+        install 的漂移清单当初存在的理由。"""
+        _write(self.source_root / "rime_ctx_report.sh", "#!/bin/sh\nreport\n",
+               executable=True)
+        tmux_dir = Path(self.tmp.name) / "dot-tmux"
+        tmux_dir.mkdir()
+        self.install(tmux_dir=tmux_dir)
+        manifest = I.read_install_manifest(self.dest)
+        self.assertIn(str(tmux_dir / "rime_ctx_report.sh"), manifest.files)
+
+    def test_a_missing_tmux_dir_is_created(self):
+        # ~/.tmux/ already exists on the author's own machines, but a fresh
+        # checkout elsewhere should not have to `mkdir` it by hand first --
+        # matches how `dest` itself is created.
+        _write(self.source_root / "rime_ctx_report.sh", "#!/bin/sh\nreport\n",
+               executable=True)
+        tmux_dir = Path(self.tmp.name) / "not-yet-created" / "dot-tmux"
+        self.install(tmux_dir=tmux_dir)
+        self.assertTrue((tmux_dir / "rime_ctx_report.sh").is_file())
+
+    def test_no_tmux_copy_when_the_source_has_no_reporter(self):
+        # The fixture never writes rime_ctx_report.sh here -- installing
+        # into tmux_dir must not fabricate a file that was never a payload.
+        tmux_dir = Path(self.tmp.name) / "dot-tmux"
+        tmux_dir.mkdir()
+        self.install(tmux_dir=tmux_dir)
+        self.assertFalse((tmux_dir / "rime_ctx_report.sh").exists())
+
+    def test_no_tmux_copy_when_tmux_dir_is_not_given(self):
+        # The library-level default: apply_install itself never guesses a
+        # home directory -- that default belongs to the CLI, one layer up.
+        _write(self.source_root / "rime_ctx_report.sh", "#!/bin/sh\nreport\n",
+               executable=True)
+        self.install()
+        manifest = I.read_install_manifest(self.dest)
+        self.assertFalse(any(Path(rel).is_absolute() for rel in manifest.files))
+
+    def test_drift_flags_the_tmux_copy_edited_in_place(self):
+        _write(self.source_root / "rime_ctx_report.sh", "#!/bin/sh\nreport\n",
+               executable=True)
+        tmux_dir = Path(self.tmp.name) / "dot-tmux"
+        tmux_dir.mkdir()
+        self.install(tmux_dir=tmux_dir)
+        (tmux_dir / "rime_ctx_report.sh").write_text("tampered\n", encoding="utf-8")
+        lines = I.drift(self.dest)
+        self.assertTrue(any("rime_ctx_report.sh" in line and "edited in place" in line
+                            for line in lines), lines)
+
+    def test_drift_flags_the_tmux_copy_falling_behind_the_repo(self):
+        # The comparison this exists to guard: source_root / rel would
+        # resolve to the SAME absolute file as target when rel is absolute,
+        # comparing the tmux copy against itself and never flagging a real
+        # divergence.
+        _write(self.source_root / "rime_ctx_report.sh", "#!/bin/sh\nreport v1\n",
+               executable=True)
+        tmux_dir = Path(self.tmp.name) / "dot-tmux"
+        tmux_dir.mkdir()
+        self.install(tmux_dir=tmux_dir)
+        _write(self.source_root / "rime_ctx_report.sh", "#!/bin/sh\nreport v2\n",
+               executable=True)
+        lines = I.drift(self.dest)
+        self.assertTrue(any("rime_ctx_report.sh" in line and "differs from the repo" in line
+                            for line in lines), lines)
 
 
 class IsSourceCheckout(InstallFixture):

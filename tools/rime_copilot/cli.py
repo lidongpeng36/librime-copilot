@@ -84,6 +84,23 @@ _CTX_HOOK_RES = {
 # parsed -- only the path token is needed.
 _CTX_SCRIPT_RE = re.compile(r"""([^\s'"]*rime_ctx_report\.sh)""")
 
+# `set -ga update-environment " LC_RIME_IME_HOST"`, in any of the spellings
+# tmux accepts (-g/-ga/-ag, set/set-option, quoted or not).
+_UPDATE_ENV_RE = re.compile(
+    r"set(?:-option)?\s+(?:-\w+\s+)*update-environment\b[^\n]*LC_RIME_IME_HOST")
+
+# NOT in `_CTX_HOOKS`, deliberately: that list drives the "polling; missing
+# tmux hook(s)" diagnosis, and a missing `client-attached` hook does not
+# cause polling -- the other two still push. It also buys nothing on a
+# machine that never reaches a remote tmux, which describes most machines
+# most of the time. So it gets its own, separate, informational status line
+# below, reported only once the two REQUIRED hooks are already confirmed
+# present -- never in place of the "missing tmux hook(s)" diagnosis, which
+# is the more important one.
+_CTX_CLIENT_ATTACHED_HOOK = "client-attached"
+_CTX_CLIENT_ATTACHED_RE = re.compile(
+    r"set-hook\s+(?:-\w+\s+)*" + re.escape(_CTX_CLIENT_ATTACHED_HOOK) + r"\b")
+
 
 def _context_memory_enabled(built_schemas: "list[Path]") -> bool:
     """Whether any built schema turns per-context ascii_mode memory on.
@@ -167,6 +184,44 @@ def _context_memory_status(tmux_conf: Path, enabled: bool) -> "str | None":
                 "run-shell command; without them the reporter asks tmux, which "
                 "answers for the invoking client and can name a pane in another "
                 "session -- see README 'Context memory'")
+
+    # The fourth argument. Without it the reporter always takes its local
+    # branch, which on the laptop is exactly right and therefore symptomless
+    # -- and then the same synced tmux.conf does nothing at all on every
+    # remote. There is no local behaviour that reveals this.
+    no_host = [ln.strip() for ln in text.splitlines()
+               if "rime_ctx_report" in ln and not ln.lstrip().startswith("#")
+               and "LC_RIME_IME_HOST" not in ln]
+    if no_host:
+        return ("context memory: tmux hook does not pass the IME host in -- append "
+                "'#{E:LC_RIME_IME_HOST}' to the run-shell command; without it the "
+                "reporter never takes its remote branch -- see README 'Remote tmux'")
+
+    # #{E:} falls back to the SERVER environment when the session has no such
+    # variable, and the server environment belongs to whichever ssh session
+    # started it. Two laptops into one remote account: the second reads the
+    # first's value. update-environment is what makes it per-session.
+    #
+    # Comment lines are excluded first, the same as `no_host` above -- a
+    # `set -ga update-environment " LC_RIME_IME_HOST"` line that is commented
+    # out would otherwise satisfy the regex and silence a warning about
+    # exactly the misconfiguration it exists to catch.
+    active = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    if not _UPDATE_ENV_RE.search(active):
+        return ("context memory: LC_RIME_IME_HOST is not in update-environment -- add "
+                "`set -ga update-environment \" LC_RIME_IME_HOST\"`; without it "
+                "#{E:LC_RIME_IME_HOST} reads the tmux server's copy, which belongs "
+                "to whichever ssh session started it -- see README 'Remote tmux'")
+
+    # Informational, not a degraded-mode warning: local panes are entirely
+    # unaffected by this hook's absence, so this line must never read like
+    # the ones above it. Checked last, only once every required check has
+    # passed -- a setup this incomplete is not "otherwise good" and belongs
+    # to one of the returns above instead.
+    if not _CTX_CLIENT_ATTACHED_RE.search(text):
+        return ("context memory: no client-attached hook -- local panes are unaffected; "
+                "a remote's endpoint cache will not refresh after an ssh reconnect. See "
+                "README 'Remote tmux'")
 
     # NOT "no per-keystroke query", which this line claimed until 2026-08-31.
     # The hooks stop CONTEXT MEMORY from polling; they do not stop AutoSpacer,
@@ -1545,6 +1600,19 @@ def cmd_install(args) -> int:
         print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
     print(f"  {'python':<17} {interpreter}")
     print(f"  {'':<17} from {provenance}")
+
+    # Defaults to ~/.tmux/, matching that directory's existing top-level
+    # scripts (install.sh, yank.sh, renew_env.sh): the operative copy a
+    # synced .tmux.conf hook actually names, distinct from the versioned
+    # copy under `dest` that _EXTRA_PAYLOAD always writes. `None` from the
+    # CLI layer means "use the default", not "skip it" -- only a caller of
+    # apply_install() itself (a test, mainly) can skip it outright by
+    # passing tmux_dir=None through explicitly.
+    tmux_dir = Path(args.tmux_dir).expanduser() if args.tmux_dir else Path.home() / ".tmux"
+    reporter = source_root / install.TMUX_REPORTER_NAME
+    if reporter.is_file():
+        print(f"  {'tmux reporter':<17} {tmux_dir / install.TMUX_REPORTER_NAME}")
+
     _print_missing_requirements(interpreter)
     if args.dry_run:
         return 0
@@ -1554,7 +1622,8 @@ def cmd_install(args) -> int:
     # one value drives the entry point's shebang and the dependency check
     # alike -- and so `--python` has somewhere to reach (see install.py's
     # module docstring and README "Keeping the installed copy honest").
-    install.apply_install(source_root, dest, builder, commit, _now(), interpreter=interpreter)
+    install.apply_install(source_root, dest, builder, commit, _now(), interpreter=interpreter,
+                          tmux_dir=tmux_dir)
     print(f"installed to {dest} @ {commit[:7] if commit else 'unknown'}")
     return 0
 
@@ -1707,6 +1776,11 @@ def build_parser() -> argparse.ArgumentParser:
     install_cmd = sub.add_parser("install")
     install_cmd.add_argument("--dest", help="where to install (default: <rime-dir>/private/bin)")
     install_cmd.add_argument("--builder", help=f"path to {paths.BUILDER_NAME}")
+    install_cmd.add_argument(
+        "--tmux-dir",
+        help="where to install the tmux context reporter (rime_ctx_report.sh), "
+             "the OPERATIVE copy a synced .tmux.conf hook actually names "
+             "(default: ~/.tmux)")
     install_cmd.add_argument(
         "--python",
         help="interpreter to pin in the installed entry point's shebang "

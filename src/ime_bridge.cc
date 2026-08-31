@@ -294,10 +294,23 @@ std::string ImeBridgeState::ProcessMessage(const std::string& message) {
     if (type == "identity") {
       auto data = j.value("data", json::object());
       const std::string pane = data.value("pane", "");
-      if (pane.empty()) {
+      // Who this message is for. Absent means "whoever receives it", which is
+      // what the local reporter sends and what every reporter sent before
+      // 2026-08-31. Present and different means the sender dialled a tunnel
+      // that is not ours -- a stale cached port on a shared remote account --
+      // and recording it would file another laptop's pane in our table.
+      const std::string expect = data.value("expect", "");
+      if (!expect.empty() && expect != HostId()) {
+        LOG(WARNING) << "[ImeBridge] identity addressed to " << expect << ", not " << HostId()
+                     << "; dropped";
+      } else if (pane.empty()) {
         LOG(WARNING) << "[ImeBridge] identity message with no pane; ignored";
       } else {
-        HandleIdentity(data.value("socket", ""), pane, data.value("command", ""));
+        // "host" absent means this machine, which is what the local reporter
+        // sends and what every pre-2026-08-31 reporter sends. It must not
+        // become a namespace of its own.
+        HandleIdentity(data.value("socket", ""), pane, data.value("command", ""),
+                       data.value("host", ""));
       }
       // "" so HandleConnection takes no connection refcount for this message.
       return "";
@@ -386,6 +399,12 @@ const std::string& ImeBridgeState::HostId() const {
   return host_id_cache_;
 }
 
+void ImeBridgeState::SetHostIdForTest(const std::string& host_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  config_.host_id = host_id;
+  host_id_cached_ = false;  // HostId() caches its first-computed result.
+}
+
 std::string ImeBridgeState::BuildHello() const {
   json msg = {{"v", kProtocolVersion},
               {"ns", kNamespace},
@@ -403,14 +422,16 @@ void ImeBridgeState::TouchClient(const std::string& client_key) {
 }
 
 void ImeBridgeState::HandleIdentity(const std::string& socket, const std::string& pane_id,
-                                    const std::string& command) {
+                                    const std::string& command, const std::string& host) {
   std::lock_guard<std::mutex> lock(mutex_);
   identity_.socket = socket;
   identity_.pane_id = pane_id;
   identity_.command = command;
+  identity_.host = host;
   has_identity_ = true;
   if (config_.debug) {
-    LOG(INFO) << "[ImeBridge] identity pushed: pane=" << pane_id << ", command=" << command;
+    LOG(INFO) << "[ImeBridge] identity pushed: pane=" << pane_id << ", command=" << command
+              << (host.empty() ? "" : ", host=") << host;
   }
 }
 

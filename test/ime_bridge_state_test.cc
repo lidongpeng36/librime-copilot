@@ -423,10 +423,15 @@ TEST(ImeBridgeState, ContextDepthIsCountedAndTruncationIsUnknown) {
 }
 
 namespace {
-std::string IdentityMessage(const char* pane, const char* command) {
-  return std::string(
-             R"({"v":1,"ns":"rime.ime","type":"identity","data":{"socket":"default","pane":")") +
-         pane + R"(","command":")" + command + R"("}})";
+std::string IdentityMessage(const char* pane, const char* command,
+                            const char* host = nullptr) {
+  std::string data =
+      std::string(R"({"socket":"default","pane":")") + pane +
+      R"(","command":")" + command + R"(")";
+  if (host) {
+    data += std::string(R"(,"host":")") + host + R"(")";
+  }
+  return R"({"v":1,"ns":"rime.ime","type":"identity","data":)" + data + "}}";
 }
 }  // namespace
 
@@ -478,6 +483,63 @@ TEST(ImeBridgeIdentity, AsciiMessagesStillRegisterTheirClient) {
       R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
       R"("data":{"action":"set","ascii":true}})");
   EXPECT_EQ(key, "nvim:1");
+}
+
+TEST(ImeBridgeIdentity, CarriesTheHostFieldWhenPresent) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%2", "zsh", "devbox"));
+  auto id = state.GetPushedIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->host, "devbox");
+  EXPECT_EQ(id->pane_id, "%2");
+}
+
+// 旧上报器（本机的 rime_ctx_report.sh）根本不发这个字段。空字符串必须
+// 保持「本机」的含义 —— 这是新插件配旧上报器的组合，spec 的 Degradation
+// 表里唯一允许发生的那一格。
+TEST(ImeBridgeIdentity, AbsentHostFieldMeansThisMachine) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%2", "zsh"));
+  auto id = state.GetPushedIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->host, "");
+}
+
+namespace {
+std::string IdentityMessageWithExpect(const char* pane, const char* host,
+                                      const char* expect) {
+  return std::string(R"({"v":1,"ns":"rime.ime","type":"identity","data":{)") +
+         R"("socket":"default","pane":")" + pane + R"(","command":"zsh")" +
+         R"(,"host":")" + host + R"(","expect":")" + expect + R"("}})";
+}
+}  // namespace
+
+// 远端的 endpoint 缓存按 uid 存，两台笔记本共用一个文件；而
+// RemoteForward 127.0.0.1:0 每次重连拿的是临时端口，重连后那个端口
+// 可能已经属于另一条隧道。让消息自带收件人，收错的一方直接丢，
+// 而不是把别人的 pane 记进自己的表。
+TEST(ImeBridgeIdentity, DropsAMessageAddressedToAnotherMachine) {
+  rime::ImeBridgeState state;
+  state.SetHostIdForTest("Mac-Mini");
+  state.ProcessMessage(IdentityMessageWithExpect("%2", "devbox", "SomeOtherLaptop"));
+  EXPECT_FALSE(state.GetPushedIdentity().has_value());
+}
+
+TEST(ImeBridgeIdentity, AcceptsAMessageAddressedToThisMachine) {
+  rime::ImeBridgeState state;
+  state.SetHostIdForTest("Mac-Mini");
+  state.ProcessMessage(IdentityMessageWithExpect("%2", "devbox", "Mac-Mini"));
+  auto id = state.GetPushedIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->host, "devbox");
+}
+
+// 本机上报器不发这个字段，它必须继续工作。
+TEST(ImeBridgeIdentity, AnAbsentExpectFieldIsNotAMismatch) {
+  rime::ImeBridgeState state;
+  state.SetHostIdForTest("Mac-Mini");
+  state.ProcessMessage(IdentityMessage("%2", "zsh"));
+  EXPECT_TRUE(state.GetPushedIdentity().has_value());
 }
 
 // ---------------------------------------------------------------------------

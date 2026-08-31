@@ -40,6 +40,16 @@ PACKAGE = "rime_copilot"
 # executable bit; `run-shell` needs it.
 _EXTRA_PAYLOAD = ("rime_ctx_report.sh",)
 
+# The same file, named separately: `_EXTRA_PAYLOAD`'s copy under `dest`
+# (private/bin) stays as a versioned copy to `scp` from, but it is not the
+# one a synced `.tmux.conf` hook can name -- private/bin's path differs by
+# machine (`--dest`, or the rime dir itself) while `~/.tmux/` is the one
+# thing the user already syncs verbatim to every machine. `apply_install`'s
+# `tmux_dir` parameter installs a second, OPERATIVE copy there, alongside
+# `install.sh` / `yank.sh` / `renew_env.sh` -- matching that directory's own
+# convention -- so the hook and the script it names travel as one unit.
+TMUX_REPORTER_NAME = _EXTRA_PAYLOAD[0]
+
 # Present in a real checkout, never in an installed copy: apply_install only
 # ever writes payload_files() plus the builder into dest, and test/ is not
 # among them. Used to refuse installing *from* an installed copy, which would
@@ -367,7 +377,8 @@ def _install_one(src: Path, target: Path, *, interpreter: "str | None" = None) -
 
 def apply_install(source_root: Path, dest: Path, builder: Path,
                   commit: "str | None", now: str,
-                  interpreter: "str | None" = None) -> None:
+                  interpreter: "str | None" = None,
+                  tmux_dir: "Path | None" = None) -> None:
     if not is_source_checkout(source_root):
         raise ValueError(
             f"refusing to install from {source_root}: not a rime-copilot checkout "
@@ -384,6 +395,18 @@ def apply_install(source_root: Path, dest: Path, builder: Path,
     # artifact that does not come from source_root, so it is not part of the
     # payload drift() compares against the repo.
     _install_one(builder, dest / BUILDER_NAME)
+
+    # The operative copy, keyed by its own absolute path rather than a
+    # dest-relative one -- it does not live under `dest`, so it needs a key
+    # drift() can still look up by. `tmux_dir` is None in most tests and in
+    # any caller that has not opted in; `None` skips this entirely rather
+    # than defaulting to the real machine's home directory here -- that
+    # default belongs to the CLI, one layer up, where a caller can always
+    # override it with `--tmux-dir`.
+    reporter = source_root / TMUX_REPORTER_NAME
+    if tmux_dir is not None and reporter.is_file():
+        placed = tmux_dir / TMUX_REPORTER_NAME
+        files[str(placed)] = _install_one(reporter, placed)
 
     # Written last: an install interrupted after copying some files but
     # before this point must read back as "not installed", not "complete".
@@ -426,6 +449,13 @@ def drift(dest: Path) -> list[str]:
     source_present = source_root.is_dir()
     lines = []
     for rel, recorded_sha256 in sorted(installed.files.items()):
+        # `rel` is dest-relative for everything under `dest` (the ordinary
+        # payload) but ABSOLUTE for the tmux reporter's operative copy, which
+        # does not live under `dest` at all -- `dest / rel` already resolves
+        # correctly either way (pathlib discards the left side when the right
+        # is absolute), but `source_root / rel` would too, which would
+        # compare that file against ITSELF instead of against the repo's
+        # copy. Go by basename against source_root for an absolute key.
         name = Path(rel).name
         target = dest / rel
         if not target.is_file():
@@ -435,7 +465,7 @@ def drift(dest: Path) -> list[str]:
         if current_sha256 != recorded_sha256:
             lines.append(f"{name}: edited in place")
         elif source_present:
-            repo_file = source_root / rel
+            repo_file = source_root / (name if Path(rel).is_absolute() else rel)
             if repo_file.is_file() and not _payload_matches(rel, repo_file, target):
                 lines.append(f"{name}: differs from the repo")
     return lines

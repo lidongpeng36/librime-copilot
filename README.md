@@ -928,17 +928,37 @@ They would additionally become the only way to keep this feature without a
 per-keystroke query if AutoSpacer ever stopped fetching unconditionally.
 
 **Pushed.** tmux already knows when the pane changed, so it does not have to be
-asked:
+asked. One config, synced verbatim to every machine — see [Remote
+tmux](#remote-tmux) for why a single hook line is correct both where Rime runs
+and on every remote it is reached from:
 
 ```tmux
-set-hook -ga after-select-pane   'run-shell -b "~/Library/Rime/private/bin/rime_ctx_report.sh \"#{pane_id}\" \"#{pane_current_command}\" \"#{socket_path}\""'
-set-hook -ga after-select-window 'run-shell -b "~/Library/Rime/private/bin/rime_ctx_report.sh \"#{pane_id}\" \"#{pane_current_command}\" \"#{socket_path}\""'
+# ~/.tmux/tmux.conf -- one file, synced to every machine.
+#
+# #{E:LC_RIME_IME_HOST} is empty on the machine Rime runs on (local mode, a
+# unix socket) and names it on every remote (remote mode, a forwarded port).
+# One hook line is therefore correct everywhere, and the script travels with
+# this file rather than being chosen per machine.
+#
+# update-environment is load-bearing: #{E:} falls back to the tmux SERVER's
+# environment when the session has no such variable, and the server's belongs
+# to whichever ssh session started it. Two laptops into one remote account
+# would otherwise have the second read the first's value.
+set -ga update-environment " LC_RIME_IME_HOST"
+
+set-hook -ga after-select-pane   'run-shell -b "~/.tmux/rime_ctx_report.sh \"#{pane_id}\" \"#{pane_current_command}\" \"#{socket_path}\" \"#{E:LC_RIME_IME_HOST}\""'
+set-hook -ga after-select-window 'run-shell -b "~/.tmux/rime_ctx_report.sh \"#{pane_id}\" \"#{pane_current_command}\" \"#{socket_path}\" \"#{E:LC_RIME_IME_HOST}\""'
+set-hook -ga client-attached     'run-shell -b "~/.tmux/rime_ctx_report.sh \"#{pane_id}\" \"#{pane_current_command}\" \"#{socket_path}\" \"#{E:LC_RIME_IME_HOST}\""'
 ```
+
+`client-attached` is inert on the local machine (it pushes the current pane
+once) and is what refreshes a remote's endpoint cache after a dropped and
+re-established ssh, i.e. after the forwarded port changed underneath it.
 
 `-ga`, not `-g`: **`-g` replaces** any existing hook of that name, so a config
 that already hooks `after-select-pane` loses it silently. `-ga` appends.
 
-**The three format arguments are not optional decoration.** tmux expands
+**The three positional format arguments are not optional decoration.** tmux expands
 `#{pane_id}` in a hook's command against the *hook's own target*. The script's
 fallback — `tmux display-message -p` with no `-t` — resolves against the
 **invoking client** instead, which is a different thing whenever a pane switch
@@ -959,15 +979,43 @@ path, verified in the same session. It is passed anyway so that both identity
 rungs read literally the same tmux format, and the `$TMUX` derivation stays as
 the fallback for a tmux too old to report `#{socket_path}`.
 
-That path is where `rime-copilot install` puts the script, and naming it
-rather than a path inside a git checkout is the point: move or delete the
-checkout and a hook naming it stops firing, silently. `rime-copilot status`
-checks the script the hook names is actually there.
+**The fourth argument, `#{E:LC_RIME_IME_HOST}`, is what selects remote mode —
+and getting it wrong is symptomless on the laptop.** An empty fourth argument
+is exactly what local mode looks like, so a hook missing it just runs the
+local branch, correctly, on the machine you tested it from — and then the
+same synced `.tmux.conf` does nothing at all on every remote, silently, with
+no local behaviour to reveal it. `rime-copilot status` names a hook that
+omits it. See [Remote tmux](#remote-tmux) for what the argument does and why
+`update-environment` has to be set alongside it.
 
-The script writes one line and exits:
+Both copies of the script matter, and they are not interchangeable.
+`rime-copilot install` writes one under `--dest` (`private/bin`, default) —
+a versioned copy to `scp` from, not the one any hook names — and a second,
+OPERATIVE copy under `--tmux-dir` (default `~/.tmux`), alongside that
+directory's existing `install.sh` / `yank.sh` / `renew_env.sh`. The tmux
+directory is the one the user already syncs to every machine verbatim, so
+putting the script there rather than in `private/bin` is what keeps the hook
+and the script it names travelling as one unit — `private/bin` differs by
+machine (`--dest`, or the rime dir itself), `~/.tmux/` does not. Both copies
+are recorded in the install manifest, so `rime-copilot status` reports either
+one edited in place or fallen behind the repo. Naming an installed path at
+all, rather than one inside a git checkout, is the point either way: move or
+delete the checkout and a hook naming it stops firing, silently.
+`rime-copilot status` also checks the script the hook names is actually
+there.
+
+The script writes one line and exits. Local mode:
 
 ```json
 {"v":1,"ns":"rime.ime","type":"identity","data":{"socket":"/tmp/tmux-501/default","pane":"%7","command":"claude"}}
+```
+
+Remote mode adds `host` (this machine's short hostname) and `expect` (the
+laptop it was told to reach, from `#{E:LC_RIME_IME_HOST}`) — see [Remote
+tmux](#remote-tmux):
+
+```json
+{"v":1,"ns":"rime.ime","type":"identity","data":{"expect":"my-laptop","host":"devbox","socket":"/tmp/tmux-1000/default","pane":"%2","command":"zsh"}}
 ```
 
 `socket` is the whole socket path (`${TMUX%%,*}`), because the polled rung
@@ -1024,6 +1072,126 @@ one — and the pane would then fight the editor on every return to it.
 
 The practical consequence is that such a pane is the wrong place to test this
 feature from. Use two panes running a plain shell.
+
+#### Remote tmux
+
+The same hooks and the same `rime_ctx_report.sh` reach a pane on a machine
+Rime is not running on, over an ssh reverse tunnel. Nothing in `.tmux.conf`
+differs between the local and the remote case — see the hook block above —
+because the script branches on whether `#{E:LC_RIME_IME_HOST}` is empty, and
+that variable is what makes the branch correct on both sides.
+
+**Two things must be true on the laptop BEFORE a remote is ever allowed to
+push an identity, and both fail silently if skipped.**
+
+- **The dylib goes to the laptop first, before any remote gets the new
+  `rime_ctx_report.sh`.** An old plugin reads the message's `host` field as
+  an unknown key and ignores it — this is the one combination in this
+  feature's degradation table that writes **wrong** data rather than merely
+  doing nothing. A remote pane then keys as though it were a *local* one
+  (`tmux:/tmp/tmux-1000/default:%2|zsh`, with no host segment), silently
+  filing that remote pane's `ascii_mode` under the laptop's own local-pane
+  memory. Concretely: sync the new `~/.tmux/tmux.conf` (and the new
+  `rime_ctx_report.sh` it points at) to a remote before copying the new
+  dylib to the laptop, and every remote pane switch corrupts a slot in the
+  laptop's own pane memory. See "Propagating a change to a machine that
+  already has this" in `CLAUDE.md` for the general shape of this hazard —
+  the dylib is always the channel with no automation, and here it is also
+  the channel that decides whether incoming data means what it says.
+- **The local tmux hooks (`after-select-pane`, `after-select-window`) must
+  already be installed on the laptop before a remote pane can push at all.**
+  The pushed identity cell has **no expiry** — only the *next* push
+  overwrites it — so a laptop with no local hooks that returns from a remote
+  pane keeps that remote's identity forever, on every subsequent local pane
+  switch, with nothing to correct it. Installing the hooks is what makes the
+  next local pane switch push a fresh (local) identity over the stale
+  remote one.
+
+**ssh config**, once per remote `Host`:
+
+```
+Host devbox
+  RemoteForward 127.0.0.1:0 /tmp/rime_copilot_ime.sock
+  SetEnv        LC_RIME_IME_HOST=%L
+```
+
+`127.0.0.1:0`, not a fixed port: sshd never unlinks a forwarded **socket
+file** and refuses to bind over one, so a socket-file tunnel (the form this
+README used to recommend) works exactly once per host and is dead — silently
+— after the first disconnect, with the stale file left behind in the
+remote's `/tmp`. A forwarded port has no such file to collide with, and `:0`
+asks sshd to allocate a fresh ephemeral one on every connection.
+`SetEnv LC_RIME_IME_HOST=%L` is what the remote's tmux server can see as
+`#{E:LC_RIME_IME_HOST}`, `%L` being ssh's own expansion for "the local
+machine's hostname, truncated at the first dot" — the same value the IME
+Bridge's [greeting](#the-greeting) already compares `$LC_RIME_IME_HOST`
+against on the Neovim client, so both remote paths key off the same name.
+
+**This moves the Neovim IME Bridge client from discovery candidate 4 to
+candidate 6.** The socket-file tunnel is what candidate 4
+(`/tmp/rime-ime-*.sock`, see [clients/neovim/README.md
+"Endpoint discovery"](clients/neovim/README.md#endpoint-discovery)) was
+built to find; a port-forwarded tunnel is invisible to it, so a remote
+running Neovim now resolves through candidate 6 — the loopback-port scan
+gated on `$LC_RIME_IME_HOST` being set — instead. That candidate already
+existed for exactly this case; changing the ssh config is what starts using
+it.
+
+**Install the script where the hooks expect it, on every machine.**
+`rime-copilot install` (no flags needed on a machine whose `~/.tmux/`
+already exists) writes `rime_ctx_report.sh` there — see the two-copies
+paragraph above — or `--tmux-dir PATH` to put it somewhere else. After that,
+`~/.tmux/` — `tmux.conf` and `rime_ctx_report.sh` together — is the whole
+sync unit; a remote needs no separate install step, because the script
+branches into its remote mode on the fourth hook argument alone.
+
+**`rime-copilot status` catches both silent misconfigurations**: a hook
+missing the fourth argument (always-local, symptomless on the laptop that
+configured it), and `update-environment` not naming
+`LC_RIME_IME_HOST` (`#{E:VAR}` then falls back to the tmux **server's**
+environment, which belongs to whichever ssh session started that server —
+two laptops into one remote account would have the second silently read the
+first's identity). Read both lines if `status` prints them; neither has a
+symptom to notice on its own.
+
+`status` also names a missing `client-attached` hook, but as its own,
+separate, informational line — never folded into "missing tmux hook(s)",
+because it is not a misconfiguration in the same sense as the two above: the
+other two hooks still push with it absent, local panes are entirely
+unaffected, and a machine that never reaches a remote tmux loses nothing.
+What it costs is that a remote's endpoint cache is not refreshed after a
+dropped and re-established ssh, i.e. after the forwarded port changed
+underneath it.
+
+**Discovery on the remote is sequential, not concurrent — do not assume it is
+cheap.** When the cache is empty or stale, `rime_ctx_report.sh` tries each
+candidate loopback port **in turn**, one `nc -w 1` connect-and-greeting-check
+per candidate, not in parallel. (This differs from the Neovim client, which
+does dial its candidates concurrently — the two are separate implementations
+of the same idea, and only one of them is concurrent.) A live tunnel is found
+on the first or second candidate and costs nothing worth noticing; a **down**
+tunnel — the ssh session dropped, no candidate answers — costs roughly one
+second per candidate tried, in sequence, before the script gives up. That
+whole cost is paid in the background (`run-shell -b`), once per pane switch
+that needs discovery, and never blocks the terminal — but it is real
+background load, and on a host with many stale candidate ports it is
+minutes, not milliseconds, until the `client-attached` hook's refresh (above)
+gets a chance to shorten the candidate list again.
+
+**Verifying a remote is actually reporting** needs `copilot/context_memory/
+debug: true` and a fresh keystroke — glog only flushes on the next write, so
+a quiet plugin can leave the very evidence you are looking for sitting in an
+unflushed buffer, and killing Squirrel drops that buffer instead of showing
+it:
+
+```
+[ctxmem] tmux:...:%4|ssh -> tmux:devbox:/tmp/tmux-1000/default:%2|zsh via bound-remote restored ascii_mode=0
+```
+
+`via bound-remote`, with a host segment in the key, means it worked. `via
+bridge` with a bare `%N|ssh` key means the remote never reported — the local
+`ssh` pane is standing in for it, which is the polled rung's normal fallback
+when nothing pushed a remote identity.
 
 ### Multi-Client Behavior
 

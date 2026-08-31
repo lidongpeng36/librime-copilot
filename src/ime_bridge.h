@@ -102,7 +102,7 @@ class ImeBridgeState {
   // (see RetainClientConnection) which would flip ascii_mode on an idle
   // machine. Nothing here touches client_states_ or conn_refs_.
   void HandleIdentity(const std::string& socket, const std::string& pane_id,
-                      const std::string& command);
+                      const std::string& command, const std::string& host);
   std::optional<context_memory::Identity> GetPushedIdentity() const;
 
   // Per-connection refcount for a client key. A reconnecting client briefly has
@@ -137,6 +137,12 @@ class ImeBridgeState {
   // This machine's short hostname, or config_.host_id when set. Cached: it is
   // read once per connection and gethostname() is a syscall.
   const std::string& HostId() const;
+
+  // The name this bridge reports in its greeting, and the name an identity
+  // message's `expect` field is checked against. Normally derived from the
+  // config's host_id; settable so the state machine can be tested without a
+  // config.
+  void SetHostIdForTest(const std::string& host_id);
 
   // The greeting written to a client the instant it connects, newline included.
   // A remote client compares data.host against the machine its ssh session came

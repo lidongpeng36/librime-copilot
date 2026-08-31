@@ -338,3 +338,52 @@ TEST(ContextMemoryDefault, TheHeadDistinguishesNoDefaultFromDefaulted) {
   auto outcome = step.OnHead("tmux:s:%8|zsh", "tmux:s:%8", ascii, [&](bool v) { ascii = v; });
   EXPECT_EQ(outcome, Step::HeadOutcome::kNothingKnown);
 }
+
+// 本机 key 的字面量金标准。刻意写死字符串而不是回环调用 MakeKey ——
+// 回环无论格式怎么变都会通过，而这条断言存在的唯一目的就是格式变了要红。
+// 它守的是 spec 的第一条全局约束：任何形变都会孤儿化每台机器已记住的
+// 全部 pane。
+TEST(ContextMemoryKey, LocalKeyIsByteIdenticalAfterTheHostSegment) {
+  rime::context_memory::Identity id;
+  id.socket = "/private/tmp/tmux-501/default";
+  id.pane_id = "%2";
+  id.command = "zsh";
+  EXPECT_EQ(rime::context_memory::MakeKey(id, true),
+            "tmux:/private/tmp/tmux-501/default:%2|zsh");
+  EXPECT_EQ(rime::context_memory::MakeKey(id, false),
+            "tmux:/private/tmp/tmux-501/default:%2");
+}
+
+TEST(ContextMemoryKey, EmptySocketStillRendersAsDefault) {
+  rime::context_memory::Identity id;
+  id.pane_id = "%0";
+  EXPECT_EQ(rime::context_memory::MakeKey(id, false), "tmux:default:%0");
+}
+
+// 失败 2 号：远端 %0 和本机 %0 今天是同一个 key。
+TEST(ContextMemoryKey, HostSegmentSeparatesSamePaneIdOnTwoMachines) {
+  rime::context_memory::Identity local;
+  local.socket = "default";
+  local.pane_id = "%0";
+  rime::context_memory::Identity remote = local;
+  remote.host = "devbox";
+
+  EXPECT_EQ(rime::context_memory::MakeKey(local, false), "tmux:default:%0");
+  EXPECT_EQ(rime::context_memory::MakeKey(remote, false), "tmux:devbox:default:%0");
+  EXPECT_NE(rime::context_memory::MakeKey(local, false),
+            rime::context_memory::MakeKey(remote, false));
+}
+
+TEST(ContextMemoryKey, IdentityEqualityComparesEveryField) {
+  rime::context_memory::Identity a{"default", "%1", "zsh", "devbox"};
+  rime::context_memory::Identity b = a;
+  EXPECT_TRUE(a == b);
+  b.host = "builder";
+  EXPECT_FALSE(a == b);
+  b = a; b.command = "nvim";
+  EXPECT_FALSE(a == b);
+  b = a; b.pane_id = "%2";
+  EXPECT_FALSE(a == b);
+  b = a; b.socket = "other";
+  EXPECT_FALSE(a == b);
+}

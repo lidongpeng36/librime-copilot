@@ -19,6 +19,7 @@ set(copilot_test_src
   plugin_commit_test.cc
   prediction_context_test.cc
   raw_input_order_test.cc
+  remote_binding_test.cc
   replay_align_test.cc
   rerank_llm_test.cc
   rerank_test.cc

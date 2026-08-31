@@ -19,6 +19,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "auto_spacer.h"
 #include "caret_context.h"
@@ -98,15 +99,38 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
     config->GetBool("copilot/context_memory/enable", &context_memory_options_.enable);
     config->GetBool("copilot/context_memory/use_pane_command",
                     &context_memory_options_.use_pane_command);
-    config->GetInt("copilot/context_memory/max_entries", &context_memory_options_.max_entries);
+    int configured_max_entries = context_memory_options_.max_entries;
+    config->GetInt("copilot/context_memory/max_entries", &configured_max_entries);
+    context_memory_options_.max_entries = ClampMaxEntries(configured_max_entries);
     config->GetBool("copilot/context_memory/debug", &context_memory_options_.debug);
+    // The commands a local pane must be running before a remote tmux identity
+    // is bound behind it. A list, not a hard-coded set, because the local
+    // pane_current_command for a wrapped connection is whatever the wrapper
+    // is called (`assh`, a shell function, `kitten ssh`); a user whose
+    // wrapper is not listed gets today's behaviour rather than a wrong one.
+    std::vector<std::string> remote_commands{"ssh", "mosh", "et"};
+    if (auto list = config->GetList("copilot/context_memory/remote_commands")) {
+      remote_commands.clear();
+      for (size_t i = 0; i < list->size(); ++i) {
+        if (auto item = list->GetValueAt(i)) {
+          string name;
+          if (item->GetString(&name)) {
+            remote_commands.push_back(name);
+          }
+        }
+      }
+    }
+    // Raw, not context_memory_options_.max_entries -- that copy was just
+    // clamped above for the Table consumer. SetRemoteBindingOptions clamps
+    // its own copy internally so its test can drive a hostile value through
+    // this exact call. See context_identity.h.
+    SetRemoteBindingOptions(remote_commands, configured_max_entries);
     // Absent leaves it at -1, "no opinion", which is the pre-existing
     // behaviour: a pane with no history keeps whatever mode it arrived in.
     bool default_ascii = false;
     if (config->GetBool("copilot/context_memory/default_ascii_mode", &default_ascii)) {
       context_memory_options_.default_ascii_mode = default_ascii ? 1 : 0;
     }
-    if (context_memory_options_.max_entries < 1) context_memory_options_.max_entries = 1;
 
     // Both the IMK hook and the tmux pane scrape return this many characters
     // — the prediction context and the re-ranking filter each have their own

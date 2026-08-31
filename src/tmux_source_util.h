@@ -702,6 +702,15 @@ inline std::vector<std::string> BuildTmuxArgs(const std::string& socket) {
 // (src/auto_spacer.cc:282-286), so a constant key would let one pane's
 // spacing state bleed into the next.
 //
+// DELIBERATELY has no host segment, unlike context_memory::MakeKey since
+// 2026-08-31. This keys AutoSpacer's client_states_ boundary cache, which
+// caches text scraped from the LOCAL pane. An ssh pane's screen shows the
+// remote's output, but the scrape, the caret and the boundary are all local,
+// so the local pane is the correct key here and a host segment would be
+// wrong rather than merely redundant. Note the "byte-identical" claim below
+// was always conditional anyway -- MakeKey appends "|command" under
+// use_pane_command and this never does.
+//
 // Byte-identical to context_memory::MakeKey (src/context_memory.h) for the
 // same socket and pane, and duplicated on purpose: this header includes
 // history.h, which drags in glog, and context_memory.h must stay Rime-free so

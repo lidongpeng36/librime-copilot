@@ -27,7 +27,20 @@ struct Identity {
   std::string socket;   // tmux socket tag; empty means tmux's default
   std::string pane_id;  // e.g. "%7"
   std::string command;  // pane_current_command; may be empty
+  // The machine the pane lives on; empty means this one.
+  //
+  // LAST on purpose. Every existing `Identity{socket, pane, command}`
+  // brace-init keeps compiling -- there are 11 of them in test/ alone --
+  // and a field inserted anywhere earlier would silently re-bind all of
+  // them to the wrong members rather than fail to compile.
+  std::string host;
 };
+
+inline bool operator==(const Identity& a, const Identity& b) {
+  return a.socket == b.socket && a.pane_id == b.pane_id && a.command == b.command &&
+         a.host == b.host;
+}
+inline bool operator!=(const Identity& a, const Identity& b) { return !(a == b); }
 
 // The single string form. BOTH identity rungs must route through this: a
 // machine that adds the tmux hook after having used the polling fallback must
@@ -46,7 +59,16 @@ struct Identity {
 // re-derive why there are two of these.
 inline std::string MakeKey(const Identity& id, bool use_pane_command) {
   const std::string socket_tag = id.socket.empty() ? "default" : id.socket;
-  std::string key = "tmux:" + socket_tag + ":" + id.pane_id;
+  std::string key = "tmux:";
+  // Inserted ONLY when non-empty, so every key already stored on every
+  // machine is byte-identical afterwards. See
+  // test/context_memory_test.cc's LocalKeyIsByteIdenticalAfterTheHostSegment,
+  // which is a literal rather than a round-trip precisely so that a change
+  // to this format cannot pass.
+  if (!id.host.empty()) {
+    key += id.host + ":";
+  }
+  key += socket_tag + ":" + id.pane_id;
   if (use_pane_command && !id.command.empty()) {
     key += "|" + id.command;
   }

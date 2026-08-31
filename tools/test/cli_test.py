@@ -96,14 +96,22 @@ class CliBase(unittest.TestCase):
         base.write_text("建议\tjian yi\t500\n", encoding="utf-8")
         (self.rime / "private" / "dict.json").write_text(
             json.dumps([{"dict": str(base)}]), encoding="utf-8")
+        # Never the real user's ~/.tmux/: cmd_install's default for
+        # --tmux-dir is Path.home() / ".tmux", and a real machine running
+        # these tests (this one included) has a real, non-empty ~/.tmux/ --
+        # an `install` test that forgot --tmux-dir must not write into it.
+        self.tmux_dir = root / "dot-tmux"
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_cli(self, *args) -> "tuple[int, str]":
+    def run_cli(self, *args, inject_tmux_dir: bool = True) -> "tuple[int, str]":
+        argv = ["--rime-dir", str(self.rime), *args]
+        if inject_tmux_dir and "install" in argv and "--tmux-dir" not in argv:
+            argv += ["--tmux-dir", str(self.tmux_dir)]
         buffer = io.StringIO()
         with redirect_stdout(buffer):
-            code = main(["--rime-dir", str(self.rime), *args])
+            code = main(argv)
         return code, buffer.getvalue()
 
     def fake_builder(self) -> Path:
@@ -691,6 +699,43 @@ class Install(CliBase):
         _, out = self.run_cli("status")
         self.assertIn("paths.py", out)
         self.assertIn("differ", out)
+
+
+class InstallTmuxDir(CliBase):
+    """The tmux reporter's OPERATIVE copy: `--tmux-dir` (default `~/.tmux`)
+    is where a synced `.tmux.conf` hook can actually find it, distinct from
+    the versioned copy `install` always writes under `--dest`.
+    """
+
+    def test_tmux_dir_override_installs_the_reporter_there(self):
+        target = Path(self.tmp.name) / "custom-tmux"
+        code, _ = self.run_cli("install", "--builder", str(self.fake_builder()),
+                               "--tmux-dir", str(target))
+        self.assertEqual(0, code)
+        placed = target / "rime_ctx_report.sh"
+        self.assertTrue(placed.is_file())
+        self.assertTrue(os.access(placed, os.X_OK))
+
+    def test_tmux_dir_is_named_in_the_dry_run_plan(self):
+        target = Path(self.tmp.name) / "custom-tmux"
+        _, out = self.run_cli("--dry-run", "install", "--builder", str(self.fake_builder()),
+                              "--tmux-dir", str(target))
+        self.assertIn(str(target / "rime_ctx_report.sh"), out)
+        self.assertFalse((target / "rime_ctx_report.sh").exists())
+
+    def test_defaults_to_the_real_home_tmux_directory(self):
+        # Verified by mocking Path.home() rather than by actually letting
+        # cmd_install fall through to it -- the whole point of this default
+        # is that it targets a real, un-fixtured directory on the running
+        # machine, so the only safe way to prove the default resolves there
+        # is to redirect "there" to a temporary one first.
+        fake_home = Path(self.tmp.name) / "fake-home"
+        fake_home.mkdir()
+        with mock.patch.object(Path, "home", return_value=fake_home):
+            code, _ = self.run_cli("install", "--builder", str(self.fake_builder()),
+                                   inject_tmux_dir=False)
+        self.assertEqual(0, code)
+        self.assertTrue((fake_home / ".tmux" / "rime_ctx_report.sh").is_file())
 
 
 class InstallInterpreter(CliBase):
@@ -1859,18 +1904,25 @@ class StatusImportTableTest(unittest.TestCase):
 
 
 class ContextMemoryStatusTest(unittest.TestCase):
-    def _line(self, body: "str | None", enabled: bool = True) -> "str | None":
+    def _line(self, body: "str | None", enabled: bool = True,
+              conf_extra: str = "") -> "str | None":
         with tempfile.TemporaryDirectory() as d:
             conf = Path(d) / "tmux.conf"
             if body is not None:
-                conf.write_text(body)
+                conf.write_text(body + conf_extra)
             return cli._context_memory_status(conf, enabled)
 
-    def _hooks(self, script: str, flag: str = "-ga", args: bool = True) -> str:
-        tail = ' \\"#{pane_id}\\" \\"#{pane_current_command}\\" \\"#{socket_path}\\"' if args else ""
+    def _hooks(self, script: str, flag: str = "-ga", args: bool = True,
+               ime_host: bool = True, client_attached: bool = False) -> str:
+        tail = ""
+        if args:
+            tail = ' \\"#{pane_id}\\" \\"#{pane_current_command}\\" \\"#{socket_path}\\"'
+            if ime_host:
+                tail += ' \\"#{E:LC_RIME_IME_HOST}\\"'
+        hooks = cli._CTX_HOOKS + ((cli._CTX_CLIENT_ATTACHED_HOOK,) if client_attached else ())
         return "".join(
             f"set-hook {flag} {hook} 'run-shell -b \"{script}{tail}\"'\n"
-            for hook in cli._CTX_HOOKS)
+            for hook in hooks)
 
     def _script(self, d: Path, *, executable: bool = True) -> Path:
         path = d / "rime_ctx_report.sh"
@@ -1884,10 +1936,16 @@ class ContextMemoryStatusTest(unittest.TestCase):
         self.assertIn("polling", line)
         self.assertIn("after-select-pane", line)
 
+    # A fully-correct hook body now names the IME host too (see the README's
+    # single synced hook block), so a "this is a correct config" fixture
+    # needs update-environment alongside it or the new checks below flag it.
+    _UPDATE_ENV_LINE = "set -ga update-environment ' LC_RIME_IME_HOST'\n"
+
     def test_reports_present_tmux_hook(self):
         with tempfile.TemporaryDirectory() as d:
             script = self._script(Path(d))
-            line = self._line(self._hooks(str(script)))
+            line = self._line(self._hooks(str(script), client_attached=True),
+                              conf_extra=self._UPDATE_ENV_LINE)
         self.assertIn("hook installed", line)
         self.assertNotIn("polling", line)
 
@@ -1911,9 +1969,75 @@ class ContextMemoryStatusTest(unittest.TestCase):
     def test_hook_passing_the_pane_in_is_reported_as_installed(self):
         with tempfile.TemporaryDirectory() as d:
             script = self._script(Path(d))
-            line = self._line(self._hooks(str(script), args=True))
+            line = self._line(self._hooks(str(script), args=True, client_attached=True),
+                              conf_extra=self._UPDATE_ENV_LINE)
         self.assertIn("hook installed", line)
         self.assertNotIn("#{pane_id}", line)
+
+    def test_reports_a_hook_that_does_not_pass_the_ime_host(self):
+        """没有第 4 个参数，远端模式永远不会被选中。
+
+        本机上这毫无症状 —— 本机模式正是第 4 参数为空时的行为 —— 所以
+        一份只在本机验过的配置同步到远端之后会静默地什么都不做。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            line = self._line(self._hooks(str(script), ime_host=False),
+                              conf_extra="set -ga update-environment ' LC_RIME_IME_HOST'\n")
+        self.assertIn("LC_RIME_IME_HOST", line)
+        self.assertNotIn("hook installed (", line)
+
+    def test_reports_update_environment_missing_the_ime_host(self):
+        """#{E:} 在 session 环境里找不到时回落到 SERVER 环境，而 server
+        环境属于最先启动它的那个 ssh 会话。两台笔记本连同一远端时，第二台
+        会读到第一台的值 —— 这正是用户 tmux.conf:449 为 SSH_TTY 处理过的
+        同一个陷阱。"""
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            line = self._line(self._hooks(str(script)))  # 没有 update-environment 行
+        self.assertIn("update-environment", line)
+
+    def test_a_commented_out_update_environment_line_still_warns(self):
+        # `_UPDATE_ENV_RE.search(text)` used to scan the whole file
+        # unfiltered, so a directive that is present but commented out would
+        # satisfy the regex and silence the very warning it exists to raise
+        # -- exactly the false negative `no_host` above already guards
+        # against by excluding comment lines first.
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            commented = "# " + self._UPDATE_ENV_LINE
+            line = self._line(self._hooks(str(script)), conf_extra=commented)
+        self.assertIn("update-environment", line)
+
+    def test_client_attached_hook_present_is_not_named(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            line = self._line(self._hooks(str(script), client_attached=True),
+                              conf_extra=self._UPDATE_ENV_LINE)
+        self.assertIn("hook installed", line)
+        self.assertNotIn("client-attached", line)
+
+    def test_reports_missing_client_attached_hook(self):
+        """`client-attached` refreshes a remote's endpoint cache after a
+        dropped and re-established ssh. Missing it is not a degraded mode --
+        the other two hooks still push -- so this must be its own line, not
+        a `missing tmux hook(s)` diagnosis, which would wrongly imply the
+        setup fell back to polling."""
+        with tempfile.TemporaryDirectory() as d:
+            script = self._script(Path(d))
+            line = self._line(self._hooks(str(script), client_attached=False),
+                              conf_extra=self._UPDATE_ENV_LINE)
+        self.assertIn("client-attached", line)
+        self.assertIn("README 'Remote tmux'", line)
+        self.assertNotIn("hook installed", line)
+        self.assertNotIn("polling", line)
+
+    def test_no_hooks_at_all_still_reports_polling_not_client_attached(self):
+        # The new informational line must never displace the more important
+        # "missing tmux hook(s)" diagnosis on a machine with nothing set up.
+        line = self._line("set -g mouse on\n")
+        self.assertIn("polling", line)
+        self.assertNotIn("client-attached", line)
 
     def test_reports_half_installed_hook(self):
         line = self._line(
@@ -1934,7 +2058,9 @@ class ContextMemoryStatusTest(unittest.TestCase):
             script = self._script(Path(d))
             for flag in ("-g", "-ga", "-g -a", "-ga  "):
                 with self.subTest(flag=flag):
-                    self.assertIn("hook installed", self._line(self._hooks(str(script), flag)))
+                    line = self._line(self._hooks(str(script), flag, client_attached=True),
+                                      conf_extra=self._UPDATE_ENV_LINE)
+                    self.assertIn("hook installed", line)
 
     # The hook names a path, and matching the set-hook lines alone reported
     # `hook installed` for a hook pointing into a checkout that had since been
