@@ -944,6 +944,24 @@ script this used to be, hook and script cannot fall out of step. See that
 repo's README for the hook and reporter details; this repo owns only the
 wire protocol the reporter speaks to `ImeBridgeServer`.
 
+**Upgrading from the hand-installed reporter.** If you set this up before
+2026-08-31, your tmux config still has a hand-written `set-hook` block
+naming `rime_ctx_report.sh` directly, and the script itself is still sitting
+wherever it was copied to. Delete both, in this order, *before* adding the
+`@plugin` line above — not after: leave the old hooks in place and both hook
+sets fire on every pane switch, and nothing reports it. The five `status`
+checks that used to compare a hook against the script it named were replaced
+by the one check above, which only asks whether the *new* plugin ran and has
+nothing to say about a stale hook still pointing at a script that no longer
+exists.
+
+```sh
+# delete the set-hook lines naming rime_ctx_report.sh from your tmux config
+# (e.g. ~/.tmux/tmux.conf or ~/.tmux.conf), then:
+rm -f ~/.tmux/rime_ctx_report.sh ~/Library/Rime/private/bin/rime_ctx_report.sh
+tmux source-file ~/.tmux/tmux.conf   # or wherever it lives; or restart your tmux server
+```
+
 `client-attached` is inert on the local machine (it pushes the current pane
 once) and is what refreshes a remote's endpoint cache after a dropped and
 re-established ssh, i.e. after the forwarded port changed underneath it.

@@ -107,15 +107,34 @@ def _context_memory_status(enabled: bool, tmux_bin: str = "tmux") -> "str | None
     tmux plugin writes its hooks against its own directory. What is left worth
     knowing is whether that plugin ran, and the option it sets is evidence that
     needs no guess at any plugin manager's layout.
-    """
-    if not enabled:
-        return None
 
+    A sixth check spoke up when the tmux side was configured but the feature
+    itself was off -- a half-done setup that otherwise fails silently forever.
+    Restoring it means asking tmux BEFORE branching on `enabled`, not after, so
+    the disabled path gets the same answer the enabled path would have gotten --
+    moving the query up, not adding a second one.
+    """
     try:
         proc = subprocess.run([tmux_bin, "show-options", "-gqv",
                                _CLIENTS_PROTOCOL_OPTION],
                               capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
+        proc = None
+
+    if not enabled:
+        # Silence unless the plugin actually ran: an unset option, or tmux
+        # unreachable, is the ordinary "neither side configured" machine, and
+        # a line printed there is the always-on noise that teaches people to
+        # stop reading `status`. A set option with the feature off is the one
+        # case worth a line -- the user followed half the README.
+        value = proc.stdout.strip() if proc is not None and proc.returncode == 0 else ""
+        if not value:
+            return None
+        return (f"context memory: off ({CTX_MEMORY_ENABLE_KEY} is false), but the "
+                f"rime-copilot-clients tmux plugin is installed (protocol {value}) "
+                f"-- set it true in your schema patch, or remove the plugin")
+
+    if proc is None:
         return ("context memory: could not ask tmux whether the clients plugin "
                 "is loaded (tmux not on PATH)")
     if proc.returncode != 0:

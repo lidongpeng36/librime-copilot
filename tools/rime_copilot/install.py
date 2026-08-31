@@ -420,13 +420,19 @@ def drift(dest: Path) -> list[str]:
     source_present = source_root.is_dir()
     lines = []
     for rel, recorded_sha256 in sorted(installed.files.items()):
-        # `rel` is dest-relative for everything under `dest` (the ordinary
-        # payload) but ABSOLUTE for the tmux reporter's operative copy, which
-        # does not live under `dest` at all -- `dest / rel` already resolves
-        # correctly either way (pathlib discards the left side when the right
-        # is absolute), but `source_root / rel` would too, which would
-        # compare that file against ITSELF instead of against the repo's
-        # copy. Go by basename against source_root for an absolute key.
+        # `rel` is dest-relative for every file `apply_install` writes today --
+        # `_EXTRA_PAYLOAD` is empty since the tmux reporter moved to
+        # rime-copilot-clients on 2026-08-31, and nothing else in
+        # `payload_files()` is ever absolute. The absolute-key handling stays
+        # for an OLDER manifest still on a machine, from before that move: a
+        # `.installed.json` written back then can still carry an absolute
+        # `rel` for the reporter's operative copy, which did not live under
+        # `dest`. `dest / rel` already resolves correctly either way (pathlib
+        # discards the left side when the right is absolute), but
+        # `source_root / rel` would too, which would compare that file against
+        # ITSELF instead of against the repo's copy -- and the repo no longer
+        # has one to compare against regardless. Go by basename against
+        # source_root for an absolute key.
         name = Path(rel).name
         target = dest / rel
         if not target.is_file():

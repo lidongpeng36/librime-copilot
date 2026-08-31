@@ -1909,10 +1909,24 @@ class ContextMemoryStatusTest(unittest.TestCase):
             line = cli._context_memory_status(True, self._fake_tmux(d, "", rc=1))
         self.assertIn("could not ask tmux", line)
 
-    def test_silent_when_the_feature_is_off(self):
+    def test_silent_when_the_feature_is_off_and_the_option_is_unset(self):
+        """Neither side configured -- the ordinary machine. A line here is
+        the always-on noise that teaches people to stop reading `status`."""
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(
-                cli._context_memory_status(False, self._fake_tmux(d, "1")))
+                cli._context_memory_status(False, self._fake_tmux(d, "")))
+
+    def test_speaks_up_when_the_plugin_ran_but_the_feature_is_off(self):
+        """A half-done setup: the tmux plugin is installed (the option is
+        set) but `copilot/context_memory/enable` is still false. Silence here
+        is the exact failure the sixth `status` check existed to prevent --
+        the user followed half the README and got nothing forever."""
+        with tempfile.TemporaryDirectory() as d:
+            line = cli._context_memory_status(
+                False, self._fake_tmux(d, str(cli.CLIENTS_PROTOCOL_VERSION)))
+        self.assertIsNotNone(line)
+        self.assertIn("off", line)
+        self.assertIn(cli.CTX_MEMORY_ENABLE_KEY, line)
 
     def _enabled(self, body: str) -> bool:
         with tempfile.TemporaryDirectory() as d:
