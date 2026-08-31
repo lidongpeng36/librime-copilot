@@ -12,14 +12,10 @@ jobs:
     steps:
       - name: Checkout last commit
         uses: actions/checkout@v4
-      - name: Install clang-format and neovim
-        run: sudo apt install -y clang-format neovim
+      - name: Install clang-format
+        run: sudo apt install -y clang-format
       - name: Lint
         run: find src tools -name '*.cc' -o -name '*.h' | xargs clang-format -Werror --dry-run || { echo Please lint your code by '"'"find src tools -name '*.cc' -o -name '*.h' | xargs clang-format -i"'"'.; false; }
-      - name: Lua unit tests
-        run: nvim -l clients/neovim/test/endpoint_spec.lua
-      - name: Lua connection tests
-        run: nvim -l clients/neovim/test/verify_spec.lua
       # Not the runner's system python: on ubuntu-24.04 that one is
       # externally managed (PEP 668) and refuses a plain `pip install`.
       - uses: actions/setup-python@v5

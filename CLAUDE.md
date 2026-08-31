@@ -78,19 +78,9 @@ cmake --build build
   `test/ime_bridge_socket_test.cc` is the one exception to "pure logic": it stands up a real
   `ImeBridgeServer` on a Unix socket (no Rime engine) to cover the parts that only exist over
   a real connection — the greeting, connection refcounting, `Stop()` draining.
-- **Lua tests** run under bare `nvim -l`, no framework:
-  ```sh
-  nvim -l clients/neovim/test/endpoint_spec.lua   # pure helpers
-  nvim -l clients/neovim/test/verify_spec.lua     # real sockets, timers, handle cleanup
-  ```
-  `verify_spec` drives the actual connection path against fake bridges. It runs each scenario
-  in a **child nvim**: reloading the module leaves the previous instance's sockets and timers
-  alive in the event loop, and they go on talking, silently invalidating the next scenario.
-  Both specs load the module under test via explicit path (`loadfile` / `package.preload`),
-  never `require` — nvim's runtimepath loader resolves `rime_ime` to the copy installed under
-  `~/.config/nvim` first, so on a machine that has the plugin installed a plain `require`
-  tests the *installed* code. That has produced falsely-green runs twice; do not undo it.
-  CI runs lint + both Lua specs + build-with-ASAN + the GTest suite.
+  CI runs lint + build-with-ASAN + the GTest suite. The Neovim client's Lua specs
+  (`endpoint_spec.lua`, `verify_spec.lua`) moved with it to `rime-copilot-clients` and run
+  there — this repo has no Lua tests of its own any more.
 
 ### macOS vs Linux
 
@@ -643,11 +633,10 @@ echo rime-copilot > plugins/copilot/.python-version
 ln -s ~/Library/Mobile\ Documents/com~apple~CloudDocs/config/rime-copilot/superpowers-docs \
       plugins/copilot/docs/superpowers
 
-# 3. confirm the setup, all four suites
+# 3. confirm the setup, both suites this repo owns (the clients' Lua specs
+#    live and run in rime-copilot-clients now)
 ctest --test-dir build -R copilot_test --output-on-failure
 python3 -m unittest discover -s plugins/copilot/tools/test -p '*_test.py'
-nvim -l plugins/copilot/clients/neovim/test/endpoint_spec.lua
-nvim -l plugins/copilot/clients/neovim/test/verify_spec.lua
 ```
 
 **Fourth: the corpus travels by iCloud, and only the corpus does.**
@@ -915,8 +904,7 @@ other**, and most changes touch more than one:
 | `*.custom.yaml`, the lexicon, `dict.json`, `private.dict.yaml` + `private/personal.dict.yaml`, the model | the vault, via `backup` / `restore` |
 | the **user dictionary** (`private.userdb`) | Rime's own user-data sync, from Squirrel's menu — NOT the vault |
 | the design records (`docs/superpowers/`) | iCloud, plus a symlink made by hand |
-| the **tmux hooks** (`~/.tmux/tmux.conf`) | nothing automated on the laptop — hand-edited or synced by hand, then `tmux source-file ~/.tmux/tmux.conf` or a fresh server. A channel with no automation: `rime-copilot install` also places a copy of `rime_ctx_report.sh` under `private/bin`, but **that copy is not the operative one** — it is a versioned copy to `scp` from, nothing hooks it. The operative copy lives at `~/.tmux/rime_ctx_report.sh`, alongside `tmux.conf`, and travels WITH that file when the user syncs their tmux config, not with `install`. Nothing writes the two `set-hook -ga` lines automatically either; a machine missing them, or running a `tmux.conf` that predates the fourth hook argument, silently falls back to context memory's polled rung (which itself needs `copilot/tmux_source/enabled`). `status` reports whether the hooks are there, and whether the **operative** script they name still is |
-| a **remote host reached over ssh** (its own `~/.tmux/tmux.conf` + `rime_ctx_report.sh`) | a FOURTH channel with no automation at all, and the one no local `status` can see. The remote's copy of `tmux.conf` and `rime_ctx_report.sh` (the same file as the laptop's — it branches on the fourth hook argument, `#{E:LC_RIME_IME_HOST}`) has to reach that host independently, by hand. **Order matters here in a way it does not for the other channels: the dylib must reach the laptop before this reaches any remote.** An old plugin reads the pushed message's `host` field as an unknown key and ignores it, so a remote pane keys as though it were local — silently filing that remote pane's `ascii_mode` into the laptop's own local-pane memory, the one combination in this feature's degradation table that writes wrong data rather than merely doing nothing. Separately, the laptop's own two hooks (`after-select-pane`, `after-select-window`) must already be installed before any remote pushes at all — the pushed identity cell has no expiry, only the next push overwrites it, so a laptop with no local hooks that returns from a remote pane keeps that remote's identity forever. See "Remote tmux" in `README.md`. A remote with a stale or missing script fails silently too: it just never reports, and that pane goes on answering as an anonymous local-`ssh`-pane key behind the laptop, exactly like a remote that was never set up at all |
+| the **clients** (Neovim, the tmux reporter, including on a remote host reached over ssh) | `rime-copilot-clients`, via each ecosystem's own plugin manager (lazy.nvim, TPM) — not a channel this repo has any part in any more. **Order still matters across the boundary**, and it does not follow the plugin managers' own schedule: the dylib must reach the laptop before a remote's clients plugin is upgraded past the point where it started sending the identity message's `host` field, or an old handler reads it as an unknown key and ignores it, silently filing that remote pane's `ascii_mode` into the laptop's own local-pane memory. See "Remote tmux" in `README.md` |
 | the **telemetry** (`private/copilot_telemetry/`) | `<sync_dir>/copilot_telemetry/` — `tools/sync_telemetry.sh` by hand, or `copilot/telemetry/auto_sync: true` on a 30-min timer. NOT the vault, and never merged: one file per machine, so collecting is concatenation |
 
 **The telemetry filename is `installation_id`, and it used to go stale.** The
@@ -984,7 +972,12 @@ sync after.
 
 The dylib is the channel with no automation, and it is the one carrying every
 C++ change. `git pull` and `restore` both succeeding says nothing about
-whether the plugin's behaviour changed on that machine.
+whether the plugin's behaviour changed on that machine. This matters more now
+than it used to: the clients (Neovim, the tmux reporter) update themselves
+through their own plugin managers on their own schedule, so on a machine
+where everything else keeps itself current, the dylib is the one thing left
+that does not — and the one most likely to be forgotten precisely because
+everything around it looks automatic.
 
 **Before that: building the tests is not building the dylib.** `cmake --build
 build --target copilot_test` is the fast loop and it is what you will run all
@@ -1036,7 +1029,8 @@ A corollary worth knowing on its own: **a redeploy leaves
 `/tmp/rime_copilot_ime.sock` absent until the next keystroke.** The refcount
 reaches zero, `Stop()` unlinks, and `Start()` binds again only when the next
 Rime session is created. That window is normal. Every client must tolerate it;
-`tools/rime_ctx_report.sh` does, with `[ -S "$SOCK" ] || exit 0`.
+`rime-copilot-clients`' tmux reporter (`scripts/report.sh`) does, with
+`[ -S "$SOCK" ] || exit 0`.
 
 **And copying the dylib is not loading it — the running Squirrel has to be
 killed.** A process maps its dynamic libraries at launch and never re-reads the
@@ -1128,41 +1122,23 @@ local copy up over the change being propagated, which is the exact shape of
 the June-2025 lexicon incident above.
 
 ## Clients
-- `clients/neovim/lua/rime_ime/` — Neovim client for the IME Bridge, one
-  self-contained module directory so it can be synced to a remote host as a
-  unit. `init.lua` is the stateful part (connection lifecycle, autocmds,
-  protocol); `endpoint.lua` is pure logic (endpoint parsing, discovery order,
-  tunnel-port enumeration, greeting parsing, backoff, instance identity) with no
-  `vim.*` reference, which is what lets `endpoint_spec.lua` run under bare
-  `nvim -l`. Keep it that way — anything stateful belongs in `init.lua`.
 
-### Remote Neovim, and why the client verifies who answers
-The client can run on a machine that is not the one Rime is on, reached through
-`RemoteForward` in the user's `~/.ssh/config`. Two facts drive the design, both
-measured (see the nvim-remote-identity design record, kept locally,
-for the full record and the alternatives that were eliminated):
-
-- **sshd never unlinks a forwarded socket file** — not on `ssh -O exit`, not on
-  SIGKILL — and refuses to bind over one, so the socket-file form of the tunnel
-  works once per host and is dead after. Hence a forwarded **port**.
-- **Two laptops on one remote account** each get a tunnel to a *different* IME,
-  indistinguishable from the far end. Hence `RemoteForward 127.0.0.1:0` (a
-  private port per laptop, no coordination) plus a greeting: `ImeBridgeServer`
-  writes one `type:"hello"` line naming its host the instant it accepts, and the
-  client keeps only the tunnel whose host matches `$LC_RIME_IME_HOST` (delivered
-  by `SetEnv LC_RIME_IME_HOST=%L`).
-
-Invariants to preserve when touching this:
-- The greeting must be **unprompted** — a client must never have to send a
-  keystroke to discover it reached the wrong machine.
-- A connection that sends no action must register **no** client state. Discovery
-  probes other laptops' tunnels; if a silent probe registered a client, its
-  disconnect would synthesize a reset and flip that machine's `ascii_mode`.
-  Guaranteed by `HandleConnection` filling `keys` only from `ProcessMessage`.
-- With `$LC_RIME_IME_HOST` unset the client must behave exactly as before,
-  greeting or not: that is the local case and every pre-existing setup.
-- No match means **no** input method. Refusing is the point; guessing is what
-  drove the wrong laptop.
+The Neovim client and the tmux reporter both live in
+[rime-copilot-clients](https://github.com/lidongpeng36/rime-copilot-clients)
+now, each installable by its own ecosystem's plugin manager (lazy.nvim, TPM) —
+neither was, sitting four directories inside this C++ repo. This repo keeps
+only the end of the wire they talk to: `ImeBridgeServer`
+(`src/ime_bridge.{h,cc}`) and the protocol it speaks — the greeting, the
+identity message, `ascii_mode` set/restore. The two sides were never testable
+together, because the handler lives behind a real Rime engine the other repo
+has no way to stand up, so the contract is kept in step by two goldens that
+name each other, the same arrangement `MakeKey` and `MakeClientKey` already
+use (`src/context_memory.h:26-46`): the literal wire-format tests at the
+bottom of `test/ime_bridge_state_test.cc` name that repo's `scripts/report.sh`
+and `test/report_test.py`, and that repo's golden names this file back.
+Bumping `kProtocolVersion` (`src/ime_bridge.cc`) is therefore a coordinated
+change across both repos; a version mismatch is inert, never wrong —
+`ProcessMessage` logs a warning and ignores the message.
 
 ## Deployment / config
 Users add `copilot` to `engine/processors` **before `ascii_composer`** — not

@@ -422,6 +422,16 @@ TEST(ImeBridgeState, ContextDepthIsCountedAndTruncationIsUnknown) {
   EXPECT_EQ(rime::Truncation::kUnknown, ctx->truncation);
 }
 
+// The other half of a cross-repo contract. The reporter that emits this exact
+// message lives in rime-copilot-clients (scripts/report.sh), and its
+// test/report_test.py pins the same string from the other side. Neither can
+// test the other -- this handler lives behind a real Rime engine -- so the two
+// goldens are kept in step by hand, the way MakeKey and MakeClientKey are
+// (src/context_memory.h:26-46).
+//
+// Bumping kProtocolVersion is a coordinated change across both repos. A
+// mismatch is inert, never wrong: ProcessMessage logs a warning and ignores
+// the message.
 namespace {
 std::string IdentityMessage(const char* pane, const char* command,
                             const char* host = nullptr) {
@@ -434,6 +444,46 @@ std::string IdentityMessage(const char* pane, const char* command,
   return R"({"v":1,"ns":"rime.ime","type":"identity","data":)" + data + "}}";
 }
 }  // namespace
+
+// The cross-repo golden. These two strings are exactly what
+// rime-copilot-clients' scripts/report.sh emits -- the first in local mode,
+// the second in remote mode -- and its test/report_test.py pins the same two
+// from the other side. Neither repo can test the other: this handler lives
+// behind a real Rime engine.
+//
+// Written out in full rather than built by IdentityMessage() ON PURPOSE.
+// Every other test in this file uses that helper, so a change to the wire
+// format changes the helper and leaves all of them green. These two cannot be
+// satisfied that way. If one fails, either the format changed -- in which case
+// the other repo needs the same change and kProtocolVersion probably needs a
+// coordinated bump -- or somebody reformatted the literal, which is the same
+// thing wearing a different hat.
+//
+// The local string is not invented: it was captured from the installed
+// reporter on 2026-08-31.
+TEST(ImeBridgeIdentity, TheLocalReportersExactMessageStillParses) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(
+      R"({"v":1,"ns":"rime.ime","type":"identity","data":{"socket":"/private/tmp/tmux-501/default","pane":"%2","command":"zsh"}})");
+  auto id = state.GetPushedIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->socket, "/private/tmp/tmux-501/default");
+  EXPECT_EQ(id->pane_id, "%2");
+  EXPECT_EQ(id->command, "zsh");
+  EXPECT_EQ(id->host, "");
+}
+
+TEST(ImeBridgeIdentity, TheRemoteReportersExactMessageStillParses) {
+  rime::ImeBridgeState state;
+  state.SetHostIdForTest("Mac-Mini");
+  state.ProcessMessage(
+      R"({"v":1,"ns":"rime.ime","type":"identity","data":{"expect":"Mac-Mini","host":"devbox","socket":"/tmp/tmux-1000/default","pane":"%2","command":"zsh"}})");
+  auto id = state.GetPushedIdentity();
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->host, "devbox");
+  EXPECT_EQ(id->pane_id, "%2");
+  EXPECT_EQ(id->command, "zsh");
+}
 
 TEST(ImeBridgeIdentity, UpdatesTheIdentityCell) {
   rime::ImeBridgeState state;
