@@ -27,28 +27,12 @@ INSTALL_MANIFEST = ".installed.json"
 ENTRY_POINT = "rime-copilot"
 PACKAGE = "rime_copilot"
 
-# Payload files that are neither the entry point nor a package module.
-#
-# `rime_ctx_report.sh` is here because a `.tmux.conf` hook has to name a
-# stable path, and the only stable path is the installed one: the bootstrap
-# promises "no checkout needed after that", so a hook pointing into a git
-# working tree stops firing the moment that tree is moved or deleted --
-# silently, and `status` went on reporting `hook installed` because it
-# matched on the set-hook lines and never asked whether the script was there.
-#
-# Installed with copy2 like every non-entry-point file, which preserves the
-# executable bit; `run-shell` needs it.
-_EXTRA_PAYLOAD = ("rime_ctx_report.sh",)
-
-# The same file, named separately: `_EXTRA_PAYLOAD`'s copy under `dest`
-# (private/bin) stays as a versioned copy to `scp` from, but it is not the
-# one a synced `.tmux.conf` hook can name -- private/bin's path differs by
-# machine (`--dest`, or the rime dir itself) while `~/.tmux/` is the one
-# thing the user already syncs verbatim to every machine. `apply_install`'s
-# `tmux_dir` parameter installs a second, OPERATIVE copy there, alongside
-# `install.sh` / `yank.sh` / `renew_env.sh` -- matching that directory's own
-# convention -- so the hook and the script it names travel as one unit.
-TMUX_REPORTER_NAME = _EXTRA_PAYLOAD[0]
+# Nothing beyond the CLI itself. `rime_ctx_report.sh` used to be here, and its
+# comment explained that a .tmux.conf hook has to name a path that outlives a
+# git checkout. It moved to rime-copilot-clients on 2026-08-31, where the tmux
+# plugin sets the hook against its own directory -- so there is no longer a
+# path for anyone to name wrongly.
+_EXTRA_PAYLOAD: "tuple[str, ...]" = ()
 
 # Present in a real checkout, never in an installed copy: apply_install only
 # ever writes payload_files() plus the builder into dest, and test/ is not
@@ -377,8 +361,7 @@ def _install_one(src: Path, target: Path, *, interpreter: "str | None" = None) -
 
 def apply_install(source_root: Path, dest: Path, builder: Path,
                   commit: "str | None", now: str,
-                  interpreter: "str | None" = None,
-                  tmux_dir: "Path | None" = None) -> None:
+                  interpreter: "str | None" = None) -> None:
     if not is_source_checkout(source_root):
         raise ValueError(
             f"refusing to install from {source_root}: not a rime-copilot checkout "
@@ -395,18 +378,6 @@ def apply_install(source_root: Path, dest: Path, builder: Path,
     # artifact that does not come from source_root, so it is not part of the
     # payload drift() compares against the repo.
     _install_one(builder, dest / BUILDER_NAME)
-
-    # The operative copy, keyed by its own absolute path rather than a
-    # dest-relative one -- it does not live under `dest`, so it needs a key
-    # drift() can still look up by. `tmux_dir` is None in most tests and in
-    # any caller that has not opted in; `None` skips this entirely rather
-    # than defaulting to the real machine's home directory here -- that
-    # default belongs to the CLI, one layer up, where a caller can always
-    # override it with `--tmux-dir`.
-    reporter = source_root / TMUX_REPORTER_NAME
-    if tmux_dir is not None and reporter.is_file():
-        placed = tmux_dir / TMUX_REPORTER_NAME
-        files[str(placed)] = _install_one(reporter, placed)
 
     # Written last: an install interrupted after copying some files but
     # before this point must read back as "not installed", not "complete".

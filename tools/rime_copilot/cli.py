@@ -1508,18 +1508,6 @@ def cmd_install(args) -> int:
     print(f"  {'python':<17} {interpreter}")
     print(f"  {'':<17} from {provenance}")
 
-    # Defaults to ~/.tmux/, matching that directory's existing top-level
-    # scripts (install.sh, yank.sh, renew_env.sh): the operative copy a
-    # synced .tmux.conf hook actually names, distinct from the versioned
-    # copy under `dest` that _EXTRA_PAYLOAD always writes. `None` from the
-    # CLI layer means "use the default", not "skip it" -- only a caller of
-    # apply_install() itself (a test, mainly) can skip it outright by
-    # passing tmux_dir=None through explicitly.
-    tmux_dir = Path(args.tmux_dir).expanduser() if args.tmux_dir else Path.home() / ".tmux"
-    reporter = source_root / install.TMUX_REPORTER_NAME
-    if reporter.is_file():
-        print(f"  {'tmux reporter':<17} {tmux_dir / install.TMUX_REPORTER_NAME}")
-
     _print_missing_requirements(interpreter)
     if args.dry_run:
         return 0
@@ -1529,8 +1517,7 @@ def cmd_install(args) -> int:
     # one value drives the entry point's shebang and the dependency check
     # alike -- and so `--python` has somewhere to reach (see install.py's
     # module docstring and README "Keeping the installed copy honest").
-    install.apply_install(source_root, dest, builder, commit, _now(), interpreter=interpreter,
-                          tmux_dir=tmux_dir)
+    install.apply_install(source_root, dest, builder, commit, _now(), interpreter=interpreter)
     print(f"installed to {dest} @ {commit[:7] if commit else 'unknown'}")
     return 0
 
@@ -1683,11 +1670,6 @@ def build_parser() -> argparse.ArgumentParser:
     install_cmd = sub.add_parser("install")
     install_cmd.add_argument("--dest", help="where to install (default: <rime-dir>/private/bin)")
     install_cmd.add_argument("--builder", help=f"path to {paths.BUILDER_NAME}")
-    install_cmd.add_argument(
-        "--tmux-dir",
-        help="where to install the tmux context reporter (rime_ctx_report.sh), "
-             "the OPERATIVE copy a synced .tmux.conf hook actually names "
-             "(default: ~/.tmux)")
     install_cmd.add_argument(
         "--python",
         help="interpreter to pin in the installed entry point's shebang "

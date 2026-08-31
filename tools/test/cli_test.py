@@ -97,19 +97,12 @@ class CliBase(unittest.TestCase):
         base.write_text("建议\tjian yi\t500\n", encoding="utf-8")
         (self.rime / "private" / "dict.json").write_text(
             json.dumps([{"dict": str(base)}]), encoding="utf-8")
-        # Never the real user's ~/.tmux/: cmd_install's default for
-        # --tmux-dir is Path.home() / ".tmux", and a real machine running
-        # these tests (this one included) has a real, non-empty ~/.tmux/ --
-        # an `install` test that forgot --tmux-dir must not write into it.
-        self.tmux_dir = root / "dot-tmux"
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_cli(self, *args, inject_tmux_dir: bool = True) -> "tuple[int, str]":
+    def run_cli(self, *args) -> "tuple[int, str]":
         argv = ["--rime-dir", str(self.rime), *args]
-        if inject_tmux_dir and "install" in argv and "--tmux-dir" not in argv:
-            argv += ["--tmux-dir", str(self.tmux_dir)]
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             code = main(argv)
@@ -700,43 +693,6 @@ class Install(CliBase):
         _, out = self.run_cli("status")
         self.assertIn("paths.py", out)
         self.assertIn("differ", out)
-
-
-class InstallTmuxDir(CliBase):
-    """The tmux reporter's OPERATIVE copy: `--tmux-dir` (default `~/.tmux`)
-    is where a synced `.tmux.conf` hook can actually find it, distinct from
-    the versioned copy `install` always writes under `--dest`.
-    """
-
-    def test_tmux_dir_override_installs_the_reporter_there(self):
-        target = Path(self.tmp.name) / "custom-tmux"
-        code, _ = self.run_cli("install", "--builder", str(self.fake_builder()),
-                               "--tmux-dir", str(target))
-        self.assertEqual(0, code)
-        placed = target / "rime_ctx_report.sh"
-        self.assertTrue(placed.is_file())
-        self.assertTrue(os.access(placed, os.X_OK))
-
-    def test_tmux_dir_is_named_in_the_dry_run_plan(self):
-        target = Path(self.tmp.name) / "custom-tmux"
-        _, out = self.run_cli("--dry-run", "install", "--builder", str(self.fake_builder()),
-                              "--tmux-dir", str(target))
-        self.assertIn(str(target / "rime_ctx_report.sh"), out)
-        self.assertFalse((target / "rime_ctx_report.sh").exists())
-
-    def test_defaults_to_the_real_home_tmux_directory(self):
-        # Verified by mocking Path.home() rather than by actually letting
-        # cmd_install fall through to it -- the whole point of this default
-        # is that it targets a real, un-fixtured directory on the running
-        # machine, so the only safe way to prove the default resolves there
-        # is to redirect "there" to a temporary one first.
-        fake_home = Path(self.tmp.name) / "fake-home"
-        fake_home.mkdir()
-        with mock.patch.object(Path, "home", return_value=fake_home):
-            code, _ = self.run_cli("install", "--builder", str(self.fake_builder()),
-                                   inject_tmux_dir=False)
-        self.assertEqual(0, code)
-        self.assertTrue((fake_home / ".tmux" / "rime_ctx_report.sh").is_file())
 
 
 class InstallInterpreter(CliBase):
