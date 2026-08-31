@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -1904,191 +1905,58 @@ class StatusImportTableTest(unittest.TestCase):
 
 
 class ContextMemoryStatusTest(unittest.TestCase):
-    def _line(self, body: "str | None", enabled: bool = True,
-              conf_extra: str = "") -> "str | None":
+    """`status` now asks tmux, not the filesystem.
+
+    Every check this replaces existed because a hook line and the script it
+    named could disagree. They no longer can: the clients plugin writes the
+    hooks against its own directory. So the one thing still worth reporting is
+    whether that plugin ran at all -- and the option it sets is the only
+    evidence that does not involve guessing at a plugin manager's layout.
+    """
+
+    def _fake_tmux(self, tmpdir: Path, stdout: str, rc: int = 0) -> str:
+        p = Path(tmpdir) / "tmux"
+        p.write_text(f"#!/bin/sh\nprintf '%s' '{stdout}'\nexit {rc}\n")
+        p.chmod(0o755)
+        return str(p)
+
+    def test_reports_the_plugin_never_ran_when_the_option_is_empty(self):
+        """`show-options -gqv` prints nothing and exits 0 for an unset option,
+        which is exactly what a machine without the plugin looks like."""
         with tempfile.TemporaryDirectory() as d:
-            conf = Path(d) / "tmux.conf"
-            if body is not None:
-                conf.write_text(body + conf_extra)
-            return cli._context_memory_status(conf, enabled)
-
-    def _hooks(self, script: str, flag: str = "-ga", args: bool = True,
-               ime_host: bool = True, client_attached: bool = False) -> str:
-        tail = ""
-        if args:
-            tail = ' \\"#{pane_id}\\" \\"#{pane_current_command}\\" \\"#{socket_path}\\"'
-            if ime_host:
-                tail += ' \\"#{E:LC_RIME_IME_HOST}\\"'
-        hooks = cli._CTX_HOOKS + ((cli._CTX_CLIENT_ATTACHED_HOOK,) if client_attached else ())
-        return "".join(
-            f"set-hook {flag} {hook} 'run-shell -b \"{script}{tail}\"'\n"
-            for hook in hooks)
-
-    def _script(self, d: Path, *, executable: bool = True) -> Path:
-        path = d / "rime_ctx_report.sh"
-        path.write_text("#!/bin/sh\n")
-        if executable:
-            path.chmod(0o755)
-        return path
-
-    def test_reports_missing_tmux_hook(self):
-        line = self._line("set -g mouse on\n")
+            line = cli._context_memory_status(True, self._fake_tmux(d, ""))
         self.assertIn("polling", line)
-        self.assertIn("after-select-pane", line)
+        self.assertIn("rime-copilot-clients", line)
 
-    # A fully-correct hook body now names the IME host too (see the README's
-    # single synced hook block), so a "this is a correct config" fixture
-    # needs update-environment alongside it or the new checks below flag it.
-    _UPDATE_ENV_LINE = "set -ga update-environment ' LC_RIME_IME_HOST'\n"
-
-    def test_reports_present_tmux_hook(self):
+    def test_reports_ok_when_the_option_matches(self):
         with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            line = self._line(self._hooks(str(script), client_attached=True),
-                              conf_extra=self._UPDATE_ENV_LINE)
-        self.assertIn("hook installed", line)
+            line = cli._context_memory_status(
+                True, self._fake_tmux(d, str(cli.CLIENTS_PROTOCOL_VERSION)))
+        self.assertIn("identity is pushed", line)
         self.assertNotIn("polling", line)
 
-    def test_reports_a_hook_that_does_not_pass_the_pane_in(self):
-        """The pre-2026-08-31 hook form, which asks tmux instead of being told.
-
-        `display-message -p` with no `-t` resolves against the INVOKING
-        client, so a scripted pane switch makes the reporter name a pane in
-        whatever session issued the command. Measured on tmux 3.7c: a switch
-        to `copilot:3` (%5) reported `librime:1 %3 claude`. Interactive
-        switches are correct by accident -- there the invoking client is the
-        one being switched -- so this never shows up in ordinary use and
-        never shows up in a log. A status line is the only way it surfaces.
-        """
+    def test_reports_skew_when_the_option_disagrees(self):
+        """A number this plugin does not speak. The bridge would ignore such
+        messages with a warning -- inert, never wrong -- but silently, so this
+        is the only place a user learns the two halves have drifted apart."""
+        other = cli.CLIENTS_PROTOCOL_VERSION + 1
         with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            line = self._line(self._hooks(str(script), args=False))
-        self.assertIn("#{pane_id}", line)
-        self.assertNotIn("hook installed (", line)
+            line = cli._context_memory_status(True, self._fake_tmux(d, str(other)))
+        self.assertIn(str(other), line)
+        self.assertIn(str(cli.CLIENTS_PROTOCOL_VERSION), line)
 
-    def test_hook_passing_the_pane_in_is_reported_as_installed(self):
+    def test_says_so_when_tmux_cannot_be_asked(self):
+        """No tmux on PATH, or no server running. Distinct from "the plugin did
+        not run" -- reporting the latter here would send the user to fix a
+        plugin when the real answer is that nothing could be measured."""
         with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            line = self._line(self._hooks(str(script), args=True, client_attached=True),
-                              conf_extra=self._UPDATE_ENV_LINE)
-        self.assertIn("hook installed", line)
-        self.assertNotIn("#{pane_id}", line)
+            line = cli._context_memory_status(True, self._fake_tmux(d, "", rc=1))
+        self.assertIn("could not ask tmux", line)
 
-    def test_reports_a_hook_that_does_not_pass_the_ime_host(self):
-        """没有第 4 个参数，远端模式永远不会被选中。
-
-        本机上这毫无症状 —— 本机模式正是第 4 参数为空时的行为 —— 所以
-        一份只在本机验过的配置同步到远端之后会静默地什么都不做。
-        """
+    def test_silent_when_the_feature_is_off(self):
         with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            line = self._line(self._hooks(str(script), ime_host=False),
-                              conf_extra="set -ga update-environment ' LC_RIME_IME_HOST'\n")
-        self.assertIn("LC_RIME_IME_HOST", line)
-        self.assertNotIn("hook installed (", line)
-
-    def test_reports_update_environment_missing_the_ime_host(self):
-        """#{E:} 在 session 环境里找不到时回落到 SERVER 环境，而 server
-        环境属于最先启动它的那个 ssh 会话。两台笔记本连同一远端时，第二台
-        会读到第一台的值 —— 这正是用户 tmux.conf:449 为 SSH_TTY 处理过的
-        同一个陷阱。"""
-        with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            line = self._line(self._hooks(str(script)))  # 没有 update-environment 行
-        self.assertIn("update-environment", line)
-
-    def test_a_commented_out_update_environment_line_still_warns(self):
-        # `_UPDATE_ENV_RE.search(text)` used to scan the whole file
-        # unfiltered, so a directive that is present but commented out would
-        # satisfy the regex and silence the very warning it exists to raise
-        # -- exactly the false negative `no_host` above already guards
-        # against by excluding comment lines first.
-        with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            commented = "# " + self._UPDATE_ENV_LINE
-            line = self._line(self._hooks(str(script)), conf_extra=commented)
-        self.assertIn("update-environment", line)
-
-    def test_client_attached_hook_present_is_not_named(self):
-        with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            line = self._line(self._hooks(str(script), client_attached=True),
-                              conf_extra=self._UPDATE_ENV_LINE)
-        self.assertIn("hook installed", line)
-        self.assertNotIn("client-attached", line)
-
-    def test_reports_missing_client_attached_hook(self):
-        """`client-attached` refreshes a remote's endpoint cache after a
-        dropped and re-established ssh. Missing it is not a degraded mode --
-        the other two hooks still push -- so this must be its own line, not
-        a `missing tmux hook(s)` diagnosis, which would wrongly imply the
-        setup fell back to polling."""
-        with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            line = self._line(self._hooks(str(script), client_attached=False),
-                              conf_extra=self._UPDATE_ENV_LINE)
-        self.assertIn("client-attached", line)
-        self.assertIn("README 'Remote tmux'", line)
-        self.assertNotIn("hook installed", line)
-        self.assertNotIn("polling", line)
-
-    def test_no_hooks_at_all_still_reports_polling_not_client_attached(self):
-        # The new informational line must never displace the more important
-        # "missing tmux hook(s)" diagnosis on a machine with nothing set up.
-        line = self._line("set -g mouse on\n")
-        self.assertIn("polling", line)
-        self.assertNotIn("client-attached", line)
-
-    def test_reports_half_installed_hook(self):
-        line = self._line(
-            "set-hook -ga after-select-pane 'run-shell -b \"rime_ctx_report.sh\"'\n"
-        )
-        self.assertIn("after-select-window", line)
-        self.assertIn("polling", line)
-
-    def test_reports_absent_tmux_conf(self):
-        line = self._line(None)
-        self.assertIn("polling", line)
-
-    # `set-hook -g` REPLACES an existing hook of that name; `-ga` appends, and
-    # is what the README now recommends. Matching the literal `set-hook -g `
-    # reported `missing` on a machine configured the right way.
-    def test_accepts_the_flag_variants_a_correct_config_uses(self):
-        with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            for flag in ("-g", "-ga", "-g -a", "-ga  "):
-                with self.subTest(flag=flag):
-                    line = self._line(self._hooks(str(script), flag, client_attached=True),
-                                      conf_extra=self._UPDATE_ENV_LINE)
-                    self.assertIn("hook installed", line)
-
-    # The hook names a path, and matching the set-hook lines alone reported
-    # `hook installed` for a hook pointing into a checkout that had since been
-    # moved -- at which point it fires and does nothing, forever.
-    def test_flags_a_hook_naming_a_script_that_is_not_there(self):
-        line = self._line(self._hooks("/nonexistent/rime_ctx_report.sh"))
-        self.assertIn("does not exist", line)
-
-    def test_flags_a_hook_naming_a_script_that_is_not_executable(self):
-        with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d), executable=False)
-            line = self._line(self._hooks(str(script)))
-        self.assertIn("not executable", line)
-
-    # An off-by-default feature must not print a line on every run on every
-    # machine; that is how "read every line of status" stops being a
-    # discipline. Silence, unless the user did half the setup.
-    def test_silent_when_the_feature_is_off_and_nothing_was_configured(self):
-        self.assertIsNone(self._line("set -g mouse on\n", enabled=False))
-        self.assertIsNone(self._line(None, enabled=False))
-
-    def test_speaks_up_when_the_hooks_are_installed_but_the_feature_is_off(self):
-        with tempfile.TemporaryDirectory() as d:
-            script = self._script(Path(d))
-            line = self._line(self._hooks(str(script)), enabled=False)
-        self.assertIsNotNone(line)
-        self.assertIn("off", line)
-        self.assertIn(cli.CTX_MEMORY_ENABLE_KEY, line)
+            self.assertIsNone(
+                cli._context_memory_status(False, self._fake_tmux(d, "1")))
 
     def _enabled(self, body: str) -> bool:
         with tempfile.TemporaryDirectory() as d:
@@ -2125,3 +1993,15 @@ class ContextMemoryStatusTest(unittest.TestCase):
         # A schema that does not use this plugin is not a misconfiguration.
         line = self._order(["ascii_composer", "key_binder"])
         self.assertIn("n/a", line)
+
+
+class ProtocolVersionAgreementTest(unittest.TestCase):
+    def test_matches_the_cpp_constant(self):
+        """CLIENTS_PROTOCOL_VERSION and kProtocolVersion are one number in two
+        languages. Nothing at runtime compares them -- the C++ side rejects a
+        mismatched message and the Python side only reports -- so this test is
+        the only thing that would notice one being bumped alone."""
+        src = (Path(__file__).resolve().parents[2] / "src" / "ime_bridge.cc").read_text()
+        m = re.search(r"constexpr int kProtocolVersion\s*=\s*(\d+)", src)
+        self.assertIsNotNone(m, "kProtocolVersion not found in src/ime_bridge.cc")
+        self.assertEqual(int(m.group(1)), cli.CLIENTS_PROTOCOL_VERSION)

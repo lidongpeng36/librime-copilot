@@ -65,41 +65,7 @@ GRAMMAR_NAME = "zh-hans-t-essay-bgw.gram"
 MIN_GRAMMAR_SIZE = 20_000_000
 
 
-_CTX_HOOKS = ("after-select-pane", "after-select-window")
-
 CTX_MEMORY_ENABLE_KEY = "copilot/context_memory/enable"
-
-# Tolerant of how the hook is actually written, because `set-hook -g` is not
-# the only correct spelling and matching it literally reported `missing` on a
-# machine that was configured right. `-ga` (append) is in fact the form the
-# README recommends -- plain `-g` REPLACES any existing hook of that name and
-# silently loses it. Flags are matched as a group so `-ga`, `-g -a`, doubled
-# spaces and no flag at all all read as present.
-_CTX_HOOK_RES = {
-    hook: re.compile(r"set-hook\s+(?:-\w+\s+)*" + re.escape(hook) + r"\b")
-    for hook in _CTX_HOOKS
-}
-# The reporter path named inside a hook body, so `status` can check the script
-# is actually there. Quotes and the surrounding `run-shell -b "..."` are not
-# parsed -- only the path token is needed.
-_CTX_SCRIPT_RE = re.compile(r"""([^\s'"]*rime_ctx_report\.sh)""")
-
-# `set -ga update-environment " LC_RIME_IME_HOST"`, in any of the spellings
-# tmux accepts (-g/-ga/-ag, set/set-option, quoted or not).
-_UPDATE_ENV_RE = re.compile(
-    r"set(?:-option)?\s+(?:-\w+\s+)*update-environment\b[^\n]*LC_RIME_IME_HOST")
-
-# NOT in `_CTX_HOOKS`, deliberately: that list drives the "polling; missing
-# tmux hook(s)" diagnosis, and a missing `client-attached` hook does not
-# cause polling -- the other two still push. It also buys nothing on a
-# machine that never reaches a remote tmux, which describes most machines
-# most of the time. So it gets its own, separate, informational status line
-# below, reported only once the two REQUIRED hooks are already confirmed
-# present -- never in place of the "missing tmux hook(s)" diagnosis, which
-# is the more important one.
-_CTX_CLIENT_ATTACHED_HOOK = "client-attached"
-_CTX_CLIENT_ATTACHED_RE = re.compile(
-    r"set-hook\s+(?:-\w+\s+)*" + re.escape(_CTX_CLIENT_ATTACHED_HOOK) + r"\b")
 
 
 def _context_memory_enabled(built_schemas: "list[Path]") -> bool:
@@ -121,116 +87,57 @@ def _context_memory_enabled(built_schemas: "list[Path]") -> bool:
     return False
 
 
-def _context_memory_status(tmux_conf: Path, enabled: bool) -> "str | None":
-    """One status line for the context-memory tmux hooks, or None for silence.
+# The wire-protocol version this plugin speaks. Equal to kProtocolVersion in
+# src/ime_bridge.cc:25 and to the value rime-copilot-clients' tmux entry point
+# publishes as @rime-copilot-clients-protocol. Nothing at runtime compares the
+# three; ProtocolVersionAgreementTest in tools/test/cli_test.py is what notices
+# one being bumped alone.
+CLIENTS_PROTOCOL_VERSION = 1
 
-    `None` when the feature is off and nothing suggests the user meant to turn
-    it on. This is an off-by-default feature, and a line printed on every run
-    on every machine -- most of which have no tmux at all -- is exactly the
-    always-on noise that teaches people to stop reading `status`.
+_CLIENTS_PROTOCOL_OPTION = "@rime-copilot-clients-protocol"
 
-    The one exception is a machine whose `.tmux.conf` HAS the hooks while
-    `enable` is false: that user followed the README, got no behaviour, and
-    the old line said `hook installed` at them. Half-done setup is worth a
-    line; nothing at all is not.
 
-    With the feature on, this reports a degraded mode, never an error --
-    without the hooks it still works through the polling rung. It exists
-    because the difference is invisible from outside.
+def _context_memory_status(enabled: bool, tmux_bin: str = "tmux") -> "str | None":
+    """One line about whether the clients plugin is driving this machine.
+
+    It asks tmux, not the filesystem. Five checks used to read ~/.tmux.conf
+    looking for a hook line, the script it named, the arguments it passed and
+    an update-environment directive -- all of which existed because a hook and
+    a separately-installed script could disagree. They cannot any more: the
+    tmux plugin writes its hooks against its own directory. What is left worth
+    knowing is whether that plugin ran, and the option it sets is evidence that
+    needs no guess at any plugin manager's layout.
     """
-    text = tmux_conf.read_text(errors="replace") if tmux_conf.exists() else ""
-    missing = [hook for hook in _CTX_HOOKS if not _CTX_HOOK_RES[hook].search(text)]
-
     if not enabled:
-        if missing:
-            return None
-        return (f"context memory: off ({CTX_MEMORY_ENABLE_KEY} is false), but the tmux "
-                f"hooks are installed -- set it true in your schema patch, or drop them")
+        return None
 
-    if missing:
-        where = "no ~/.tmux.conf" if not text else "not found in ~/.tmux.conf"
-        return ("context memory: polling; missing tmux hook(s): "
-                + ", ".join(missing)
-                + f" ({where}; a hook set from a source-file'd fragment is not visible here)"
-                + " -- see README 'Context memory'")
+    try:
+        proc = subprocess.run([tmux_bin, "show-options", "-gqv",
+                               _CLIENTS_PROTOCOL_OPTION],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ("context memory: could not ask tmux whether the clients plugin "
+                "is loaded (tmux not on PATH)")
+    if proc.returncode != 0:
+        # No server running is the ordinary case here, not an error: tmux exits
+        # non-zero when it cannot reach one. Saying "the plugin did not run"
+        # would send the user to fix a plugin when nothing was measured.
+        return ("context memory: could not ask tmux whether the clients plugin "
+                "is loaded (no server running?)")
 
-    # The hooks are there, so the path they name had better be too. `status`
-    # used to match the set-hook lines and stop, which reported `hook
-    # installed` for a hook naming a script inside a checkout that had since
-    # been moved -- at which point the hook fires and does nothing, forever.
-    for match in _CTX_SCRIPT_RE.finditer(text):
-        script = Path(match.group(1)).expanduser()
-        if not script.is_file():
-            return f"context memory: tmux hook names {script}, which does not exist"
-        if not os.access(script, os.X_OK):
-            return (f"context memory: tmux hook names {script}, which is not executable "
-                    f"-- `chmod +x` it, or run `rime-copilot install` again")
-    # A hook that names the script but does not hand it the pane. Before
-    # 2026-08-31 that was the documented form, and the script asked tmux
-    # instead -- `display-message -p` with no `-t`, which resolves against the
-    # INVOKING client rather than the hook's target. Measured on tmux 3.7c: a
-    # `select-window -t copilot:3` issued from another session's pane made the
-    # hook report `librime:1 %3 claude` instead of `%5`. Interactive
-    # prefix-key switches are correct by accident (there the invoking client
-    # is the one being switched), so this is invisible in ordinary use, writes
-    # a plausible-looking key, and appears in no log. A status line is the
-    # only place it can surface.
-    stale = [ln.strip() for ln in text.splitlines()
-             if "rime_ctx_report" in ln and not ln.lstrip().startswith("#")
-             and "#{pane_id}" not in ln]
-    if stale:
-        return ("context memory: tmux hook does not pass the pane in -- append "
-                "'#{pane_id}' '#{pane_current_command}' '#{socket_path}' to the "
-                "run-shell command; without them the reporter asks tmux, which "
-                "answers for the invoking client and can name a pane in another "
-                "session -- see README 'Context memory'")
-
-    # The fourth argument. Without it the reporter always takes its local
-    # branch, which on the laptop is exactly right and therefore symptomless
-    # -- and then the same synced tmux.conf does nothing at all on every
-    # remote. There is no local behaviour that reveals this.
-    no_host = [ln.strip() for ln in text.splitlines()
-               if "rime_ctx_report" in ln and not ln.lstrip().startswith("#")
-               and "LC_RIME_IME_HOST" not in ln]
-    if no_host:
-        return ("context memory: tmux hook does not pass the IME host in -- append "
-                "'#{E:LC_RIME_IME_HOST}' to the run-shell command; without it the "
-                "reporter never takes its remote branch -- see README 'Remote tmux'")
-
-    # #{E:} falls back to the SERVER environment when the session has no such
-    # variable, and the server environment belongs to whichever ssh session
-    # started it. Two laptops into one remote account: the second reads the
-    # first's value. update-environment is what makes it per-session.
-    #
-    # Comment lines are excluded first, the same as `no_host` above -- a
-    # `set -ga update-environment " LC_RIME_IME_HOST"` line that is commented
-    # out would otherwise satisfy the regex and silence a warning about
-    # exactly the misconfiguration it exists to catch.
-    active = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
-    if not _UPDATE_ENV_RE.search(active):
-        return ("context memory: LC_RIME_IME_HOST is not in update-environment -- add "
-                "`set -ga update-environment \" LC_RIME_IME_HOST\"`; without it "
-                "#{E:LC_RIME_IME_HOST} reads the tmux server's copy, which belongs "
-                "to whichever ssh session started it -- see README 'Remote tmux'")
-
-    # Informational, not a degraded-mode warning: local panes are entirely
-    # unaffected by this hook's absence, so this line must never read like
-    # the ones above it. Checked last, only once every required check has
-    # passed -- a setup this incomplete is not "otherwise good" and belongs
-    # to one of the returns above instead.
-    if not _CTX_CLIENT_ATTACHED_RE.search(text):
-        return ("context memory: no client-attached hook -- local panes are unaffected; "
-                "a remote's endpoint cache will not refresh after an ssh reconnect. See "
-                "README 'Remote tmux'")
-
-    # NOT "no per-keystroke query", which this line claimed until 2026-08-31.
-    # The hooks stop CONTEXT MEMORY from polling; they do not stop AutoSpacer,
-    # which calls GetSurroundingContext() on every non-composing keystroke and
-    # spawns tmux there regardless. Measured live on the day the hooks were
-    # first installed on a machine: the pushed rung took over (`via bridge` in
-    # the ctxmem log) and the spawn count did not move. A status line that
-    # reports a saving nobody made is how a reader stops trusting the rest.
-    return "context memory: hook installed (identity is pushed, not polled)"
+    value = proc.stdout.strip()
+    if not value:
+        return ("context memory: polling; the rime-copilot-clients tmux plugin "
+                "has not run -- add `set -g @plugin "
+                "'lidongpeng36/rime-copilot-clients'` and reload, or press "
+                "prefix + I to install it")
+    if value != str(CLIENTS_PROTOCOL_VERSION):
+        return (f"context memory: the tmux plugin speaks protocol {value}, this "
+                f"plugin speaks {CLIENTS_PROTOCOL_VERSION} -- messages between "
+                f"them are ignored with a warning, never misapplied; update "
+                f"whichever is behind")
+    return (f"context memory: clients plugin v{value} (identity is pushed, "
+            f"not polled)")
 
 
 def _ordered_list_block(text: str, opener: str, item: "re.Pattern" = None) -> "list[str]":
@@ -902,7 +809,7 @@ def cmd_status(args) -> int:
     # enabled it, which is the only population it protects.
     built_schemas = sorted((rime_dir / "build").glob("*.schema.yaml"))
     ctx_enabled = _context_memory_enabled(built_schemas)
-    ctx_line = _context_memory_status(Path.home() / ".tmux.conf", ctx_enabled)
+    ctx_line = _context_memory_status(ctx_enabled)
     if ctx_line:
         print(ctx_line)
     if ctx_enabled:
