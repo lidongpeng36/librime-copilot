@@ -191,8 +191,16 @@ looking at loopback listeners it could own and keeping the one whose greeting
 names the right machine — on Linux from `/proc/net/tcp`, narrowed to the
 ephemeral range (a bind to port 0 is served from exactly there, so a service on a
 well-known port is never even connected to); on macOS from `lsof`, which names
-the owning process, so only `sshd`'s listeners are touched. Measured on real
-hosts: one candidate each.
+the owning process, so only `sshd`'s listeners are touched.
+
+The narrowing helps but does not usually get to one. Re-measured 2026-08-31 on
+this project's own remote: 14 loopback listeners, 6 inside that host's
+ephemeral range, 3 of them this laptop's own tunnels — one per live master.
+Those three are equivalent (each leads to the same IME), so first match wins;
+the greeting is what separates them from *another* laptop's tunnel, not from
+each other. Note also that the range is read, never assumed — that host's is
+`10240 65535`, not the 32768-60999 default, and sshd allocated 28175, which a
+hardcoded default floor would have excluded.
 
 **`SetEnv LC_RIME_IME_HOST=%L`** is what makes the greeting checkable — `%L` is
 this laptop's short hostname, and `LC_*` passes through the stock `AcceptEnv`, so
@@ -278,6 +286,52 @@ user's. The catch is that a multiplexed session will not re-establish a forward
 its master failed to bind, so **the session you are in stays without an IME** and
 recovery lands on the next master. In practice that means the first ssh after
 each idle gap is dead. That is the cost the port form avoids.
+
+#### Migrating away from the socket-file form
+
+Three things do not happen on their own, and each was measured on 2026-08-31
+while converting a laptop that had been on the socket-file form for months.
+
+**A live master keeps the old forward.** `ControlPersist` means the config you
+just edited reaches nothing until the master for that host is replaced. Use
+`ssh -O stop <host>`, **not** `ssh -O exit`: per `man ssh`, `exit` requests the
+master to exit and takes its sessions with it, while `stop` only stops it
+accepting further multiplexing requests, so whatever is running on it keeps
+running. On the machine this was done on, the live master was carrying a
+long-running remote session; `-O exit` would have killed it for no reason.
+
+**`-o RemoteForward=...` on the command line APPENDS, it does not override.**
+So a "let me test the port form without touching the config" invocation
+attempts *both* forwards, and the socket-file one fails against the residue
+exactly as it always would:
+
+```
+Allocated port 28175 for remote forward to /tmp/rime_copilot_ime.sock
+Warning: remote port forwarding failed for listen path /tmp/rime-ime-<hash>.sock
+```
+
+That is not the test failing. Read the `Allocated port` line — that is the one
+you asked for.
+
+**The old socket files stay on every remote, forever.** That is the whole
+problem with the form you are leaving, and nothing cleans them up when you stop
+using it. They are inert once the config no longer names them, but they are
+also what would poison the name if you ever went back:
+
+```sh
+ssh <host> 'find /tmp -maxdepth 1 -name "rime-ime-*.sock" -user "$(id -un)" -print -delete'
+```
+
+`-user` is not decoration: `/tmp` is world-writable and another user on that
+host can hold the same name.
+
+**Several matching candidates is normal.** Each live master forwards its own
+port, so a laptop with two or three sessions to one host presents two or three
+ports that all greet with the same name. They are equivalent — every one of
+them leads to the same IME — so first match wins is correct. What the greeting
+separates is a *different laptop's* tunnel, which greets with a different name.
+Measured on one host: 14 loopback listeners, 6 inside the ephemeral range,
+3 of them ours.
 
 ### Focus events
 
