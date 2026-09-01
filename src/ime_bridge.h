@@ -24,10 +24,14 @@ class Context;
 struct ImeBridgeClientState {
   bool has_initial = false;   // 是否已记录初始状态
   bool initial_state = true;  // 第一次 set 时的 ascii_mode（整个会话保持不变）
-  bool has_base = false;
-  bool base = false;                                  // 每次 set cycle 的 base
-  int depth = 0;                                      // set 嵌套层数
-  bool current_target = true;                         // 最近一次 set 的目标值
+
+  // Insert mode 的那一个 bit。这是本 bridge 为该 client 维护的唯一可变状态：
+  // 普通/可视/命令行模式恒为英文，无需记忆。has_insert_state 为假意味着「这台
+  // 机器还没告诉过我它在 insert 里用什么」，此时 enter_insert 必须一个字都不写 ——
+  // 那正是「第一次进 insert 沿用原有输入模式」。
+  bool has_insert_state = false;
+  bool insert_state = false;
+
   std::chrono::steady_clock::time_point last_active;  // 最后活动时间
 
   // Surrounding text context
@@ -39,11 +43,19 @@ struct ImeBridgeClientState {
 
 // 待处理的 action
 struct ImeBridgePendingAction {
-  enum Type { kNone, kSet, kRestore, kReset, kUnregister, kActivate, kDeactivate };
+  enum Type {
+    kNone,
+    kSet,
+    kReset,
+    kUnregister,
+    kActivate,
+    kDeactivate,
+    kEnterInsert,
+    kLeaveInsert
+  };
   Type type = kNone;
   std::string client_key;
   bool ascii = true;    // for kSet
-  bool stack = true;    // for kSet: if true, increment depth and save base
   bool restore = true;  // for kReset
   // for kReset: true when the server made this up because the last connection
   // for the client went away, false when the client actually asked for it. A
@@ -85,8 +97,9 @@ class ImeBridgeState {
   // value to learn which clients a given connection is carrying.
   std::string ProcessMessage(const std::string& message);
 
-  void HandleSet(const std::string& client_key, bool ascii, bool stack = true);
-  void HandleRestore(const std::string& client_key);
+  void HandleSet(const std::string& client_key, bool ascii);
+  void HandleEnterInsert(const std::string& client_key);
+  void HandleLeaveInsert(const std::string& client_key);
   void HandleReset(const std::string& client_key, bool restore);
   void HandleUnregister(const std::string& client_key);
   void HandleContext(const std::string& client_key, const std::string& before,
@@ -124,9 +137,18 @@ class ImeBridgeState {
   // the end of a key event and attributes it to the pane the event resolved
   // to. This queue is context-blind -- an action queued by pane A's nvim is
   // applied on whatever pane the next keystroke lands in -- so a tail that
-  // saw this counter move must not record what it reads. Counting every
-  // should_set rather than only kSet: kRestore and kReset write the mode too,
-  // and a restore landing on the wrong pane misattributes just as badly.
+  // saw this counter move must not record what it reads.
+  //
+  // Counted off should_set rather than off the action type, so that the set of
+  // actions that write the mode does not have to be enumerated here at all --
+  // which is the point, because enumerating it is what goes stale. It already
+  // did: this comment used to read "kReset writes the mode too" as though those
+  // were the only two, and kEnterInsert and kLeaveInsert were added afterwards
+  // setting should_set without anybody revisiting the sentence. Today the full
+  // set is kSet / kReset / kEnterInsert / kLeaveInsert; if you find yourself
+  // extending that list by hand, it has failed again and the right move is to
+  // delete the sentence, not lengthen it. The counter is already correct for
+  // any future action, and that is the whole design.
   //
   // Atomic rather than mutex_-guarded so the input thread can sample it at
   // the head of a key event without contending with a connection thread.

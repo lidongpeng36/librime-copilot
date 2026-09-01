@@ -847,14 +847,15 @@ IME Bridge allows external editors to control Rime's `ascii_mode` via Unix Domai
 
 JSON Lines format:
 ```json
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"set","ascii":true}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"restore"}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"reset","restore":true}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"unregister"}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"activate"}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"context","before":"测","after":"试"}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"clear_context"}}
-{"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"deactivate"}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"set","ascii":true}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"enter_insert"}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"leave_insert"}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"reset","restore":true}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"unregister"}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"activate"}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"context","before":"测","after":"试"}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"clear_context"}}
+{"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"12345"},"data":{"action":"deactivate"}}
 ```
 
 ### The greeting
@@ -864,7 +865,7 @@ writes one line naming the machine it is running on, before the client has sent
 anything.
 
 ```json
-{"v":1,"ns":"rime.ime","type":"hello","data":{"host":"my-laptop"}}
+{"v":2,"ns":"rime.ime","type":"hello","data":{"host":"my-laptop"}}
 ```
 
 Past that line the protocol is one-way as before, and a client is free to ignore
@@ -886,8 +887,9 @@ using it.
 
 | Action | Description |
 |--------|-------------|
-| `set` | Set `ascii_mode`. Params: `ascii` (bool), `stack` (bool, default true). `stack=false` sets mode without affecting restore stack. |
-| `restore` | Restore to previous state (supports nested calls) |
+| `set` | Set `ascii_mode`. Params: `ascii` (bool). No `stack` any more — this is an absolute assertion, not bookkeeping: it does not touch the saved insert-mode bit and there is no restore stack left to affect. |
+| `enter_insert` | Restore `ascii_mode` to this client's saved insert-mode bit (the value `leave_insert` last recorded). If the bridge has no saved bit for this client yet — e.g. a freshly-connected editor — it writes nothing at all: `ascii_mode` is left exactly as it is, so a new connection does not force the user into Chinese. |
+| `leave_insert` | Save the current `ascii_mode` as this client's insert-mode bit, then set `ascii_mode` to true (English) — normal/visual/command-line modes are always ASCII. |
 | `reset` | Clear state and optionally restore original mode |
 | `unregister` | Remove client registration (on exit) |
 | `activate` | Mark this client as active context owner |
@@ -969,7 +971,7 @@ re-established ssh, i.e. after the forwarded port changed underneath it.
 The reporter writes one line and exits. Local mode:
 
 ```json
-{"v":1,"ns":"rime.ime","type":"identity","data":{"socket":"/tmp/tmux-501/default","pane":"%7","command":"claude"}}
+{"v":2,"ns":"rime.ime","type":"identity","data":{"socket":"/tmp/tmux-501/default","pane":"%7","command":"claude"}}
 ```
 
 Remote mode adds `host` (this machine's short hostname) and `expect` (the
@@ -977,7 +979,7 @@ laptop it was told to reach, from `#{E:LC_RIME_IME_HOST}`) — see [Remote
 tmux](#remote-tmux):
 
 ```json
-{"v":1,"ns":"rime.ime","type":"identity","data":{"expect":"my-laptop","host":"devbox","socket":"/tmp/tmux-1000/default","pane":"%2","command":"zsh"}}
+{"v":2,"ns":"rime.ime","type":"identity","data":{"expect":"my-laptop","host":"devbox","socket":"/tmp/tmux-1000/default","pane":"%2","command":"zsh"}}
 ```
 
 `socket` is the whole socket path (`${TMUX%%,*}`), because the polled rung

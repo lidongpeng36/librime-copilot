@@ -22,7 +22,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr int kProtocolVersion = 1;
+constexpr int kProtocolVersion = 2;
 constexpr const char* kNamespace = "rime.ime";
 constexpr size_t kMaxMessageSize = 4096;
 // Upper bound on one accumulated JSON line; a client that never sends '\n'
@@ -337,10 +337,11 @@ std::string ImeBridgeState::ProcessMessage(const std::string& message) {
 
     if (action == "set") {
       bool ascii = data.value("ascii", true);
-      bool stack = data.value("stack", true);
-      HandleSet(client_key, ascii, stack);
-    } else if (action == "restore") {
-      HandleRestore(client_key);
+      HandleSet(client_key, ascii);
+    } else if (action == "enter_insert") {
+      HandleEnterInsert(client_key);
+    } else if (action == "leave_insert") {
+      HandleLeaveInsert(client_key);
     } else if (action == "reset") {
       bool restore = data.value("restore", true);
       HandleReset(client_key, restore);
@@ -482,46 +483,52 @@ void ImeBridgeState::ReleaseClientConnection(const std::string& client_key) {
   }
 }
 
-void ImeBridgeState::HandleSet(const std::string& client_key, bool ascii, bool stack) {
+void ImeBridgeState::HandleSet(const std::string& client_key, bool ascii) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   auto& state = client_states_[client_key];
   state.last_active = std::chrono::steady_clock::now();
-  state.current_target = ascii;
 
   ImeBridgePendingAction action;
   action.type = ImeBridgePendingAction::kSet;
   action.client_key = client_key;
   action.ascii = ascii;
-  action.stack = stack;
   pending_actions_.push(action);
 
   if (config_.debug) {
     LOG(INFO) << "[ImeBridge] HandleSet: client=" << client_key << ", ascii=" << ascii
-              << ", stack=" << stack << ", depth=" << state.depth
               << ", queue_size=" << pending_actions_.size();
   }
 }
 
-void ImeBridgeState::HandleRestore(const std::string& client_key) {
+void ImeBridgeState::HandleEnterInsert(const std::string& client_key) {
   std::lock_guard<std::mutex> lock(mutex_);
-
-  auto it = client_states_.find(client_key);
-  if (it == client_states_.end() || it->second.depth == 0) {
-    if (config_.debug) {
-      LOG(INFO) << "[ImeBridge] HandleRestore: no state to restore for " << client_key;
-    }
-    return;
-  }
+  auto& state = client_states_[client_key];
+  state.last_active = std::chrono::steady_clock::now();
 
   ImeBridgePendingAction action;
-  action.type = ImeBridgePendingAction::kRestore;
+  action.type = ImeBridgePendingAction::kEnterInsert;
   action.client_key = client_key;
   pending_actions_.push(action);
 
   if (config_.debug) {
-    LOG(INFO) << "[ImeBridge] HandleRestore: client=" << client_key
-              << ", depth=" << it->second.depth << ", queue_size=" << pending_actions_.size();
+    LOG(INFO) << "[ImeBridge] HandleEnterInsert: client=" << client_key
+              << ", has_bit=" << state.has_insert_state;
+  }
+}
+
+void ImeBridgeState::HandleLeaveInsert(const std::string& client_key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto& state = client_states_[client_key];
+  state.last_active = std::chrono::steady_clock::now();
+
+  ImeBridgePendingAction action;
+  action.type = ImeBridgePendingAction::kLeaveInsert;
+  action.client_key = client_key;
+  pending_actions_.push(action);
+
+  if (config_.debug) {
+    LOG(INFO) << "[ImeBridge] HandleLeaveInsert: client=" << client_key;
   }
 }
 
@@ -692,62 +699,49 @@ ImeBridgeState::ApplyResult ImeBridgeState::ApplyAction(const ImeBridgePendingAc
   switch (action.type) {
     case ImeBridgePendingAction::kSet: {
       auto& state = client_states_[action.client_key];
+      state.last_active = std::chrono::steady_clock::now();
 
-      // 在第一次 set 时保存初始状态（整个会话只保存一次）
+      // 无记账的绝对断言。栈没有了：普通/可视/命令行模式恒为英文，不需要记忆，
+      // 唯一要记的那个 bit 由 leave_insert 负责。
       if (!state.has_initial) {
         state.initial_state = current_ascii;
         state.has_initial = true;
-        if (config_.debug) {
-          LOG(INFO) << "[ImeBridge] ApplyAction kSet: saved initial_state=" << state.initial_state;
-        }
-      }
-
-      // 如果是 stack=true (默认行为)，则更新 depth 和 base
-      if (action.stack) {
-        // 如果是当前 cycle 的第一次 set，记录为 base
-        if (state.depth == 0) {
-          state.base = current_ascii;
-          state.has_base = true;
-          if (config_.debug) {
-            LOG(INFO) << "[ImeBridge] ApplyAction kSet: saved base=" << state.base;
-          }
-        }
-        state.depth++;
-      } else {
-        if (config_.debug) {
-          LOG(INFO) << "[ImeBridge] ApplyAction kSet: non-stack set, skipping flow control";
-        }
       }
 
       result.should_set = true;
       result.ascii_mode = action.ascii;
-
-      if (config_.debug) {
-        LOG(INFO) << "[ImeBridge] ApplyAction kSet: ascii=" << action.ascii
-                  << ", base=" << state.base << ", depth=" << state.depth;
-      }
       break;
     }
 
-    case ImeBridgePendingAction::kRestore: {
-      auto it = client_states_.find(action.client_key);
-      if (it != client_states_.end() && it->second.depth > 0) {
-        it->second.depth--;
+    case ImeBridgePendingAction::kLeaveInsert: {
+      auto& state = client_states_[action.client_key];
+      // F4: 这个条目可能是刚刚由 operator[] 建出来的（上一条 reset 抹掉了它），
+      // 而默认构造的 last_active 是零值 —— 不盖时间戳，它一出生就是「远古」的，
+      // 下一次 CleanupStaleClients 必删。实测过：建好 14 微秒后就被清掉。
+      state.last_active = std::chrono::steady_clock::now();
 
-        if (it->second.depth == 0 && it->second.has_base) {
-          result.should_set = true;
-          result.ascii_mode = it->second.base;
-          it->second.has_base = false;
-
-          if (config_.debug) {
-            LOG(INFO) << "[ImeBridge] ApplyAction kRestore: restored to base=" << it->second.base;
-          }
-        } else {
-          if (config_.debug) {
-            LOG(INFO) << "[ImeBridge] ApplyAction kRestore: depth=" << it->second.depth;
-          }
-        }
+      if (!state.has_initial) {
+        state.initial_state = current_ascii;
+        state.has_initial = true;
       }
+      state.insert_state = current_ascii;
+      state.has_insert_state = true;
+
+      result.should_set = true;
+      result.ascii_mode = true;  // 普通模式恒为英文
+      break;
+    }
+
+    case ImeBridgePendingAction::kEnterInsert: {
+      auto it = client_states_.find(action.client_key);
+      if (it == client_states_.end() || !it->second.has_insert_state) {
+        // 一个字都不写。这台机器还没说过它在 insert 里用什么，就用它自己现在的
+        // 状态 —— should_set 保持 false，排空循环因此不会碰 ascii_mode。
+        break;
+      }
+      it->second.last_active = std::chrono::steady_clock::now();
+      result.should_set = true;
+      result.ascii_mode = it->second.insert_state;
       break;
     }
 
@@ -755,8 +749,9 @@ ImeBridgeState::ApplyResult ImeBridgeState::ApplyAction(const ImeBridgePendingAc
       // A reset we synthesized on disconnect is moot if the client has a live
       // connection again by now: the tunnel merely blipped, and applying it
       // would yank the user back to initial_state (typically English)
-      // mid-composition *and* erase has_initial/base/depth, so nothing could
-      // put them back. resync() deliberately does not re-assert ascii_mode.
+      // mid-composition *and* erase has_initial (and the saved insert-mode
+      // bit), so nothing could put them back. resync() deliberately does not
+      // re-assert ascii_mode.
       // conn_refs_ is guarded by mutex_, which we already hold: read it
       // directly rather than going through Retain/ReleaseClientConnection,
       // which would deadlock on this non-recursive mutex.

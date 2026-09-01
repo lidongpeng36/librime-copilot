@@ -80,7 +80,7 @@ bool WaitForLiveConnections(ImeBridgeServer& server, int expected) {
 }
 
 std::string Msg(const std::string& app, const std::string& instance, const std::string& data) {
-  return std::string(R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":")") + app +
+  return std::string(R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":")") + app +
          R"(","instance":")" + instance + R"("},"data":)" + data + "}";
 }
 
@@ -277,7 +277,7 @@ TEST(ImeBridgeSocket, IdentityDisconnectDoesNotResetUnlikeAscii) {
   // must produce no reset.
   int id_fd = ConnectClient(cfg.socket_path);
   ASSERT_GE(id_fd, 0);
-  SendLine(id_fd, R"({"v":1,"ns":"rime.ime","type":"identity",)"
+  SendLine(id_fd, R"({"v":2,"ns":"rime.ime","type":"identity",)"
                   R"("data":{"socket":"default","pane":"%7","command":"claude"}})");
 
   bool got_identity = false;

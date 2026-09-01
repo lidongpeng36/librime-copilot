@@ -91,31 +91,12 @@ TEST(ImeBridgeState, ClearContextOnActiveClearsOwnership) {
 TEST(ImeBridgeState, ProcessMessageParsesContext) {
   ImeBridgeState s;
   s.HandleActivate("nvim:1");
-  s.ProcessMessage(R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+  s.ProcessMessage(R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
                    R"("data":{"action":"context","before":"中","after":"文"}})");
   auto ctx = s.GetActiveContext();
   ASSERT_TRUE(ctx.has_value());
   EXPECT_EQ("中", ctx->before);
   EXPECT_EQ("文", ctx->after);
-}
-
-TEST(ImeBridgeState, ApplyActionSetThenRestoreReturnsToBase) {
-  ImeBridgeState s;
-  ImeBridgePendingAction set;
-  set.type = ImeBridgePendingAction::kSet;
-  set.client_key = "nvim:1";
-  set.ascii = true;
-  set.stack = true;
-  auto r1 = s.ApplyAction(set, /*current_ascii=*/false);  // base captured = false
-  EXPECT_TRUE(r1.should_set);
-  EXPECT_TRUE(r1.ascii_mode);
-
-  ImeBridgePendingAction restore;
-  restore.type = ImeBridgePendingAction::kRestore;
-  restore.client_key = "nvim:1";
-  auto r2 = s.ApplyAction(restore, /*current_ascii=*/true);
-  EXPECT_TRUE(r2.should_set);
-  EXPECT_FALSE(r2.ascii_mode);  // restored to base (false)
 }
 
 TEST(ImeBridgeState, CleanupRemovesTimedOutClients) {
@@ -146,11 +127,13 @@ TEST(ImeBridgeState, ProcessMessageReturnsClientKey) {
   ImeBridgeState s;
   EXPECT_EQ("nvim:1",
             s.ProcessMessage(
-                R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+                R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
                 R"("data":{"action":"ping"}})"));
   EXPECT_EQ("", s.ProcessMessage("not json at all"));
+  // The old version, now rejected outright by the same exact-equality check
+  // RejectsTheOldVersionOutright pins below.
   EXPECT_EQ("", s.ProcessMessage(
-                    R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+                    R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
                     R"("data":{"action":"ping"}})"));
 }
 
@@ -170,7 +153,7 @@ TEST(ImeBridgeState, HelloCarriesTheConfiguredHostId) {
       << "and must not contain an embedded newline";
 
   auto msg = nlohmann::json::parse(hello);
-  EXPECT_EQ(1, msg["v"]);
+  EXPECT_EQ(2, msg["v"]);
   EXPECT_EQ("rime.ime", msg["ns"]);
   EXPECT_EQ("hello", msg["type"]);
   EXPECT_EQ("my-laptop", msg["data"]["host"]);
@@ -208,7 +191,7 @@ TEST(ImeBridgeState, LastConnectionCloseSynthesizesReset) {
   // to put ascii_mode back itself.
   ImeBridgeState s;
   s.RetainClientConnection("nvim:1");
-  s.HandleSet("nvim:1", true, true);
+  s.HandleSet("nvim:1", true);
   s.TakePendingActions();  // drain the set
 
   s.ReleaseClientConnection("nvim:1");
@@ -246,7 +229,7 @@ TEST(ImeBridgeState, SynthesizedResetIsANoOpAfterACleanExit) {
   // The synthesized reset then finds nothing and asks for no ascii_mode change.
   ImeBridgeState s;
   s.RetainClientConnection("nvim:1");
-  s.HandleSet("nvim:1", true, true);
+  s.HandleSet("nvim:1", true);
   for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
     s.ApplyAction(q.front(), /*current_ascii=*/false);
   }
@@ -285,7 +268,7 @@ TEST(ImeBridgeState, SynthesizedResetIsSkippedWhenTheClientIsBack) {
   // would switch the user to English and erase has_initial for good.
   ImeBridgeState s;
   s.RetainClientConnection("nvim:1");
-  s.HandleSet("nvim:1", true, true);
+  s.HandleSet("nvim:1", true);
   for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
     s.ApplyAction(q.front(), /*current_ascii=*/false);  // initial_state = false
   }
@@ -299,14 +282,15 @@ TEST(ImeBridgeState, SynthesizedResetIsSkippedWhenTheClientIsBack) {
   auto result = s.ApplyAction(pending.front(), /*current_ascii=*/false);
   EXPECT_FALSE(result.should_set);
 
-  // The client state survived: a later restore still knows the base, and a
-  // later *explicit* reset still knows the initial state.
-  ImeBridgePendingAction restore;
-  restore.type = ImeBridgePendingAction::kRestore;
-  restore.client_key = "nvim:1";
-  auto r2 = s.ApplyAction(restore, /*current_ascii=*/true);
+  // The client state survived: a later *explicit* reset still knows the
+  // initial state.
+  ImeBridgePendingAction reset;
+  reset.type = ImeBridgePendingAction::kReset;
+  reset.client_key = "nvim:1";
+  reset.restore = true;
+  auto r2 = s.ApplyAction(reset, /*current_ascii=*/true);
   EXPECT_TRUE(r2.should_set);
-  EXPECT_FALSE(r2.ascii_mode);  // back to the base captured above
+  EXPECT_FALSE(r2.ascii_mode);  // back to initial_state (false, captured above)
 }
 
 TEST(ImeBridgeState, SynthesizedResetStillAppliesWhenTheClientIsGone) {
@@ -314,7 +298,7 @@ TEST(ImeBridgeState, SynthesizedResetStillAppliesWhenTheClientIsGone) {
   // must go back to where we found it.
   ImeBridgeState s;
   s.RetainClientConnection("nvim:1");
-  s.HandleSet("nvim:1", true, true);
+  s.HandleSet("nvim:1", true);
   for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
     s.ApplyAction(q.front(), /*current_ascii=*/false);  // initial_state = false
   }
@@ -337,7 +321,7 @@ TEST(ImeBridgeState, ExplicitResetAppliesEvenWithALiveConnection) {
   // connection must not suppress a reset the client asked for.
   ImeBridgeState s;
   s.RetainClientConnection("nvim:1");
-  s.HandleSet("nvim:1", true, true);
+  s.HandleSet("nvim:1", true);
   for (auto q = s.TakePendingActions(); !q.empty(); q.pop()) {
     s.ApplyAction(q.front(), /*current_ascii=*/false);  // initial_state = false
   }
@@ -441,7 +425,7 @@ std::string IdentityMessage(const char* pane, const char* command,
   if (host) {
     data += std::string(R"(,"host":")") + host + R"(")";
   }
-  return R"({"v":1,"ns":"rime.ime","type":"identity","data":)" + data + "}}";
+  return R"({"v":2,"ns":"rime.ime","type":"identity","data":)" + data + "}}";
 }
 }  // namespace
 
@@ -464,7 +448,7 @@ std::string IdentityMessage(const char* pane, const char* command,
 TEST(ImeBridgeIdentity, TheLocalReportersExactMessageStillParses) {
   rime::ImeBridgeState state;
   state.ProcessMessage(
-      R"({"v":1,"ns":"rime.ime","type":"identity","data":{"socket":"/private/tmp/tmux-501/default","pane":"%2","command":"zsh"}})");
+      R"({"v":2,"ns":"rime.ime","type":"identity","data":{"socket":"/private/tmp/tmux-501/default","pane":"%2","command":"zsh"}})");
   auto id = state.GetPushedIdentity();
   ASSERT_TRUE(id.has_value());
   EXPECT_EQ(id->socket, "/private/tmp/tmux-501/default");
@@ -477,7 +461,7 @@ TEST(ImeBridgeIdentity, TheRemoteReportersExactMessageStillParses) {
   rime::ImeBridgeState state;
   state.SetHostIdForTest("Mac-Mini");
   state.ProcessMessage(
-      R"({"v":1,"ns":"rime.ime","type":"identity","data":{"expect":"Mac-Mini","host":"devbox","socket":"/tmp/tmux-1000/default","pane":"%2","command":"zsh"}})");
+      R"({"v":2,"ns":"rime.ime","type":"identity","data":{"expect":"Mac-Mini","host":"devbox","socket":"/tmp/tmux-1000/default","pane":"%2","command":"zsh"}})");
   auto id = state.GetPushedIdentity();
   ASSERT_TRUE(id.has_value());
   EXPECT_EQ(id->host, "devbox");
@@ -520,7 +504,7 @@ TEST(ImeBridgeIdentity, RegistersNoClient) {
 TEST(ImeBridgeIdentity, MalformedIdentityLeavesTheCellAlone) {
   rime::ImeBridgeState state;
   state.ProcessMessage(IdentityMessage("%7", "claude"));
-  state.ProcessMessage(R"({"v":1,"ns":"rime.ime","type":"identity","data":{}})");
+  state.ProcessMessage(R"({"v":2,"ns":"rime.ime","type":"identity","data":{}})");
   auto id = state.GetPushedIdentity();
   ASSERT_TRUE(id.has_value());
   EXPECT_EQ(id->pane_id, "%7");
@@ -530,7 +514,7 @@ TEST(ImeBridgeIdentity, MalformedIdentityLeavesTheCellAlone) {
 TEST(ImeBridgeIdentity, AsciiMessagesStillRegisterTheirClient) {
   rime::ImeBridgeState state;
   const std::string key = state.ProcessMessage(
-      R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+      R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
       R"("data":{"action":"set","ascii":true}})");
   EXPECT_EQ(key, "nvim:1");
 }
@@ -558,7 +542,7 @@ TEST(ImeBridgeIdentity, AbsentHostFieldMeansThisMachine) {
 namespace {
 std::string IdentityMessageWithExpect(const char* pane, const char* host,
                                       const char* expect) {
-  return std::string(R"({"v":1,"ns":"rime.ime","type":"identity","data":{)") +
+  return std::string(R"({"v":2,"ns":"rime.ime","type":"identity","data":{)") +
          R"("socket":"default","pane":")" + pane + R"(","command":"zsh")" +
          R"(,"host":")" + host + R"(","expect":")" + expect + R"("}})";
 }
@@ -608,21 +592,21 @@ TEST(ImeBridgeModeWrites, CountsEveryAppliedWriteAndNothingElse) {
   ASSERT_TRUE(s.ApplyAction(set, /*current_ascii=*/false).should_set);
   EXPECT_EQ(s.applied_mode_writes(), 1u);
 
-  // A restore that returns to base writes the mode too, and lands on whatever
-  // pane the keystroke is in just as a set does -- so it must count.
-  ImeBridgePendingAction restore;
-  restore.type = ImeBridgePendingAction::kRestore;
-  restore.client_key = "nvim:1";
-  ASSERT_TRUE(s.ApplyAction(restore, /*current_ascii=*/true).should_set);
+  // A reset that finds the client's captured initial state writes the mode
+  // too, and lands on whatever pane the keystroke is in just as a set does --
+  // so it must count.
+  ImeBridgePendingAction reset;
+  reset.type = ImeBridgePendingAction::kReset;
+  reset.client_key = "nvim:1";
+  reset.restore = true;
+  ASSERT_TRUE(s.ApplyAction(reset, /*current_ascii=*/true).should_set);
   EXPECT_EQ(s.applied_mode_writes(), 2u);
 
   // An action that resolves to no write must NOT count: a tail that saw the
   // counter move refuses to record, so an over-count silently costs the
-  // feature the keystrokes it exists to remember.
-  ImeBridgePendingAction extra_restore;
-  extra_restore.type = ImeBridgePendingAction::kRestore;
-  extra_restore.client_key = "nvim:1";  // depth is already 0
-  ASSERT_FALSE(s.ApplyAction(extra_restore, /*current_ascii=*/true).should_set);
+  // feature the keystrokes it exists to remember. The reset above already
+  // erased the client's state, so re-applying the same action finds nothing.
+  ASSERT_FALSE(s.ApplyAction(reset, /*current_ascii=*/true).should_set);
   EXPECT_EQ(s.applied_mode_writes(), 2u);
 
   ImeBridgePendingAction unknown_unregister;
@@ -656,4 +640,163 @@ TEST(ImeBridgeModeWrites, IsMonotonicAcrossClientsAndResets) {
   s.ApplyAction(b, /*current_ascii=*/true);
 
   EXPECT_EQ(s.applied_mode_writes(), 3u);
+}
+
+// The insert-mode bit, and the other half of a second cross-repo golden.
+//
+// Everything below pins ApplyAction's kSet / kReset / kEnterInsert /
+// kLeaveInsert / kUnregister semantics from this side. The other side is
+// rime-copilot-clients' test/verify_spec.lua -- its `new_model` /
+// `model_apply` pair is a hand-written state machine mirroring exactly these
+// transitions, and its docstring names this test group back. That is the same
+// arrangement as the identity-message golden further up this file, and it
+// exists for the same reason: neither repo can test the other, because this
+// handler lives behind a real Rime engine that the Lua side has no way to
+// stand up.
+//
+// So a change to any transition here is a change over there too. If the two
+// drift, the failure is silent in the worst possible direction: verify_spec
+// goes on passing against a bridge that no longer exists, and it is the only
+// thing on the client side that checks state rather than bytes.
+//
+// The Lua model keeps one state rather than a map keyed by `app:instance`,
+// because each scenario runs a single client. That is a simplification of the
+// per-client keying below, not a disagreement with it.
+
+// 离开 insert：把当时的真实状态存成 bit，然后强制英文。
+TEST(ImeBridgeInsertBit, LeaveInsertSavesCurrentAndForcesAscii) {
+  ImeBridgeState s;
+  ImeBridgePendingAction leave;
+  leave.type = ImeBridgePendingAction::kLeaveInsert;
+  leave.client_key = "nvim:1";
+  auto r = s.ApplyAction(leave, /*current_ascii=*/false);  // 用户当时在中文
+  EXPECT_TRUE(r.should_set);
+  EXPECT_TRUE(r.ascii_mode);  // 普通模式恒为英文
+}
+
+// 没有 bit 时什么都不做 —— 这是「第一次进 insert 沿用这台机器原有状态」的实现依据。
+// 注意：这里 client_states_ 是空的，所以只覆盖 guard 里 `it == end()` 这一支 ——
+// 生产路径上 HandleEnterInsert 会先 operator[] 自动建出条目，那一支永远不会命中；
+// 真正在生产路径上生效的是 `!has_insert_state`，那一支由下面
+// EnterInsertWritesNothingWhenTheEntryExistsWithoutABit 覆盖。
+TEST(ImeBridgeInsertBit, EnterInsertWithNoSavedBitDoesNothing) {
+  ImeBridgeState s;
+  ImeBridgePendingAction enter;
+  enter.type = ImeBridgePendingAction::kEnterInsert;
+  enter.client_key = "nvim:1";
+  auto r = s.ApplyAction(enter, /*current_ascii=*/true);
+  EXPECT_FALSE(r.should_set);  // 不是「设成某值」，是「一个字都不写」
+}
+
+// The guard's live clause. HandleEnterInsert auto-vivifies the client entry,
+// so on the real path `find()` never returns end() -- what actually stops the
+// write is has_insert_state being false. The sibling test above cannot reach
+// this clause because it calls ApplyAction with an empty map.
+TEST(ImeBridgeInsertBit, EnterInsertWritesNothingWhenTheEntryExistsWithoutABit) {
+  ImeBridgeState s;
+  s.HandleEnterInsert("nvim:1");
+  auto actions = s.TakePendingActions();
+  ASSERT_EQ(actions.size(), 1u);
+  auto r = s.ApplyAction(actions.front(), /*current_ascii=*/false);
+  EXPECT_FALSE(r.should_set) << "an entry with no bit must still write nothing";
+}
+
+// 存了什么就还什么。
+TEST(ImeBridgeInsertBit, EnterInsertRestoresTheSavedBit) {
+  ImeBridgeState s;
+  ImeBridgePendingAction leave;
+  leave.type = ImeBridgePendingAction::kLeaveInsert;
+  leave.client_key = "nvim:1";
+  s.ApplyAction(leave, /*current_ascii=*/false);
+
+  ImeBridgePendingAction enter;
+  enter.type = ImeBridgePendingAction::kEnterInsert;
+  enter.client_key = "nvim:1";
+  auto r = s.ApplyAction(enter, /*current_ascii=*/true);
+  EXPECT_TRUE(r.should_set);
+  EXPECT_FALSE(r.ascii_mode);  // 回到中文
+}
+
+// 手动切成英文之后离开再回来，仍是英文 —— spec 的 G2。
+TEST(ImeBridgeInsertBit, AManualSwitchInsideInsertSurvivesTheRoundTrip) {
+  ImeBridgeState s;
+  ImeBridgePendingAction leave;
+  leave.type = ImeBridgePendingAction::kLeaveInsert;
+  leave.client_key = "nvim:1";
+  s.ApplyAction(leave, /*current_ascii=*/true);  // 用户在 insert 里手动切了英文
+
+  ImeBridgePendingAction enter;
+  enter.type = ImeBridgePendingAction::kEnterInsert;
+  enter.client_key = "nvim:1";
+  auto r = s.ApplyAction(enter, /*current_ascii=*/true);
+  EXPECT_TRUE(r.should_set);
+  EXPECT_TRUE(r.ascii_mode);
+}
+
+// F4：由 ApplyAction 建出来的状态，last_active 曾是零值，于是「出生即过期」。
+TEST(ImeBridgeInsertBit, StateCreatedByApplyActionIsNotBornStale) {
+  ImeBridgeState s;  // 默认超时 30 分钟
+  ImeBridgePendingAction leave;
+  leave.type = ImeBridgePendingAction::kLeaveInsert;
+  leave.client_key = "nvim:1";
+  ASSERT_TRUE(s.ApplyAction(leave, /*current_ascii=*/false).should_set);
+
+  s.CleanupStaleClients();  // 必须留下它
+
+  ImeBridgePendingAction enter;
+  enter.type = ImeBridgePendingAction::kEnterInsert;
+  enter.client_key = "nvim:1";
+  auto r = s.ApplyAction(enter, /*current_ascii=*/true);
+  EXPECT_TRUE(r.should_set) << "the bit did not survive a cleanup pass";
+  EXPECT_FALSE(r.ascii_mode);
+}
+
+// 退出 nvim 仍要能恢复：initial_state 的抓取不依赖旧的 stack 逻辑。
+TEST(ImeBridgeInsertBit, LeaveInsertAlsoCapturesInitialStateOnce) {
+  ImeBridgeState s;
+  ImeBridgePendingAction leave;
+  leave.type = ImeBridgePendingAction::kLeaveInsert;
+  leave.client_key = "nvim:1";
+  s.ApplyAction(leave, /*current_ascii=*/false);  // 进 nvim 前是中文
+  s.ApplyAction(leave, /*current_ascii=*/true);   // 后续的 leave 不得改写它
+
+  ImeBridgePendingAction reset;
+  reset.type = ImeBridgePendingAction::kReset;
+  reset.client_key = "nvim:1";
+  reset.restore = true;
+  auto r = s.ApplyAction(reset, /*current_ascii=*/true);
+  ASSERT_TRUE(r.should_set);
+  EXPECT_FALSE(r.ascii_mode) << "initial_state should still be the pre-nvim value";
+}
+
+// 线格式：这两个动作要能从一条真实消息走通。
+TEST(ImeBridgeInsertBit, ProcessMessageDispatchesTheTwoActions) {
+  ImeBridgeState s;
+  s.ProcessMessage(
+      R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+      R"("data":{"action":"leave_insert"}})");
+  s.ProcessMessage(
+      R"({"v":2,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+      R"("data":{"action":"enter_insert"}})");
+  auto actions = s.TakePendingActions();
+  ASSERT_EQ(actions.size(), 2u);
+  EXPECT_EQ(actions.front().type, ImeBridgePendingAction::kLeaveInsert);
+  actions.pop();
+  EXPECT_EQ(actions.front().type, ImeBridgePendingAction::kEnterInsert);
+}
+
+// 一次 flag day：精确相等的检查意味着新 dylib 会完全忽略仍说 v1 的客户端。
+// 这条用例存在的意义是让「顺手把版本改回去」当场失败。
+TEST(ImeBridgeProtocol, RejectsTheOldVersionOutright) {
+  ImeBridgeState s;
+  s.ProcessMessage(
+      R"({"v":1,"ns":"rime.ime","type":"ascii","src":{"app":"nvim","instance":"1"},)"
+      R"("data":{"action":"leave_insert"}})");
+  EXPECT_TRUE(s.TakePendingActions().empty());
+}
+
+TEST(ImeBridgeProtocol, HelloAdvertisesVersionTwo) {
+  ImeBridgeState s;
+  auto hello = nlohmann::json::parse(s.BuildHello());
+  EXPECT_EQ(hello["v"], 2);
 }
