@@ -1975,3 +1975,120 @@ class ProtocolVersionAgreementTest(unittest.TestCase):
         m = re.search(r"constexpr int kProtocolVersion\s*=\s*(\d+)", src)
         self.assertIsNotNone(m, "kProtocolVersion not found in src/ime_bridge.cc")
         self.assertEqual(int(m.group(1)), cli.CLIENTS_PROTOCOL_VERSION)
+
+
+class BridgeProtocolStatusTest(unittest.TestCase):
+    """The one status check that asks the RUNNING dylib.
+
+    Against a fake socket, never the real /tmp/rime_copilot_ime.sock: a
+    development machine has a live Squirrel on it, so a test that talked to the
+    real bridge would report on whatever dylib happened to be loaded that day
+    and would take a connection slot off the user's own input method.
+    """
+
+    def _serve(self, greeting: "bytes | None"):
+        """A one-shot AF_UNIX server. Returns its path.
+
+        `greeting` of None accepts and stays mute, which is how a peer that is
+        not a bridge at all looks from here.
+        """
+        import socket as pysocket
+        import threading
+        import time
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        # Short basename: sun_path is ~104 bytes on macOS and tempfile roots
+        # under /var/folders are long enough for that to matter.
+        path = os.path.join(td.name, "s")
+        srv = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def run():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                if greeting is not None:
+                    try:
+                        conn.sendall(greeting)
+                    except OSError:
+                        pass
+                else:
+                    # HOLD the connection open. Closing it immediately makes
+                    # recv() return b"" at once, which produces the same
+                    # "no greeting" line without ever exercising the timeout --
+                    # i.e. the budget assertion below would pass on a version
+                    # of the code that had no timeout at all.
+                    time.sleep(1.0)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 2)
+        return path
+
+    def test_absent_socket_is_silent(self):
+        # The redeploy window: the refcount hits zero, Stop() unlinks, and
+        # Start() rebinds on the next keystroke. Reporting a failure there
+        # would fire on every machine that had just deployed.
+        self.assertIsNone(cli._bridge_protocol_status("/nonexistent/rime.sock"))
+
+    def test_stale_socket_file_with_no_listener_is_silent(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = os.path.join(td.name, "s")
+        open(path, "w").close()  # a plain file: connect() cannot succeed
+        self.assertIsNone(cli._bridge_protocol_status(path, timeout=0.2))
+
+    def test_matching_version_reports_it(self):
+        greeting = ('{"v":%d,"ns":"rime.ime","type":"hello","data":{"host":"x"}}\n'
+                    % cli.CLIENTS_PROTOCOL_VERSION).encode()
+        line = cli._bridge_protocol_status(self._serve(greeting))
+        self.assertIn(f"protocol {cli.CLIENTS_PROTOCOL_VERSION}", line)
+        self.assertNotIn("dropped", line)
+
+    def test_lagging_dylib_is_named(self):
+        # The counter-example this check was written for: a current checkout
+        # and a Squirrel still running the dylib it launched with.
+        old = cli.CLIENTS_PROTOCOL_VERSION - 1
+        greeting = ('{"v":%d,"ns":"rime.ime","type":"hello","data":{"host":"x"}}\n'
+                    % old).encode()
+        line = cli._bridge_protocol_status(self._serve(greeting))
+        self.assertIn(f"protocol {old}", line)
+        self.assertIn(str(cli.CLIENTS_PROTOCOL_VERSION), line)
+        self.assertIn("killall Squirrel", line)
+
+    def test_greeting_without_a_version_field(self):
+        # Predates the field, so it is older than 1 rather than unknowable --
+        # named the way the Neovim client names the same case.
+        greeting = b'{"ns":"rime.ime","type":"hello","data":{"host":"x"}}\n'
+        line = cli._bridge_protocol_status(self._serve(greeting))
+        self.assertIn("1 or older", line)
+
+    def test_a_peer_that_never_greets_does_not_hang(self):
+        import time
+        start = time.monotonic()
+        line = cli._bridge_protocol_status(self._serve(None), timeout=0.3)
+        # The budget is what matters: status must never hang. Generous ceiling
+        # so a loaded CI box does not fail this on scheduling noise.
+        self.assertLess(time.monotonic() - start, 3.0)
+        self.assertIn("no greeting", line)
+
+    def test_a_peer_that_is_not_a_bridge(self):
+        line = cli._bridge_protocol_status(self._serve(b"not json at all\n"))
+        self.assertIn("not", line)
+        self.assertIn("JSON", line)
+
+    def test_socket_path_default_and_override(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        d = Path(td.name)
+        self.assertEqual(cli._bridge_socket_path([]), cli.DEFAULT_BRIDGE_SOCKET)
+        # The deployed flow-map shape, which is the one a built schema actually
+        # carries and the one _config_leaves exists to read.
+        s = d / "x.schema.yaml"
+        s.write_text('copilot:\n  ime_bridge: {enable: true, socket_path: "/tmp/other.sock"}\n')
+        self.assertEqual(cli._bridge_socket_path([s]), "/tmp/other.sock")

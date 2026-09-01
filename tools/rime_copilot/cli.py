@@ -92,7 +92,7 @@ def _context_memory_enabled(built_schemas: "list[Path]") -> bool:
 # publishes as @rime-copilot-clients-protocol. Nothing at runtime compares the
 # three; ProtocolVersionAgreementTest in tools/test/cli_test.py is what notices
 # one being bumped alone.
-CLIENTS_PROTOCOL_VERSION = 1
+CLIENTS_PROTOCOL_VERSION = 2
 
 _CLIENTS_PROTOCOL_OPTION = "@rime-copilot-clients-protocol"
 
@@ -157,6 +157,115 @@ def _context_memory_status(enabled: bool, tmux_bin: str = "tmux") -> "str | None
                 f"whichever is behind")
     return (f"context memory: clients plugin v{value} (identity is pushed, "
             f"not polled)")
+
+
+BRIDGE_SOCKET_KEY = "copilot/ime_bridge/socket_path"
+DEFAULT_BRIDGE_SOCKET = "/tmp/rime_copilot_ime.sock"
+
+
+def _bridge_socket_path(built_schemas: "list[Path]") -> str:
+    """Where the running bridge listens, per the BUILT schema.
+
+    Same reasoning as `_context_memory_enabled`: a `.custom.yaml` patch can set
+    this without the source `.schema.yaml` ever mentioning it, and `_config_leaves`
+    is what reads the flat key, the nested block and Rime's deployed flow map as
+    one setting. Falls back to ImeBridgeConfig's own default (src/ime_bridge.h).
+    """
+    for path in built_schemas:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for leaf, value in _config_leaves(text):
+            if leaf == BRIDGE_SOCKET_KEY:
+                v = value.strip().strip('"').strip("'")
+                if v:
+                    return v
+    return DEFAULT_BRIDGE_SOCKET
+
+
+def _bridge_protocol_status(socket_path: str, timeout: float = 0.5) -> "str | None":
+    """One line about the protocol the RUNNING bridge speaks, or None.
+
+    This exists because the check above cannot see the failure it is nominally
+    about. It compares a tmux option against `CLIENTS_PROTOCOL_VERSION`, and
+    both of those travel by git -- so on a machine whose checkout is current but
+    whose Squirrel still has the dylib it launched with weeks ago, they agree
+    and `status` reports healthy while the bridge greets v1 and drops every v2
+    message on the floor. That is not hypothetical: it is what this machine was
+    doing when the check was written. It is also the exact shape CLAUDE.md warns
+    about under "copying the dylib is not loading it" -- the dylib is the one
+    channel with no automation, and asking the socket is the only question whose
+    answer comes from the running image rather than from the tree.
+
+    Silent when there is nothing to ask, which is not the same as healthy but is
+    the only honest report:
+
+    - **No socket file.** Legitimately absent for a window after every redeploy
+      -- the connection refcount hits zero, `Stop()` unlinks, and `Start()`
+      rebinds only when the next Rime session is created (CLAUDE.md, "a redeploy
+      leaves /tmp/rime_copilot_ime.sock absent until the next keystroke"). It is
+      also what a machine with `copilot/ime_bridge/enable` off looks like, which
+      is most of them. Neither is a failure, and a line here would be the
+      always-on noise that teaches people to stop reading `status`.
+    - **A socket file nothing is listening on.** A leftover from a process that
+      died without unlinking. Says nothing about any version.
+
+    Never blocks for long: one short timeout covers connect and the greeting
+    together, and a bridge that is up answers in microseconds over AF_UNIX.
+    """
+    import socket as _socket
+
+    if not os.path.exists(socket_path):
+        return None
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        try:
+            sock.connect(socket_path)
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            return None
+        chunks = []
+        while b"\n" not in b"".join(chunks):
+            try:
+                data = sock.recv(4096)
+            except (OSError, _socket.timeout):
+                data = b""
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    line = b"".join(chunks).split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+    if not line:
+        return ("ime bridge: connected to {} but it sent no greeting within "
+                "{:.1f}s -- something else may be listening on that path"
+                .format(socket_path, timeout))
+    try:
+        hello = json.loads(line)
+    except ValueError:
+        return (f"ime bridge: {socket_path} answered with something that is not "
+                f"JSON -- something else is listening on that path")
+    if not isinstance(hello, dict):
+        return (f"ime bridge: {socket_path} answered with something that is not "
+                f"a greeting -- something else is listening on that path")
+
+    v = hello.get("v")
+    if v == CLIENTS_PROTOCOL_VERSION:
+        return f"ime bridge: running dylib speaks protocol {v}"
+    # A greeting with no version at all predates the field, which makes it
+    # older than any numbered version rather than unknowable. Named the way the
+    # Neovim client names it, so the two reports read alike.
+    named = v if v is not None else "1 or older"
+    return (f"ime bridge: the RUNNING dylib speaks protocol {named}, this "
+            f"checkout speaks {CLIENTS_PROTOCOL_VERSION} -- every client "
+            f"message is being dropped silently. `git pull` and `restore` do "
+            f"not carry the dylib: rebuild it, copy it into Squirrel.app, then "
+            f"`killall Squirrel`")
 
 
 def _ordered_list_block(text: str, opener: str, item: "re.Pattern" = None) -> "list[str]":
@@ -833,6 +942,13 @@ def cmd_status(args) -> int:
         print(ctx_line)
     if ctx_enabled:
         print(_processor_order_status(built_schemas))
+    # Deliberately NOT gated on ctx_enabled: this one is gated by the socket
+    # existing, which is a sharper question than any config file can answer --
+    # it is the only line here whose answer comes from the running dylib rather
+    # than from the tree.
+    bridge_line = _bridge_protocol_status(_bridge_socket_path(built_schemas))
+    if bridge_line:
+        print(bridge_line)
     return 0
 
 
