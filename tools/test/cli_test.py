@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -1275,6 +1276,141 @@ class VaultedFiles(unittest.TestCase):
         from rime_copilot.vault import VAULTED_FILES
         self.assertIn("private/.copilot_clean_stamp.json", VAULTED_FILES)
 
+
+
+class ClientsVersionStatusTest(unittest.TestCase):
+    """The protocol option catches a protocol skew and nothing else.
+
+    What it cannot see is the two installed halves running different commits
+    with the SAME protocol number. Measured: the tmux plugin sat ten commits
+    behind the Neovim one, both saying protocol 2, and status reported healthy
+    while a hook added in those ten commits was simply absent -- so a second
+    machine attaching woke nobody. This check exists for that.
+
+    Deliberately local: it compares the two INSTALLED copies against each other
+    and never asks a remote. So it cannot see "both are old", and its wording
+    must not suggest otherwise.
+    """
+
+    def _fake_tmux(self, tmpdir: Path, stdout: str, rc: int = 0) -> str:
+        p = Path(tmpdir) / "tmux"
+        p.write_text(f"#!/bin/sh\nprintf '%s' '{stdout}'\nexit {rc}\n")
+        p.chmod(0o755)
+        return str(p)
+
+    def _repo(self, root: Path, commits: int) -> str:
+        """A real git repo with `commits` commits; returns the short HEAD."""
+        root.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        subprocess.run(["git", "init", "-q"], cwd=root, env=env, check=True)
+        for i in range(commits):
+            (root / "f").write_text(str(i))
+            subprocess.run(["git", "add", "f"], cwd=root, env=env, check=True)
+            subprocess.run(["git", "commit", "-qm", f"c{i}"], cwd=root, env=env, check=True)
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
+                           env=env, capture_output=True, text=True, check=True)
+        return r.stdout.strip()
+
+    def _sha_at(self, root: Path, back: int) -> str:
+        r = subprocess.run(["git", "rev-parse", "--short", f"HEAD~{back}"], cwd=root,
+                           capture_output=True, text=True, check=True)
+        return r.stdout.strip()
+
+    def test_agreeing_copies_report_the_shared_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            nvim_dir = Path(d) / "lazy" / "rime-copilot-clients"
+            head = self._repo(nvim_dir, 2)
+            line = cli._clients_version_status(nvim_dir, self._fake_tmux(Path(d), head))
+            self.assertIn(head, line)
+            self.assertNotIn("behind", line)
+
+    def test_a_behind_tmux_copy_is_named_with_its_distance(self):
+        """The whole point: say WHICH half is behind and by how much, because
+        the operator's next move differs (`prefix + U` versus lazy's update)."""
+        with tempfile.TemporaryDirectory() as d:
+            nvim_dir = Path(d) / "lazy" / "rime-copilot-clients"
+            self._repo(nvim_dir, 4)
+            older = self._sha_at(nvim_dir, 2)
+            line = cli._clients_version_status(nvim_dir, self._fake_tmux(Path(d), older))
+            self.assertIn("tmux", line)
+            self.assertIn("2", line)
+            self.assertIn(older, line)
+
+    def test_unrelated_commits_are_reported_without_guessing_a_direction(self):
+        """Both known to this repo, neither an ancestor of the other -- say they
+        disagree, and do not invent which one is behind.
+
+        Uses a real second branch rather than a made-up sha: a sha this repo has
+        never heard of is a DIFFERENT case, covered above, and conflating the two
+        is what made a live run claim "different histories" about a commit that
+        was a direct descendant.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            nvim_dir = Path(d) / "lazy" / "rime-copilot-clients"
+            self._repo(nvim_dir, 2)
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+            subprocess.run(["git", "checkout", "-qb", "side", "HEAD~1"], cwd=nvim_dir,
+                           env=env, check=True)
+            (nvim_dir / "g").write_text("x")
+            subprocess.run(["git", "add", "g"], cwd=nvim_dir, env=env, check=True)
+            subprocess.run(["git", "commit", "-qm", "side"], cwd=nvim_dir, env=env, check=True)
+            side = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=nvim_dir,
+                                  env=env, capture_output=True, text=True, check=True).stdout.strip()
+            subprocess.run(["git", "checkout", "-q", "master"], cwd=nvim_dir, env=env, check=True)
+            line = cli._clients_version_status(nvim_dir, self._fake_tmux(Path(d), side))
+            self.assertIn(side, line)
+            self.assertIn("different histories", line)
+            self.assertNotIn("behind", line)
+
+    def test_a_commit_the_neovim_copy_has_never_fetched_is_said_as_such(self):
+        """The common case, and the one the unit tests above cannot reach.
+
+        Direction is decided by asking the Neovim copy's own git. When only the
+        tmux half has been updated, that repo has never fetched the newer commit
+        and cannot know it -- rev-list simply fails. Reporting that as "neither
+        contains the other, different histories" is a false statement, and it is
+        what a live run produced before this case existed: the tmux copy really
+        was a direct descendant.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            nvim_dir = Path(d) / "lazy" / "rime-copilot-clients"
+            self._repo(nvim_dir, 2)
+            line = cli._clients_version_status(nvim_dir, self._fake_tmux(Path(d), "deadbee"))
+            self.assertIn("deadbee", line)
+            self.assertIn("never fetched", line)
+            self.assertNotIn("different histories", line)
+            # The claim, not the word: this message says which-is-behind cannot
+            # be told, so it legitimately contains "behind".
+            self.assertNotIn("commits behind", line)
+
+    def test_an_empty_option_means_the_copy_cannot_be_identified(self):
+        """Distinct from the plugin never having run, which the protocol check
+        already reports -- a copy installed without git is still installed."""
+        with tempfile.TemporaryDirectory() as d:
+            nvim_dir = Path(d) / "lazy" / "rime-copilot-clients"
+            self._repo(nvim_dir, 1)
+            line = cli._clients_version_status(nvim_dir, self._fake_tmux(Path(d), ""))
+            self.assertIsNotNone(line)
+            self.assertNotIn("behind", line)
+
+    def test_a_missing_neovim_copy_is_said_plainly_and_is_not_an_error(self):
+        """Must name the directory it looked in and say the two are unchecked.
+
+        Asserting only "not None, no 'behind'" was not enough: with the
+        no-checkout branch removed the code falls through to the generic
+        "neither contains the other" line, which is also not None and also has
+        no 'behind', so the test passed against a version that had lost the
+        behaviour entirely. Pin the distinguishing content.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            missing = Path(d) / "nowhere"
+            line = cli._clients_version_status(missing, self._fake_tmux(Path(d), "abc1234"))
+            self.assertIsNotNone(line)
+            self.assertIn(str(missing), line)
+            self.assertIn("unchecked", line)
+            self.assertNotIn("behind", line)
 
 if __name__ == "__main__":
     unittest.main()

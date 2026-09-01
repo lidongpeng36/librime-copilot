@@ -159,6 +159,98 @@ def _context_memory_status(enabled: bool, tmux_bin: str = "tmux") -> "str | None
             f"not polled)")
 
 
+
+_CLIENTS_COMMIT_OPTION = "@rime-copilot-clients-commit"
+
+# Where lazy.nvim puts it. Not a guess the check depends on: when this path
+# holds no git repo the check says so plainly instead of reporting a skew it
+# cannot see. The tmux half needs no path at all -- it publishes its own commit.
+DEFAULT_NVIM_CLIENTS_DIR = Path.home() / ".local/share/nvim/lazy/rime-copilot-clients"
+
+
+def _git_out(repo: Path, *args: str) -> "str | None":
+    """`git -C repo args...`, or None if git cannot answer. Never raises."""
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def _clients_version_status(nvim_dir: Path, tmux_bin: str = "tmux") -> "str | None":
+    """Whether the two installed halves of rime-copilot-clients agree.
+
+    The protocol option next to this catches a PROTOCOL skew and nothing else.
+    What it cannot see is the two halves running different commits with the same
+    protocol number -- measured on 2026-09-01: the tmux plugin sat ten commits
+    behind the Neovim one, both saying protocol 2, status reported healthy, and
+    the broadcast hook added in those ten commits was simply absent, so a second
+    machine attaching woke nobody.
+
+    Deliberately local. It compares the two INSTALLED copies against each other
+    and never contacts a remote, so `status` cannot hang on a slow network -- and
+    so it cannot see "both are old" either. The wording below never claims the
+    copies are current, only that they match.
+    """
+    try:
+        proc = subprocess.run([tmux_bin, "show-options", "-gqv", _CLIENTS_COMMIT_OPTION],
+                              capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    published = proc.stdout.strip()
+
+    head = _git_out(nvim_dir, "rev-parse", "--short", "HEAD")
+
+    if not published and head is None:
+        return None  # neither half identifiable; the protocol check covers "never ran"
+    if not published:
+        return (f"clients: the Neovim plugin is {head}, the tmux plugin does not say "
+                f"which commit it came from -- installed without git, or too old to "
+                f"publish it; update it and this line will compare them")
+    if head is None:
+        return (f"clients: the tmux plugin is {published}; no git checkout at "
+                f"{nvim_dir} to compare the Neovim plugin against -- if it lives "
+                f"elsewhere the two halves are unchecked, not known to agree")
+    if head == published:
+        return f"clients: both halves are {head} (matching, which is not the same as current)"
+
+    # Direction is decided by asking the Neovim copy's own git, so it can only
+    # be decided about a commit that copy actually has. When only the tmux half
+    # has been updated -- the common case -- this repo has never fetched the
+    # newer commit and rev-list simply fails. Saying "different histories" there
+    # is a false statement about what is usually a direct descendant, which is
+    # exactly what a live run produced before this branch existed.
+    if _git_out(nvim_dir, "cat-file", "-e", f"{published}^{{commit}}") is None:
+        return (f"clients: the tmux plugin is {published}, which the Neovim copy at "
+                f"{nvim_dir} has never fetched -- so which one is behind cannot be "
+                f"told from here. Update the Neovim plugin, or fetch in that copy, "
+                f"and this line will say")
+
+    # `rev-list --count X..HEAD` is NOT an ancestry test: for two divergent
+    # branches both directions count non-zero, so using it to decide direction
+    # reports "N commits behind" about histories that merely share a base. Ask
+    # about ancestry directly, and use the count only to say how far.
+    def _is_ancestor(older: str, newer: str) -> bool:
+        return _git_out(nvim_dir, "merge-base", "--is-ancestor", older, newer) is not None
+
+    behind = _git_out(nvim_dir, "rev-list", "--count", f"{published}..HEAD")
+    if _is_ancestor(published, "HEAD") and behind and behind.isdigit() and int(behind) > 0:
+        return (f"clients: the tmux plugin is {published}, {behind} commits behind the "
+                f"Neovim plugin at {head} -- update it (prefix + U) then "
+                f"`tmux source-file ~/.tmux.conf`; a hook added in between is "
+                f"otherwise simply absent, with nothing to see")
+    ahead = _git_out(nvim_dir, "rev-list", "--count", f"HEAD..{published}")
+    if _is_ancestor("HEAD", published) and ahead and ahead.isdigit() and int(ahead) > 0:
+        return (f"clients: the Neovim plugin at {head} is {ahead} commits behind the "
+                f"tmux plugin at {published} -- update it with your plugin manager")
+    return (f"clients: the tmux plugin says {published}, the Neovim plugin is {head}, "
+            f"and neither contains the other -- they came from different histories")
+
 BRIDGE_SOCKET_KEY = "copilot/ime_bridge/socket_path"
 DEFAULT_BRIDGE_SOCKET = "/tmp/rime_copilot_ime.sock"
 
@@ -940,6 +1032,12 @@ def cmd_status(args) -> int:
     ctx_line = _context_memory_status(ctx_enabled)
     if ctx_line:
         print(ctx_line)
+    # Next to the protocol line on purpose: that one reports a protocol skew,
+    # this one reports the two halves running different commits with the same
+    # protocol number -- which is what actually happened, and looked healthy.
+    version_line = _clients_version_status(DEFAULT_NVIM_CLIENTS_DIR)
+    if version_line:
+        print(version_line)
     if ctx_enabled:
         print(_processor_order_status(built_schemas))
     # Deliberately NOT gated on ctx_enabled: this one is gated by the socket
