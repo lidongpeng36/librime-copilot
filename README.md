@@ -199,10 +199,19 @@ work is on the GPU at all. Use it before touching `n_gpu_layers` or `n_threads`,
 and on any new machine, rather than carrying this one's numbers over:
 
 ```sh
-bench_scorer --model ~/Library/Rime/private/rime40m-q8.gguf --iters 1000
-bench_scorer --model ~/Library/Rime/private/rime40m-q8.gguf --iters 1000 \
+bench_scorer --model ~/Library/Rime/private/rime40m-v2-q8.gguf --iters 1000
+bench_scorer --model ~/Library/Rime/private/rime40m-v2-q8.gguf --iters 1000 \
              --gpu-layers 0 --threads 4
 ```
+
+What it does **not** measure is the split that dominates the live figure.
+`BuildCandidates` uses two-character candidates throughout, so every iteration
+pays one `llama_decode`; in real use 44% of scoring windows hold nothing but
+single-token candidates, reach `n_tok == 0` in `ScoreGroup`, and are scored
+straight off the prefill's last logits for ~0.18 ms. Read this tool as the cost
+of the decode-bearing half, and see CLAUDE.md's bimodality table for the other
+one — including the ~5x gap between what this reports and what the same machine
+logs in production, which is open.
 
 ## Usage
 

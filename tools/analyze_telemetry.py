@@ -504,6 +504,24 @@ def rate_table(db, title, expr, where="rr_from > 0", limit=None,
 # report could only sweep upward; this is the other direction.
 RECOVERY_THRESHOLDS = (0.5, 1.0, 1.5)
 
+# copilot/telemetry/sample_ok, which the log does not carry -- the value that
+# was in force when the lines were written. It matters because ShouldRecord
+# (telemetry_event.h:235) keeps every promotion and every miss but only one
+# plain success in N, so the two sides of "what would a lower margin do" are
+# NOT recorded at the same rate. Pass --sample-ok to override, and read the
+# implied figure the report prints beside it: the stats lines count every
+# segment, so the factor actually in force is recoverable and does not have to
+# be trusted.
+DEFAULT_SAMPLE_OK = 20
+
+# ShouldRecord's own condition, in SQL. `promoted` there is db_promoted ||
+# llm_promoted, and db_promoted is "rr.text is non-empty" -- NOT "from > 0".
+# The agreed-and-moved-nothing control group therefore counts as promoted and
+# is kept in full, which is why this cannot be written as `rr_from > 0`.
+FULLY_RECORDED_SQL = (
+    "((rr_text IS NOT NULL AND rr_text != '') OR llm_promoted = 1 OR sel_idx != 0)"
+)
+
 
 def accuracy_line(db):
     """(hits, segments, rate) — first-candidate accuracy, or None.
@@ -532,7 +550,57 @@ def accuracy_line(db):
     return hits, segments, hits / segments
 
 
-def decline_split(db):
+def _print_threshold_table(split, sample_ok, implied):
+    """What lowering `margin` would do, both sides, with the harm side weighted.
+
+    This used to be one line per threshold reading "margin X would have
+    recovered N" -- the benefit alone. It argued for the 2026-08-28 move from
+    2.0 to 1.0, which the outcome then vindicated, but it would have argued
+    for that move just as loudly had the outcome been the opposite: a count
+    that can only go up is not evidence. See decline_split.__doc__ for the
+    back-test that dates both bounds.
+    """
+    print()
+    print("      What LOWERING the threshold would do. `hurt` weights the")
+    print(f"      declines the user resolved on the head by sample_ok={sample_ok},")
+    print(f"      because ShouldRecord keeps only 1 in {sample_ok} of those and every")
+    print(f"      one of the wins in full -- the two sides are not counted at")
+    print(f"      the same rate, and the raw counts are in the last column.")
+    print()
+    print(f"      {'to':>6}  {'promotes':>8} {'helps':>6} {'hurts':>6}   "
+         f"{'accept: naive':>13} {'weighted':>9}   raw win/head/other")
+    for threshold in RECOVERY_THRESHOLDS:
+        at = split["blocked_at"][threshold]
+        obs = at["obs_helped"] + at["obs_hurt_head"] + at["obs_hurt_other"]
+        if not obs:
+            print(f"      {threshold:>6}  {'--':>8} {'--':>6} {'--':>6}   "
+                 f"{'(nothing blocked reaches this threshold)':>39}")
+            continue
+        weighted = at["w_helped"] + at["w_hurt"]
+        print(f"      {threshold:>6}  {weighted:>8} {at['w_helped']:>6} {at['w_hurt']:>6}   "
+             f"{at['naive_accept']:>12.0%} {at['weighted_accept']:>9.0%}   "
+             f"{at['obs_helped']}/{at['obs_hurt_head']}/{at['obs_hurt_other']}")
+    print()
+    print("      Read the pair as a range, never either half. Both bounds were")
+    print("      wrong at the one change with a known answer (78% / 38% against")
+    print("      a measured 66%), and they were wrong in opposite directions.")
+    print("      A threshold is worth taking when the RANGE clears the accept")
+    print("      rate the promotions already achieve, printed above as the")
+    print("      LLM path's own accepted share -- not when the naive half does.")
+    if implied is None:
+        print("      sample_ok could not be checked: no stats lines, or no sampled")
+        print("      hits to divide by. The weighted column rests on the flag alone.")
+    elif not 0.7 <= implied / sample_ok <= 1.4:
+        print(f"      !!  the stats lines imply sample_ok is about {implied:.0f}, not")
+        print(f"          {sample_ok}. The weighted column is scaled by the wrong")
+        print(f"          factor -- pass --sample-ok {implied:.0f}, or split the files by")
+        print("          the era in which the schema key changed.")
+    else:
+        print(f"      (sample_ok={sample_ok} checks out: the stats denominator implies "
+             f"{implied:.1f})")
+
+
+def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
     """How the LLM's declines break down, and what a lower margin would buy.
 
     Two kinds with opposite fixes:
@@ -548,9 +616,34 @@ def decline_split(db):
                it. When that something is what the user then chose
                (`best_is_sel`), a lower threshold would have fixed the
                segment outright.
+
+    `blocked_at[threshold]` is what LOWERING the margin to `threshold` would
+    actually do, and it has two sides. `recovered_at` (kept, and still the
+    benefit alone) counts only the segments a lower threshold would win. The
+    ones it would lose are the blocked declines the user resolved by taking
+    the head -- and those are precisely the events ShouldRecord samples at
+    1 in `sample_ok`, so counting the two sides off the same raw log
+    understates the harm `sample_ok`-fold.
+
+    Two rates come back because neither is trustworthy alone:
+
+      naive_accept     obs_helped / observations. What this function used to
+                       imply. Optimistic: the harm side is undercounted.
+      weighted_accept  w_helped / (w_helped + w_hurt), the sampled cases
+                       weighted back up. Pessimistic: `sample_ok` multiplies
+                       a count that is often a handful, so its Poisson noise
+                       is multiplied with it.
+
+    Back-tested against the only threshold change with a known answer. Over
+    the pre-2026-08-28 log the [1.0, 2.0) band read 78% naive and 38%
+    weighted; margin then moved 2.0 -> 1.0 and the band measured 66% on 99
+    promotions, which are recorded in full and so unbiased. The truth was
+    between the bounds and the naive number alone would have overstated the
+    case by 12 points. Quote the pair, not either half.
     """
     rows = db.execute(
-        "SELECT decline_kind, best_is_sel, llm_margin FROM ev WHERE decline_kind IS NOT NULL"
+        f"SELECT decline_kind, best_is_sel, llm_margin, sel_idx, {FULLY_RECORDED_SQL}"
+        " FROM ev WHERE decline_kind IS NOT NULL"
     ).fetchall()
     split = {
         "agreed": 0,
@@ -558,19 +651,73 @@ def decline_split(db):
         "blocked": 0,
         "blocked_and_wanted": 0,
         "recovered_at": {t: 0 for t in RECOVERY_THRESHOLDS},
+        "blocked_at": {t: {"obs_helped": 0, "obs_hurt_head": 0, "obs_hurt_other": 0,
+                           "w_helped": 0, "w_hurt": 0}
+                       for t in RECOVERY_THRESHOLDS},
     }
-    for kind, best_is_sel, margin in rows:
+    for kind, best_is_sel, margin, sel_idx, fully in rows:
         if kind in ("agreed", "gated"):
             split[kind] += 1
             continue
         split["blocked"] += 1
-        if not best_is_sel:
+        if best_is_sel:
+            split["blocked_and_wanted"] += 1
+        if margin is None:
             continue
-        split["blocked_and_wanted"] += 1
+        # One observation stands for `sample_ok` segments when ShouldRecord
+        # sampled it. For a decline that is exactly the case where the user
+        # resolved the segment on the head -- i.e. every one of the cases a
+        # lower threshold would HARM. Counting them raw is what makes the
+        # one-sided number look like a recommendation.
+        weight = 1 if fully else sample_ok
         for threshold in RECOVERY_THRESHOLDS:
-            if margin is not None and margin >= threshold:
+            if margin < threshold:
+                continue
+            at = split["blocked_at"][threshold]
+            if best_is_sel:
+                at["obs_helped"] += 1
+                at["w_helped"] += weight
                 split["recovered_at"][threshold] += 1
+            else:
+                if sel_idx == 0:
+                    at["obs_hurt_head"] += 1
+                else:
+                    at["obs_hurt_other"] += 1
+                at["w_hurt"] += weight
+    for at in split["blocked_at"].values():
+        obs = at["obs_helped"] + at["obs_hurt_head"] + at["obs_hurt_other"]
+        weighted = at["w_helped"] + at["w_hurt"]
+        # None, not 0.0: "no blocked decline reached this threshold" and "every
+        # one of them was wrong" are opposite findings.
+        at["naive_accept"] = at["obs_helped"] / obs if obs else None
+        at["weighted_accept"] = at["w_helped"] / weighted if weighted else None
     return split
+
+
+def implied_sample_ok(db):
+    """The 1-in-N factor actually in force, recovered from the stats lines.
+
+    `sample_ok` is a schema key no line carries, and a wrong assumption
+    silently scales one side of decline_split's table. The stats stream counts
+    EVERY segment the scorer looked at, and the event stream keeps
+    `FULLY_RECORDED_SQL` of them plus 1 in N of the rest, so
+
+        N = (segments - fully_recorded_events) / sampled_events
+
+    Returns None rather than a number when it cannot be computed -- no stats
+    lines, or no sampled hits to divide by. The two streams do not cover
+    exactly the same population (an AutoSpacer bail-out reaches the stats line
+    and never becomes an event), so treat this as a check on the ORDER of the
+    assumed value, not as a replacement for it.
+    """
+    segments = db.execute("SELECT COALESCE(SUM(segments), 0) FROM stats").fetchone()[0]
+    if not segments:
+        return None
+    full = db.execute(f"SELECT COUNT(*) FROM ev WHERE {FULLY_RECORDED_SQL}").fetchone()[0]
+    sampled = db.execute(f"SELECT COUNT(*) FROM ev WHERE NOT {FULLY_RECORDED_SQL}").fetchone()[0]
+    if not sampled:
+        return None
+    return (segments - full) / sampled
 
 
 def displaced_heads(db, limit=10):
@@ -599,8 +746,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("paths", nargs="+", help="JSONL files from any number of machines")
     ap.add_argument("--top", type=int, default=30, help="rows in the per-character tables")
+    ap.add_argument("--sample-ok", type=int, default=DEFAULT_SAMPLE_OK,
+                   help="copilot/telemetry/sample_ok as it was when these lines were "
+                        "written (default %(default)s). Only the LLM decline table uses "
+                        "it; the report prints the value implied by the stats lines "
+                        "beside it, so a wrong one is visible rather than silent.")
     args = ap.parse_args()
+    if args.sample_ok < 1:
+        ap.error("--sample-ok must be at least 1 (1 means nothing was sampled)")
 
+    sample_ok = args.sample_ok
     db, skipped = load(args.paths)
     # Before the `total` check, not after: a file whose every line was skipped
     # has total == 0, and reporting only "No events" would read as "telemetry is
@@ -749,7 +904,7 @@ def main():
               " ELSE '08+' END",
               where="llm_from > 0", promoted_col="llm_promoted",
               verdict_col="llm_verdict", altered_col="llm_head_altered")
-    split = decline_split(db)
+    split = decline_split(db, sample_ok=sample_ok)
     total_declines = split["agreed"] + split["gated"] + split["blocked"]
     if total_declines:
         print(f"\n  LLM declined on {total_declines} segment(s)")
@@ -765,9 +920,7 @@ def main():
         if split["blocked"]:
             print(f"      of those, the model's pick is what the user chose: "
                  f"{split['blocked_and_wanted']}")
-            for threshold in RECOVERY_THRESHOLDS:
-                print(f"      margin {threshold} would have recovered: "
-                     f"{split['recovered_at'][threshold]}")
+            _print_threshold_table(split, sample_ok, implied_sample_ok(db))
         print("\n  `agreed` is the share a lower margin cannot fix, and it is the only")
         print("  one that says the MODEL is the limit -- when it dominates, the next")
         print("  lever is tools/rime_train/. `gated` looks identical in the log and")

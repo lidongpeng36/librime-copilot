@@ -182,6 +182,124 @@ class DeclineSplit(unittest.TestCase):
         self.assertEqual(split["recovered_at"][1.0], 0)
 
 
+class LoweringTheThresholdHasTwoSides(unittest.TestCase):
+    """`recovered_at` counts only what a lower margin would WIN, and the cases
+    it would LOSE are the ones ShouldRecord samples at 1-in-`sample_ok`
+    (telemetry_event.h:235 keeps every promotion and every miss, and only one
+    plain success in N). Counting the two sides off the same raw log therefore
+    understates the harm `sample_ok`-fold, which is how a one-sided number gets
+    read as a recommendation.
+
+    Back-tested against the one threshold change with a known answer: over the
+    pre-2026-08-28 log the naive count predicted 78% for the [1.0, 2.0) band,
+    the weighted count predicted 38%, and the band measured 66% once margin
+    actually moved to 1.0. Both bounds are wrong; only the naive one is wrong
+    in the direction that argues for the change.
+    """
+
+    def _split(self, sample_ok=20):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        for e in [
+            # The model was right and the user reached past the head for it.
+            # sel_idx != 0, so ShouldRecord kept it in full: weight 1.
+            {"v": 3, "sel": "那里", "sel_idx": 1, "top": ["哪里", "那里"],
+             "llm": {"incumbent": "哪里", "best": "那里", "margin": 0.6,
+                     "skip": "margin", "n_scored": 4, "dropped": []}},
+            # The model was wrong and the user took the head. sel_idx == 0 and
+            # nothing was promoted, so this is the 1-in-N sampled case: one
+            # observation stands for `sample_ok` of them.
+            {"v": 3, "sel": "哪里", "sel_idx": 0, "top": ["哪里", "那里"],
+             "llm": {"incumbent": "哪里", "best": "那里", "margin": 0.7,
+                     "skip": "margin", "n_scored": 4, "dropped": []}},
+            # The model was wrong and the user took neither. Kept in full.
+            {"v": 3, "sel": "别的", "sel_idx": 3, "top": ["哪里", "那里"],
+             "llm": {"incumbent": "哪里", "best": "那里", "margin": 0.8,
+                     "skip": "margin", "n_scored": 4, "dropped": []}},
+        ]:
+            analyze._load_event_line(db, e)
+        return analyze.decline_split(db, sample_ok=sample_ok)
+
+    def test_the_harm_side_is_counted_at_all(self):
+        at = self._split()["blocked_at"][0.5]
+        self.assertEqual(at["obs_helped"], 1)
+        self.assertEqual(at["obs_hurt_head"], 1)
+        self.assertEqual(at["obs_hurt_other"], 1)
+
+    def test_a_decline_the_user_resolved_on_the_head_is_weighted(self):
+        at = self._split(sample_ok=20)["blocked_at"][0.5]
+        # 1 * 20 for the sampled head-pick, plus 1 for the third candidate.
+        self.assertEqual(at["w_hurt"], 21)
+        self.assertEqual(at["w_helped"], 1)
+
+    def test_the_weight_follows_sample_ok_rather_than_being_hard_coded(self):
+        self.assertEqual(self._split(sample_ok=1)["blocked_at"][0.5]["w_hurt"], 2)
+        self.assertEqual(self._split(sample_ok=50)["blocked_at"][0.5]["w_hurt"], 51)
+
+    def test_both_bounds_are_reported_and_the_naive_one_is_the_optimistic_one(self):
+        at = self._split()["blocked_at"][0.5]
+        # naive: 1 of 3 raw observations. weighted: 1 of 22.
+        self.assertAlmostEqual(at["naive_accept"], 1 / 3)
+        self.assertAlmostEqual(at["weighted_accept"], 1 / 22)
+        self.assertGreater(at["naive_accept"], at["weighted_accept"])
+
+    def test_a_threshold_above_every_blocked_margin_promotes_nothing(self):
+        at = self._split()["blocked_at"][1.0]
+        self.assertEqual((at["obs_helped"], at["obs_hurt_head"], at["obs_hurt_other"]),
+                         (0, 0, 0))
+        self.assertIsNone(at["naive_accept"])
+        self.assertIsNone(at["weighted_accept"])
+
+    def test_recovered_at_keeps_meaning_the_benefit_side_alone(self):
+        split = self._split()
+        self.assertEqual(split["recovered_at"][0.5], split["blocked_at"][0.5]["obs_helped"])
+
+
+class ImpliedSampleOk(unittest.TestCase):
+    """`sample_ok` is a schema key the log does not carry, so the report has to
+    be told it -- and a wrong value silently scales one side of the table
+    above. The stats lines make it checkable: they count EVERY segment, so
+    `(segments - fully_recorded) / sampled` recovers the factor that was
+    actually in force."""
+
+    def _db(self, events, segments):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        for e in events:
+            analyze._load_event_line(db, e)
+        analyze._load_stats_line(db, {"v": 6, "type": "stats", "ts": "2026-09-01T10:00:00+0800",
+                                      "segments": segments, "llm_acted": segments})
+        return db
+
+    def test_the_factor_is_recovered_from_the_stats_denominator(self):
+        # 2 misses (kept in full) + 3 sampled hits, over 62 real segments:
+        # (62 - 2) / 3 = 20.
+        events = [{"v": 6, "sel": "那", "sel_idx": 1, "top": ["哪", "那"]},
+                  {"v": 6, "sel": "那", "sel_idx": 2, "top": ["哪", "个", "那"]}]
+        events += [{"v": 6, "sel": "哪", "sel_idx": 0, "top": ["哪"]}] * 3
+        self.assertAlmostEqual(analyze.implied_sample_ok(self._db(events, 62)), 20.0)
+
+    def test_a_promotion_the_user_took_at_the_head_is_not_a_sampled_hit(self):
+        # sel_idx == 0 but promoted, so ShouldRecord kept it in full.
+        events = [{"v": 6, "sel": "那", "sel_idx": 0, "top": ["那"],
+                   "llm_skip": "none",
+                   "llm": {"incumbent": "哪", "text": "那", "best": "那", "from": 1,
+                           "margin": 3.0, "skip": "none", "n_scored": 4, "dropped": []}}]
+        events += [{"v": 6, "sel": "哪", "sel_idx": 0, "top": ["哪"]}] * 2
+        # (21 - 1) / 2 = 10, not (21 - 0) / 3.
+        self.assertAlmostEqual(analyze.implied_sample_ok(self._db(events, 21)), 10.0)
+
+    def test_no_sampled_hits_means_no_estimate_rather_than_a_division(self):
+        events = [{"v": 6, "sel": "那", "sel_idx": 1, "top": ["哪", "那"]}]
+        self.assertIsNone(analyze.implied_sample_ok(self._db(events, 5)))
+
+    def test_no_stats_lines_means_no_estimate(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        analyze._load_event_line(db, {"v": 6, "sel": "哪", "sel_idx": 0, "top": ["哪"]})
+        self.assertIsNone(analyze.implied_sample_ok(db))
+
+
 if __name__ == "__main__":
     unittest.main()
 

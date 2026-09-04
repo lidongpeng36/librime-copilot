@@ -545,13 +545,54 @@ that, and a stale database will otherwise be reported as fresh.
 trained for this input method rather than with the db's n-gram, using the real
 text before the caret. Trained from scratch on 4.5B tokens of Chinese
 (`tools/rime_train/`, and the corpus-pipeline design record kept locally);
-42MB at Q8_0, p50 4.7ms / p99 11.0ms per scoring.
+42MB at Q8_0. The deployed file is `rime40m-v2-q8.gguf`, the 2026-08-22
+retrain -- the vault carries both names on purpose, see `vault.VAULTED_FILES`.
+
+**Its latency is bimodal, and a single p50 describes neither mode.** This file
+used to say "p50 4.7ms / p99 11.0ms per scoring", which is a number from
+`bench_scorer` and not what a machine actually experiences. Measured live over
+524 v6 scorings on two machines, the split is on ONE thing -- whether the batch
+needs a `llama_decode` at all:
+
+| longest candidate in the batch | share | p50 | p95 |
+| --- | --- | --- | --- |
+| 1 character (every candidate one token) | 44% | **0.18 ms** | 0.31 ms |
+| 2+ characters | 56% | **11.1 ms** | 22.7 ms |
+
+`ScoreGroup` (`llm_scorer.cc:484`) scores every candidate's FIRST token off
+`ctx_last_logits_` -- the prefill's own last row, no decode -- and only submits
+`len - 1` tokens per candidate. A window of all single-character candidates
+therefore reaches `n_tok == 0` and never calls `llama_decode`; that is the
+0.18ms mode, and it is essentially free. Anything longer costs exactly one
+decode, and that decode is the whole 11ms.
+
+Two things follow, and both were got wrong before this was measured:
+
+- **Context length is not the cost.** The slow mode is flat in it: p50 11.18ms
+  at a fetched depth of 1-7 characters against 11.58ms at 24-32, and
+  `bench_scorer` on an M4 Pro puts context 32 vs 64 at score p50 2.11 vs
+  2.09ms with prefill (which is background anyway) at 1.86 vs 2.12ms. This is
+  why `context_chars` went to 64 on 2026-09-04 for free.
+- **It is not GPU wake-up either.** Bucketed by idle gap since the previous
+  scoring, the decode-bearing mode is 11.41ms at a gap under 2 seconds and
+  10.06ms at a gap over 10 minutes -- flat.
+
+**Open, and currently unmeasurable: production is ~5x `bench_scorer` for the
+same work.** The bench does the same batch geometry (32-char context, four
+two-character candidates, GPU) and reports score p50 2.11ms / p99 3.70ms on
+the same machine that logs 11.1ms live. The instrument cannot settle it,
+because `trace.score_us` (`rerank_filter.cc:187-191`) wraps the whole
+`LlmScorer::Score()` call INCLUDING its wait on `model_mutex_` -- which
+`Prefill()` holds for the duration of a background warm, and warms fire on
+every commit and every composition start, i.e. milliseconds before the Apply
+that needs to score. Splitting that wait out of the work is the next
+measurement, not another guess.
 
 Three artifacts have to be present:
 
 | artifact | how it travels | check |
 | --- | --- | --- |
-| `private/rime40m-q8.gguf` | **vaulted** — `rime-copilot restore` brings it down; `install-model --from PATH` is the manual route | `rime-copilot status` → `model:` |
+| `private/rime40m-v2-q8.gguf` | **vaulted** — `rime-copilot restore` brings it down; `install-model --from PATH` is the manual route. The pre-retrain `rime40m-q8.gguf` is vaulted alongside it and is what the schema named before 2026-08-22 | `rime-copilot status` → `model:` |
 | `private/zh-hans-t-essay-bgw.gram` | `rime-copilot fetch-grammar` (public download) | `rime-copilot status` → `grammar:` |
 | `librime-copilot.dylib` | built from a librime checkout, copied into `Squirrel.app` by hand | — |
 
@@ -776,10 +817,39 @@ behaviour and is left for real use — or a better instrument — to decide:
   has no measurement below 1. The code default stays 2.0. Note the accept rate
   before and after the change is not one quantity — every promotion in the log
   cleared whatever margin its machine was running.
+
+  **That live evidence was a one-sided count, and the move was right by luck.**
+  `decline_split` reported only what a lower threshold would WIN. What it would
+  LOSE — the blocked declines the user resolved by taking the head — it never
+  counted, and those are exactly the events `ShouldRecord`
+  (`telemetry_event.h:235`) samples at 1 in `sample_ok`: it keeps every
+  promotion and every miss in full, and one plain success in 20. So the two
+  sides of the question were not being counted at the same rate, and the half
+  that argued for the change was the fully-recorded one. A count that can only
+  go up is not evidence.
+
+  The outcome vindicated it anyway. Promotions ARE recorded in full, so the
+  band the change unlocked is measurable without correction: `[1.0, 2.0)`
+  promoted 99 times at a 66% accept rate against 71% for the `>= 2.0` band that
+  was already promoting — net +65 / −34. That 66% is the one back-test this
+  question has, and it dates both bounds: over the pre-2026-08-28 log the same
+  band read **78% naive and 38% sampling-weighted**. Both were wrong; only the
+  naive one was wrong in the direction that argued for the change.
+
+  `analyze_telemetry.py` now prints the pair (`_print_threshold_table`), never
+  either half, and checks the `sample_ok` it was told against the factor the
+  stats lines imply (`implied_sample_ok` — the stats stream counts every
+  segment, so the weight does not have to be trusted). **Read the range against
+  the accept rate the promotions already achieve.** On the post-2026-08-28 log
+  that is why 0.5 has NOT been taken: it would promote 79 more at an accept
+  range of 18–64%, against the 69% the current promotions manage.
 - **`copilot/rerank/same_span_only`** (default true) — whether a promotion may
   take a candidate covering a *different amount of input* than the one it
   displaces. False is worth +4.5 points of segments and costs p99 11.0ms →
-  15.1ms, and changes how much input Space commits.
+  15.1ms, and changes how much input Space commits. (Both latencies are
+  `bench_scorer` figures — see the bimodality note under "Neural re-ranking"
+  for why a live p99 is roughly 2x either of them, and why the difference is
+  one `llama_decode`, not context length.)
 - **`copilot/rerank/llm/require_han_context`** (default true) — the Han-context
   gate. See "What is NOT built" below: it blocks 42.9% of all segments, lifting
   it is safe, and lifting it changes the output on 75 of 27245. Stays true on
@@ -798,7 +868,8 @@ behaviour and is left for real use — or a better instrument — to decide:
 **`copilot/rerank/llm/battery_active` (default false) is the one whose default
 is now known to be wrong.** Its README justification was "the model's CPU cost
 is exactly the kind of thing a laptop should shed on battery"; measured, one
-prefill-plus-scoring is ~3.9ms of GPU and ~1.9ms of CPU, so a dense 1000
+prefill-plus-scoring is ~3.9ms of GPU and ~1.9ms of CPU (a `bench_scorer`
+figure; live, 56% of scorings pay a decode and cost ~11ms), so a dense 1000
 commits an hour is ~0.012 Wh/h against a laptop's 8-15W — about 0.1% of
 consumption, and the GPU is already awake rendering the candidate window at
 exactly those moments. `true` is the recommendation; the default stays `false`
