@@ -20,6 +20,9 @@
 #include "db_provider.h"
 #include "llm_provider.h"
 #include "llm_scorer.h"
+#ifdef COPILOT_WITH_MLX
+#include "mlx_scorer.h"
+#endif
 #include "utils.h"
 
 namespace rime {
@@ -178,6 +181,14 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   bool rerank_llm_enable = false;
   string rerank_llm_model;
   LlmScorerOptions rerank_llm_scorer;
+  // copilot/rerank/llm/backend: llama | mlx. Defaults to llama everywhere --
+  // llama.cpp is what Linux builds, what the prediction provider uses, and the
+  // reference the MLX path is verified against.
+  std::string rerank_llm_backend = "llama";
+  // Read here rather than at the construction site: `config` is scoped to the
+  // block above, and every other option on this path is read in one place.
+  bool rerank_mlx_compile = true;
+  bool rerank_mlx_f16 = true;
   if (auto* schema = ticket.schema) {
     auto* config = schema->config();
     if (config->GetString("copilot/db", &db_name)) {
@@ -207,6 +218,9 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     // before tools/bench_scorer.cc made them measurable; see LlmScorerOptions.
     config->GetInt("copilot/rerank/llm/n_gpu_layers", &rerank_llm_scorer.n_gpu_layers);
     config->GetInt("copilot/rerank/llm/n_threads", &rerank_llm_scorer.n_threads);
+    config->GetString("copilot/rerank/llm/backend", &rerank_llm_backend);
+    config->GetBool("copilot/rerank/llm/mlx_compile", &rerank_mlx_compile);
+    config->GetBool("copilot/rerank/llm/mlx_f16", &rerank_mlx_f16);
   }
   std::shared_ptr<::copilot::History> history = std::make_shared<::copilot::History>(100);
   // `enable` gates CONSTRUCTION, not just output, and that distinction is the
@@ -256,7 +270,34 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
         the<ResourceResolver>(Service::instance().CreateResourceResolver(kCopilotLLMResourceType));
     auto model_path = r->ResolvePath(rerank_llm_model);
     if (std::filesystem::exists(model_path)) {
+#ifdef COPILOT_WITH_MLX
+      // Runtime, not build time. The two backends read the SAME gguf -- MLX's
+      // loader converts ggml Q8_0 into its own packed 8-bit affine form and
+      // agrees with llama.cpp's logprobs to 0.0023 -- so switching is a config
+      // edit and a redeploy, with no new artifact and nothing to keep in sync.
+      // That is what makes an A/B on one machine possible at all; a
+      // compile-time choice would mean two builds and two measurements taken
+      // at different times, which this project has already been bitten by.
+      if (rerank_llm_backend == "mlx") {
+        MlxScorerOptions mlx_options;
+        mlx_options.compile = rerank_mlx_compile;
+        mlx_options.f16 = rerank_mlx_f16;
+        LOG(INFO) << "[copilot] rerank llm: backend=mlx, compile=" << mlx_options.compile;
+        scorer = std::make_unique<MlxScorer>(model_path, mlx_options);
+      } else {
+        scorer = std::make_unique<LlmScorer>(model_path, rerank_llm_scorer);
+      }
+#else
+      if (rerank_llm_backend == "mlx") {
+        // Named rather than ignored: a schema asking for a backend this build
+        // does not have would otherwise run llama.cpp and report nothing,
+        // which is the shape of every silent-fallback bug this tree records.
+        LOG(WARNING) << "[copilot] rerank llm: backend=mlx requested, but this build has no "
+                        "MLX support (configure with -DCOPILOT_WITH_MLX=ON on Apple). "
+                        "Using llama.cpp.";
+      }
       scorer = std::make_unique<LlmScorer>(model_path, rerank_llm_scorer);
+#endif
     } else {
       LOG(ERROR) << "[copilot] rerank llm: model not found at " << model_path
                  << " (copilot/rerank/llm/model: " << rerank_llm_model << ")";

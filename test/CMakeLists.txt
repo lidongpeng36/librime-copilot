@@ -67,7 +67,7 @@ if(BUILD_MERGED_PLUGINS)
 else()
   add_executable(copilot_test
     ${copilot_test_src}
-    $<TARGET_OBJECTS:rime-copilot-objs>)
+    ${COPILOT_ALL_OBJS})
   target_link_libraries(copilot_test
     ${LINK_LIBS}
     ${rime_library}

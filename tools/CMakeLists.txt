@@ -4,7 +4,7 @@ include_directories(../src)
 
 add_executable(build_copilot
   build_copilot.cc
-  $<TARGET_OBJECTS:rime-copilot-objs>)
+  ${COPILOT_ALL_OBJS})
 target_link_libraries(build_copilot
   ${LINK_LIBS}
   ${rime_library}
@@ -12,7 +12,7 @@ target_link_libraries(build_copilot
 
 add_executable(dump_copilot
   dump_copilot.cc
-  $<TARGET_OBJECTS:rime-copilot-objs>)
+  ${COPILOT_ALL_OBJS})
 target_link_libraries(dump_copilot
   ${LINK_LIBS}
   ${rime_library}
@@ -20,7 +20,7 @@ target_link_libraries(dump_copilot
 
 add_executable(replay_copilot
   replay_copilot.cc
-  $<TARGET_OBJECTS:rime-copilot-objs>)
+  ${COPILOT_ALL_OBJS})
 target_link_libraries(replay_copilot
   ${LINK_LIBS}
   ${rime_library}
@@ -49,6 +49,20 @@ add_executable(bench_scorer
   bench_scorer.cc)
 target_link_libraries(bench_scorer
   ${LINK_LIBS})
+
+# The two backends through the real Scorer seam, in one process. Unlike
+# score_candidates and bench_scorer above, this one deliberately DOES link the
+# plugin objects: measuring the shipped classes is the whole point, and that
+# brings rime and glog with it.
+if(TARGET rime-copilot-mlx)
+  add_executable(bench_backends
+    bench_backends.cc
+    ${COPILOT_ALL_OBJS})
+  target_link_libraries(bench_backends
+    ${LINK_LIBS}
+    ${rime_library}
+    ${rime_dict_library})
+endif()
 
 if(APPLE)
   find_library(APPSERVICES_LIBRARY ApplicationServices REQUIRED)
