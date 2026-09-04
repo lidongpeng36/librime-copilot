@@ -735,6 +735,18 @@ void Copilot::WarmRerankContext(Context* ctx, const string& extra_committed) {
   if (context.empty()) {
     return;
   }
+  // Classified BEFORE WarmUp, because WarmUp's own dedupe hides the answer:
+  // it returns early for a context already hot, so counting inside the scorer
+  // would never see the `dedup` class at all -- and that class is a third of
+  // the question, since a warm that does nothing is a prefill an incremental
+  // path would not have to make cheaper.
+  //
+  // `last_warm_context_` is this object's, not the scorer's: the question is
+  // about the sequence of contexts the plugin ASKS for, which is a property of
+  // the trigger sites (commit, composition start, AutoSpacer), not of what the
+  // scorer decided to do with them.
+  stats_.ObserveWarm(context, last_warm_context_);
+  last_warm_context_ = context;
   scorer->WarmUp(context);
 }
 

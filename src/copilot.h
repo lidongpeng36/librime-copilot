@@ -115,6 +115,11 @@ class Copilot : public Processor {
   // empty/zero, which is also the "not yet observed anything" state
   // FlushStatsIfAny relies on to skip an all-zero line.
   telemetry::StatsAccumulator stats_;
+  // The previous context handed to Scorer::WarmUp, for ObserveWarm's
+  // classification. Not cleared with the stats window: the question is whether
+  // consecutive warms extend each other, and a window boundary is not a break
+  // in that sequence.
+  string last_warm_context_;
   // 0 means "no window open yet"; the first commit after construction (or
   // after a flush) opens one instead of firing immediately, so a session that
   // never commits again after startup does not need a special case here --

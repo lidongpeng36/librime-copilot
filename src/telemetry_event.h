@@ -66,7 +66,20 @@ namespace telemetry {
 // line carries none of the three, and absent must be read as "not measured" --
 // in particular `n_decoded` absent is NOT 0, which is a real and common
 // measurement (see LlmRecord).
-inline constexpr int kSchemaVersion = 7;
+//
+// v8 adds `warm_counts` and `warm_extend_chars_p50` to StatsLine: how each
+// warm-up related to the one before it (dedup | extend | rebuild) and, for the
+// extends, how many characters were appended. It measures whether an
+// INCREMENTAL prefill would apply -- today both backends wipe the KV cache and
+// re-decode the whole context on every warm, and whether that is worth fixing
+// depends entirely on how often the new context merely extends the old one.
+//
+// Deliberately a classification and a count, never the context itself. A
+// scoring context is the user's own text; the evaluation corpus is kept off
+// the public remote for exactly that reason, and a field carrying 64
+// characters of it per warm would move that text into a file no such decision
+// was made about. A v7 line carries neither field.
+inline constexpr int kSchemaVersion = 8;
 
 // What the re-ranking filter decided for one segment.
 struct RerankRecord {
@@ -175,6 +188,9 @@ struct StatsLine {
   // doesn't already refute. Warm-hit rate is therefore
   // `llm_acted / (llm_acted + skip_counts["cold"])`, computed by the
   // analyser from the two numbers that do carry independent information.
+  // v8. dedup | extend | rebuild -- see StatsAccumulator::ObserveWarm.
+  std::map<std::string, int64_t> warm_counts;
+  double warm_extend_chars_p50 = 0.0;
   std::map<std::string, int64_t> skip_counts;  // SkipReasonName() -> count,
                                                // over every segment, so a
                                                // spike in one reason (e.g.
@@ -379,6 +395,22 @@ inline std::string SerializeStatsJsonl(const StatsLine& s) {
   // did not record it" from any value. See StatsLine's field comment.
   if (s.fetch_chars >= 0) {
     j["fetch_chars"] = s.fetch_chars;
+  }
+  // Omitted when no warm happened in the window, rather than written as an
+  // empty object: "no warms" and "warms that classified as nothing" would
+  // otherwise look the same, and the second is not a state ObserveWarm can
+  // produce.
+  if (!s.warm_counts.empty()) {
+    nlohmann::ordered_json warm;
+    for (const auto& [k, v] : s.warm_counts) {
+      warm[k] = v;
+    }
+    j["warm_counts"] = std::move(warm);
+    // Only meaningful when something extended; an all-rebuild window has no
+    // appended-character count to report.
+    if (s.warm_counts.count("extend")) {
+      j["warm_extend_chars_p50"] = s.warm_extend_chars_p50;
+    }
   }
   return j.dump();
 }

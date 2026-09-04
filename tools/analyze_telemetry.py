@@ -105,6 +105,12 @@ CREATE TABLE stats (
   -- fetches THIS cap cut short, so the two must never be summed across
   -- different values of it.
   fetch_chars INT
+  ,
+  -- v8. The median characters appended when a warm EXTENDED the previous
+  -- context. NULL on an earlier line and on a v8 window where nothing
+  -- extended -- "not measured" and "measured zero appended characters" are
+  -- different, and the second is not a state ObserveWarm can produce.
+  warm_extend_chars_p50 REAL
 );
 
 -- One row per (stats line, skip reason) pair, flattened out of that line's
@@ -125,6 +131,13 @@ CREATE TABLE skip (
 -- This table is the unbiased one, and it is the only one whose numbers should
 -- be quoted when deciding whether to reach deeper.
 CREATE TABLE trunc (
+  ts TEXT, kind TEXT, count INT
+);
+
+-- One row per (stats line, warm class) pair -- dedup|extend|rebuild. Same
+-- shape and same reason as `skip` and `trunc` above. v8 and later only; an
+-- earlier line contributes no rows, which is "not measured" rather than zero.
+CREATE TABLE warm (
   ts TEXT, kind TEXT, count INT
 );
 
@@ -161,7 +174,12 @@ CREATE TABLE recorder (
 # cheap mode rather than a missing measurement. `us` is unchanged. All three
 # are omitted when unmeasured, so a v6 line loads with them NULL and absent
 # must never be read as 0.
-SCHEMA_VERSION = 7
+# v8 adds `warm_counts` (dedup | extend | rebuild) and `warm_extend_chars_p50`
+# to StatsLine: whether an incremental prefill would apply at all. Both
+# backends currently re-decode the whole context on every warm, and whether
+# that is worth fixing depends entirely on how often the new context merely
+# extends the old one. A classification and a count, never the context itself.
+SCHEMA_VERSION = 8
 
 # Below this many samples a percentage is noise, and the first percentage this
 # report prints becomes the baseline every later change is quoted against. The
@@ -447,6 +465,15 @@ def _load_stats_line(db, e):
     for kind, count in (trunc_counts or {}).items():
         if not isinstance(kind, str) or isinstance(count, bool) or not isinstance(count, (int, float)):
             raise ValueError("trunc_counts entry is not a str -> number mapping")
+    # v8. Same validate-then-default shape: a malformed object rejects the
+    # whole line rather than contributing a partial row.
+    warm_counts = e.get("warm_counts")
+    if warm_counts is not None and not isinstance(warm_counts, dict):
+        raise ValueError("warm_counts is not a JSON object")
+    for kind, count in (warm_counts or {}).items():
+        if (not isinstance(kind, str) or isinstance(count, bool)
+                or not isinstance(count, (int, float))):
+            raise ValueError("warm_counts entry is not a str -> number mapping")
     us_p50 = e.get("us_p50")
     us_p95 = e.get("us_p95")
     # Absent on v4, and on a v5 window that saw no environment-truncated
@@ -464,13 +491,15 @@ def _load_stats_line(db, e):
     # midway through skip_counts or trunc_counts must not leave this line's
     # `stats` row written while its child rows are half-missing -- the
     # exception the caller catches has no transaction to roll that back out.
-    db.execute("INSERT INTO stats VALUES (?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO stats VALUES (?,?,?,?,?,?,?,?,?)",
               (e.get("ts"), segments, llm_acted, us_p50, us_p95, depth_p50, depth_p95,
-               fetch_chars))
+               fetch_chars, e.get("warm_extend_chars_p50")))
     for reason, count in (skip_counts or {}).items():
         db.execute("INSERT INTO skip VALUES (?,?,?)", (e.get("ts"), reason, count))
     for kind, count in (trunc_counts or {}).items():
         db.execute("INSERT INTO trunc VALUES (?,?,?)", (e.get("ts"), kind, count))
+    for kind, count in (warm_counts or {}).items():
+        db.execute("INSERT INTO warm VALUES (?,?,?)", (e.get("ts"), kind, count))
 
 
 def rate_table(db, title, expr, where="rr_from > 0", limit=None,
@@ -796,6 +825,7 @@ def main():
         print("No per-event lines (only stats lines) in the given files.")
         _print_skip_distribution(db)
         _print_latency_split(db)
+        _print_warm_split(db)
         _print_fetch_truncation(db)
         return 0
 
@@ -844,6 +874,7 @@ def main():
         # head_altered (a db-`rr` concept) has no bearing on.
         _print_skip_distribution(db)
         _print_latency_split(db)
+        _print_warm_split(db)
         _print_fetch_truncation(db)
         return 0
 
@@ -985,6 +1016,7 @@ def main():
 
     _print_skip_distribution(db)
     _print_latency_split(db)
+    _print_warm_split(db)
     _print_fetch_truncation(db)
     print()
     return 0
@@ -1159,6 +1191,67 @@ def _pctl(xs, p):
         return None
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(p * len(xs)))]
+
+
+def warm_split(db):
+    """[(kind, count)] over dedup|extend|rebuild, commonest first.
+
+    The applicability of an incremental prefill, and nothing else. Today both
+    backends wipe the KV cache and re-decode the whole context on every warm --
+    14.7 ms on llama.cpp, 22.0 ms on MLX -- and most of that work is already in
+    the cache the rebuild just discarded. Whether that is worth fixing depends
+    entirely on how often the new context merely EXTENDS the old one, which
+    nothing in this tree could see before v8.
+
+      dedup    the same context as last time; WarmUp returns early and no
+               prefill happens at all. Not work an incremental path would make
+               cheaper, so counting it as a win would overstate the case.
+      extend   the previous context is a prefix of this one. The cached keys
+               and values are still valid at the positions they hold, and only
+               the appended characters would need decoding.
+      rebuild  everything else -- the window slid past `context_chars`, the
+               caret moved, the app changed. Positions shift and the cache is
+               worthless.
+    """
+    return [tuple(r) for r in db.execute(
+        "SELECT kind, SUM(count) FROM warm GROUP BY kind ORDER BY SUM(count) DESC")]
+
+
+def _print_warm_split(db):
+    print("\n" + "=" * 64)
+    print("WARM-UP REUSE  how much of each prefill was already in the cache")
+    print("=" * 64)
+    rows = warm_split(db)
+    total = sum(n for _, n in rows)
+    if not total:
+        print("  (no v8 line yet: every recorder here predates the warm counters, or none")
+        print("   of their windows saw a warm-up. Both backends re-decode the whole context")
+        print("   on every warm and nothing before v8 could say how often that was waste.)")
+        return
+    print(f"  {'class':10s} {'n':>7s} {'share':>7s}")
+    for kind, n in rows:
+        print(f"  {kind:10s} {n:>7d} {n / total:>7.1%}")
+    extend = dict(rows).get("extend", 0)
+    chars = db.execute(
+        "SELECT AVG(warm_extend_chars_p50) FROM stats WHERE warm_extend_chars_p50 > 0"
+    ).fetchone()[0]
+    print()
+    if total < MIN_N:
+        print(f"  (shares withheld as evidence: {total} warm(s) is below the {MIN_N} this")
+        print("   report will divide by -- the counts above are real, the rates are not)")
+        return
+    if chars:
+        print(f"  when it extended, {chars:.1f} character(s) were appended on average.")
+    print("  `extend` is the share an incremental prefill would turn from a full")
+    print("  re-decode into a few tokens. `dedup` is already free. `rebuild` is the")
+    print("  share no cache strategy short of keeping several slots can help.")
+    if extend / total < 0.2:
+        print()
+        print("  Below a fifth, and the design record says not to build it on less:")
+        print("  an incremental prefill adds a cache-coherence surface to the one part")
+        print("  of this system whose failure is silent -- confident scores about text")
+        print("  the user is not looking at. See the 2026-09-04 incremental-prefill")
+        print("  design, \"the honest case against\".")
 
 
 def _print_latency_split(db):

@@ -40,6 +40,61 @@ RerankTrace FetchTrace(int before_depth, Truncation truncation) {
   return t;
 }
 
+// v8. Whether an incremental prefill would apply is not a property anything in
+// this tree could see: both backends wipe the KV cache and re-decode the whole
+// context on every warm, so "how often does the new context merely extend the
+// old one" had no answer at all.
+TEST(StatsWarm, AnExtensionIsDistinguishedFromARebuild) {
+  StatsAccumulator a;
+  a.ObserveWarm("我们今天", "");            // first ever -> nothing to extend
+  a.ObserveWarm("我们今天要", "我们今天");  // one character appended
+  a.ObserveWarm("完全不同的文字", "我们今天要");
+  const auto s = a.Snapshot("t");
+  EXPECT_EQ(s.warm_counts.at("extend"), 1);
+  EXPECT_EQ(s.warm_counts.at("rebuild"), 2);  // the first one has no predecessor
+  EXPECT_EQ(s.warm_extend_chars_p50, 1.0);
+}
+
+// The class that costs nothing and must not be counted as work: WarmUp returns
+// early for a context already hot, so a repeat is not a prefill an incremental
+// path would make cheaper. Counting it as `extend` would overstate the win.
+TEST(StatsWarm, TheSameContextTwiceIsDedupNotExtend) {
+  StatsAccumulator a;
+  a.ObserveWarm("我们今天", "我们今天");
+  const auto s = a.Snapshot("t");
+  EXPECT_EQ(s.warm_counts.at("dedup"), 1);
+  EXPECT_EQ(s.warm_counts.count("extend"), 0u);
+}
+
+// Characters, not bytes. Every context here is Han, where one character is
+// three bytes -- a byte count would report 3 and make the appended-length
+// distribution useless for sizing the incremental decode.
+TEST(StatsWarm, TheAppendedLengthIsCountedInCharacters) {
+  StatsAccumulator a;
+  a.ObserveWarm("我们今天要讨论", "我们今天");
+  const auto s = a.Snapshot("t");
+  EXPECT_EQ(s.warm_extend_chars_p50, 3.0);
+}
+
+// A window with no warm at all must leave the map empty rather than writing
+// zeroes: SerializeStatsJsonl omits the field entirely in that case, and "no
+// warms" is a different fact from "warms that classified as nothing".
+TEST(StatsWarm, AWindowWithNoWarmReportsNothing) {
+  StatsAccumulator a;
+  const auto s = a.Snapshot("t");
+  EXPECT_TRUE(s.warm_counts.empty());
+}
+
+// Flush clears them, like every other counter here: a window is a window.
+TEST(StatsWarm, TheCountersResetWithTheWindow) {
+  StatsAccumulator a;
+  a.ObserveWarm("abc", "ab");
+  a.Snapshot("t");
+  a.Reset();
+  const auto s = a.Snapshot("t");
+  EXPECT_TRUE(s.warm_counts.empty());
+}
+
 }  // namespace
 
 TEST(Percentile, MatchesCompareRerankPysDefinition) {

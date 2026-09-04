@@ -21,6 +21,7 @@
 #include "rerank_llm.h"  // llm_rerank::SkipReason, SkipReasonName
 #include "rerank_trace.h"
 #include "telemetry_event.h"
+#include "utf8_index.h"
 
 namespace rime {
 namespace telemetry {
@@ -54,6 +55,37 @@ class StatsAccumulator {
   // the LLM did with it: how the fetch was truncated is a property of the
   // frontend, not of the scorer, and a segment the model skipped had its
   // context fetched all the same. See ObserveFetch.
+  // One warm-up, classified against the one before it. Records the CLASS and
+  // a character count, never the context itself: a scoring context is the
+  // user's own text, which is why the evaluation corpus is kept off this
+  // remote at all (CLAUDE.md, "Where the design records live"), and a
+  // telemetry line that carried 64 characters of it per warm would put it
+  // somewhere no such decision was made about.
+  //
+  // The three classes are exactly the applicability of an incremental
+  // prefill, which is the question this exists to answer:
+  //
+  //   dedup   the same context as last time -- the scorer's WarmUp returns
+  //           early and no prefill happens at all
+  //   extend  the previous context is a PREFIX of this one, so its KV entries
+  //           are still valid at the positions they already hold and only the
+  //           new characters would need decoding
+  //   rebuild anything else: the window slid, the caret moved, the app
+  //           changed. Positions shift, so the cache cannot be extended
+  void ObserveWarm(const std::string& context, const std::string& previous) {
+    if (context == previous) {
+      ++warm_counts_["dedup"];
+      return;
+    }
+    if (!previous.empty() && context.rfind(previous, 0) == 0) {
+      ++warm_counts_["extend"];
+      warm_extend_chars_.push_back(
+          static_cast<int64_t>(::copilot::CharCount(context) - ::copilot::CharCount(previous)));
+      return;
+    }
+    ++warm_counts_["rebuild"];
+  }
+
   void Observe(const RerankTrace* trace) {
     ++segments_;
     if (!trace) {
@@ -86,6 +118,8 @@ class StatsAccumulator {
     s.segments = segments_;
     s.llm_acted = llm_acted_;
     s.skip_counts = skip_counts_;
+    s.warm_counts = warm_counts_;
+    s.warm_extend_chars_p50 = Percentile(warm_extend_chars_, 0.5);
     s.us_p50 = Percentile(us_samples_, 0.5);
     s.us_p95 = Percentile(us_samples_, 0.95);
     s.trunc_counts = trunc_counts_;
@@ -105,6 +139,8 @@ class StatsAccumulator {
     llm_acted_ = 0;
     skip_counts_.clear();
     us_samples_.clear();
+    warm_counts_.clear();
+    warm_extend_chars_.clear();
     trunc_counts_.clear();
     depth_samples_.clear();
   }
@@ -138,6 +174,8 @@ class StatsAccumulator {
   int64_t llm_acted_ = 0;
   std::map<std::string, int64_t> skip_counts_;
   std::vector<int64_t> us_samples_;
+  std::map<std::string, int64_t> warm_counts_;
+  std::vector<int64_t> warm_extend_chars_;
   std::map<std::string, int64_t> trunc_counts_;
   std::vector<int64_t> depth_samples_;
 };

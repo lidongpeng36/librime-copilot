@@ -342,6 +342,76 @@ class LatencySplit(unittest.TestCase):
         self.assertIn("shares withheld", buf.getvalue())
 
 
+class WarmSplit(unittest.TestCase):
+    """v8. Both backends re-decode the whole context on every warm, and whether
+    that is worth fixing depends on how often the new context merely extends the
+    old one -- which nothing could see before these counters."""
+
+    def _db(self, warm_counts_list):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        for i, wc in enumerate(warm_counts_list):
+            analyze._load_stats_line(db, {
+                "v": 8, "type": "stats", "ts": f"2026-09-04T10:0{i}:00+0800",
+                "segments": 10, "llm_acted": 10, "warm_counts": wc,
+                "warm_extend_chars_p50": 3.0})
+        return db
+
+    def test_the_three_classes_are_summed_across_windows(self):
+        db = self._db([{"extend": 2, "rebuild": 1}, {"extend": 3, "dedup": 4}])
+        self.assertEqual(dict(analyze.warm_split(db)),
+                         {"extend": 5, "rebuild": 1, "dedup": 4})
+
+    def test_a_v7_line_contributes_no_rows(self):
+        # "not measured" is not "zero": a recorder that predates the counters
+        # must not read as a machine whose warms never extended.
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        analyze._load_stats_line(db, {"v": 7, "type": "stats", "ts": "t",
+                                      "segments": 10, "llm_acted": 10})
+        self.assertEqual(analyze.warm_split(db), [])
+
+    def test_a_malformed_warm_counts_rejects_the_line(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        with self.assertRaises(ValueError):
+            analyze._load_stats_line(db, {"v": 8, "type": "stats", "ts": "t",
+                                          "segments": 1, "llm_acted": 1,
+                                          "warm_counts": {"extend": "many"}})
+
+    def test_no_v8_line_says_so_rather_than_printing_zeroes(self):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_warm_split(db)
+        self.assertIn("no v8 line yet", buf.getvalue())
+
+    def test_a_handful_of_warms_gets_counts_but_no_rates(self):
+        db = self._db([{"extend": 2, "rebuild": 1}])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_warm_split(db)
+        self.assertIn("withheld as evidence", buf.getvalue())
+
+    def test_a_low_extend_share_points_at_the_design_records_warning(self):
+        # The design says not to build an incremental prefill on a small
+        # `extend` share, and the report should say so rather than leaving the
+        # reader to remember it.
+        db = self._db([{"extend": 3, "rebuild": 60}])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_warm_split(db)
+        self.assertIn("Below a fifth", buf.getvalue())
+
+    def test_a_high_extend_share_does_not_carry_that_warning(self):
+        db = self._db([{"extend": 40, "rebuild": 10}])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_warm_split(db)
+        self.assertNotIn("Below a fifth", buf.getvalue())
+
+
 class ImpliedSampleOk(unittest.TestCase):
     """`sample_ok` is a schema key the log does not carry, so the report has to
     be told it -- and a wrong value silently scales one side of the table
