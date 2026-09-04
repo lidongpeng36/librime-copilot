@@ -80,7 +80,26 @@ if (APPLE)
       ${MLX_ROOT}/include/metal_cpp)
     target_link_libraries(rime-copilot-mlx PRIVATE llama nlohmann_json::nlohmann_json)
     set_target_properties(rime-copilot-mlx PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    list(APPEND LINK_LIBS ${MLX_ROOT}/lib/libmlx.dylib)
+    # -L plus -l, NOT the full path to libmlx.dylib. A full path makes CMake
+    # derive an automatic rpath from it and emit that BEFORE anything added
+    # here, so @loader_path ended up second and a deployed plugin still
+    # resolved through the build machine's directory. Spelling both rpaths out
+    # is the only way to control their order, and the order is the whole point.
+    #
+    # @loader_path FIRST, so a deployed plugin finds libmlx beside itself.
+    #
+    # Without this the only rpath is the absolute one CMake derives from
+    # MLX_ROOT -- which on this machine was a pip virtualenv, complete with the
+    # user's name and a python3.12 in the path. That works until the dylib is
+    # copied into Squirrel.app, where it keeps loading MLX out of a
+    # virtualenv that nothing else knows about and that a `pip install --upgrade`
+    # renames. dyld tries rpaths in order, so the build tree still resolves
+    # through the absolute one and a deployment resolves through this one.
+    #
+    # libmlx, libjaccl and mlx.metallib go beside the plugin, and all three
+    # must match the build. See README, "The MLX backend".
+    list(APPEND LINK_LIBS "-Wl,-rpath,@loader_path" "-L${MLX_ROOT}/lib" "-lmlx"
+                          "-Wl,-rpath,${MLX_ROOT}/lib")
     add_compile_definitions(COPILOT_WITH_MLX=1)
   endif()
 endif()

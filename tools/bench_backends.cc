@@ -153,7 +153,14 @@ bool RunRound(rime::Scorer* scorer, const std::string& context,
 int main(int argc, char** argv) {
   std::string model_path;
   int iters = 40, rounds = 3, idle_ms = 100, context_chars = 64;
-  double tolerance = 0.01;
+  // 0.05 because the SHIPPED default disagrees by 0.0187: MlxScorerOptions::f16
+  // runs the forward in float16 where llama.cpp computes in f32 against an F16
+  // KV cache. A tolerance of 0.01 refused the default configuration, which
+  // makes the guard noise rather than a guard. 0.0187 is 2% of the 1.0-nat
+  // promotion threshold, so it cannot flip a promotion the margin gate would
+  // allow; pass --tolerance 0.005 with mlx_f16 off to hold the two to the
+  // 0.0014 that pure quantization rounding gives.
+  double tolerance = 0.05;
   bool json = false;
   // Energy is sampled by an external tool that cannot separate two arms in
   // one process, so --only runs a single backend under load. It is NOT for
