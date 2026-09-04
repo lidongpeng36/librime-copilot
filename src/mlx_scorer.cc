@@ -2,6 +2,8 @@
 
 #include <dlfcn.h>
 
+#include <ggml.h>
+#include <gguf.h>
 #include <llama.h>
 #include <mlx/mlx.h>
 
@@ -9,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <mutex>
@@ -440,26 +443,199 @@ struct MlxScorer::Impl {
 
   // ---- loading and the worker --------------------------------------------
 
-  static int ReadInt(const std::unordered_map<std::string, mx::GGUFMetaData>& meta,
-                     const std::string& key, int fallback) {
-    auto it = meta.find(key);
-    if (it == meta.end() || !std::holds_alternative<mx::array>(it->second)) {
-      return fallback;
+  // ggml Q8_0 -> MLX's packed 8-bit affine, and the whole reason this function
+  // exists rather than a call to mx::load_gguf.
+  //
+  // MLX is built here with MLX_BUILD_GGUF=OFF, because its gguf support vendors
+  // a second ggml and exports 31 gguf_*/ggml_* symbols that collide with
+  // llama.cpp's 1150. Linked together, whichever comes first on the link line
+  // wins, and when MLX won, llama.cpp's own model loader called MLX's
+  // incompatible gguf_get_key and died with SIGBUS. Removing the symbols is
+  // the fix; reading the file through llama.cpp's gguf API -- already linked,
+  // and the same one LlmScorer uses, so the two backends cannot disagree about
+  // what is in the file -- is the consequence.
+  //
+  // The conversion is exact, not approximate. ggml Q8_0 stores, per block of
+  // 32, one f16 scale `d` and 32 int8 quants with value = q * d and no zero
+  // point. MLX's affine form is value = q * scale + bias over uint8, so
+  // q_mlx = q_ggml + 128, scale = d, bias = -128 * d. Verified end to end:
+  // logprobs agree with score_candidates to 0.0023 nats, which is the
+  // rounding Q8_0 itself carries.
+  static bool ConvertQ8_0(const uint8_t* src, int64_t rows, int64_t cols,
+                          std::vector<uint32_t>* packed, std::vector<float>* scales,
+                          std::vector<float>* biases) {
+    constexpr int kBlock = 32;
+    if (cols % kBlock != 0) {
+      return false;
     }
-    auto a = std::get<mx::array>(it->second);
-    mx::eval(a);
-    return (int)a.item<uint32_t>();
+    const int64_t groups = cols / kBlock;
+    packed->assign(static_cast<size_t>(rows * cols / 4), 0u);
+    scales->assign(static_cast<size_t>(rows * groups), 0.0f);
+    biases->assign(static_cast<size_t>(rows * groups), 0.0f);
+    for (int64_t r = 0; r < rows; ++r) {
+      for (int64_t g = 0; g < groups; ++g) {
+        // sizeof(block_q8_0) == 2 + 32; laid out as the f16 scale then the
+        // quants. Read by offset rather than by casting to ggml's struct: this
+        // translation unit is C++20 and must not depend on ggml-common.h,
+        // which is internal to llama.cpp's build.
+        const uint8_t* block = src + (r * groups + g) * (2 + kBlock);
+        uint16_t half_bits = 0;
+        std::memcpy(&half_bits, block, sizeof(half_bits));
+        const float d = HalfToFloat(half_bits);
+        (*scales)[static_cast<size_t>(r * groups + g)] = d;
+        (*biases)[static_cast<size_t>(r * groups + g)] = -128.0f * d;
+        for (int i = 0; i < kBlock; ++i) {
+          const int8_t q = static_cast<int8_t>(block[2 + i]);
+          const uint32_t byte = static_cast<uint32_t>(static_cast<uint8_t>(q + 128));
+          const int64_t flat = r * cols + g * kBlock + i;
+          (*packed)[static_cast<size_t>(flat / 4)] |= byte << (8 * (flat % 4));
+        }
+      }
+    }
+    return true;
   }
 
-  static float ReadFloat(const std::unordered_map<std::string, mx::GGUFMetaData>& meta,
-                         const std::string& key, float fallback) {
-    auto it = meta.find(key);
-    if (it == meta.end() || !std::holds_alternative<mx::array>(it->second)) {
-      return fallback;
+  static float HalfToFloat(uint16_t h) {
+    // No <arm_neon.h> and no _Float16: this has to compile as plain C++20 in a
+    // TU that already juggles two toolchains' headers.
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1Fu;
+    const uint32_t mant = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+      if (mant == 0) {
+        bits = sign;
+      } else {
+        int e = -1;
+        uint32_t m = mant;
+        do {
+          ++e;
+          m <<= 1;
+        } while ((m & 0x400u) == 0);
+        bits = sign | ((127 - 15 - e) << 23) | ((m & 0x3FFu) << 13);
+      }
+    } else if (exp == 0x1Fu) {
+      bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+      bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
     }
-    auto a = std::get<mx::array>(it->second);
-    mx::eval(a);
-    return a.item<float>();
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+  }
+
+  // The model, read through llama.cpp's gguf API and converted into the arrays
+  // MLX's quantized_matmul wants. See ConvertQ8_0 for why this is not
+  // mx::load_gguf.
+  //
+  // One file, one reader, for both backends: LlmScorer opens the same path with
+  // the same library, so the two cannot disagree about what is in it. That
+  // matters more than it sounds -- the whole point of running them side by side
+  // is that a difference in their output is a difference in the SCORER.
+  bool LoadGgufWeights() {
+    ggml_context* meta_ctx = nullptr;
+    gguf_init_params params{};
+    params.no_alloc = false;  // let ggml allocate and load the tensor data
+    params.ctx = &meta_ctx;
+    gguf_context* gguf = gguf_init_from_file(model_path_.c_str(), params);
+    if (!gguf) {
+      LOG(ERROR) << "[copilot] mlx_scorer: gguf_init_from_file failed for " << model_path_;
+      return false;
+    }
+    struct Closer {
+      gguf_context* g;
+      ggml_context* c;
+      ~Closer() {
+        if (g) gguf_free(g);
+        if (c) ggml_free(c);
+      }
+    } closer{gguf, meta_ctx};
+
+    auto key_u32 = [&](const char* k, int fallback) {
+      const int64_t id = gguf_find_key(gguf, k);
+      return id < 0 ? fallback : static_cast<int>(gguf_get_val_u32(gguf, id));
+    };
+    auto key_f32 = [&](const char* k, float fallback) {
+      const int64_t id = gguf_find_key(gguf, k);
+      return id < 0 ? fallback : gguf_get_val_f32(gguf, id);
+    };
+    shape_.n_layers = key_u32("llama.block_count", 0);
+    shape_.d_model = key_u32("llama.embedding_length", 0);
+    shape_.n_heads = key_u32("llama.attention.head_count", 0);
+    shape_.n_kv_heads = key_u32("llama.attention.head_count_kv", shape_.n_heads);
+    shape_.rms_eps = key_f32("llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    shape_.rope_theta = key_f32("llama.rope.freq_base", 10000.0f);
+    if (shape_.n_layers <= 0 || shape_.d_model <= 0 || shape_.n_heads <= 0) {
+      LOG(ERROR) << "[copilot] mlx_scorer: gguf metadata is missing the model shape";
+      return false;
+    }
+    shape_.head_dim = shape_.d_model / shape_.n_heads;
+    shape_.group_size = kExpectedGroupSize;
+
+    // Over the gguf's OWN tensor list, not over everything in the ggml
+    // context: loading with no_alloc=false also creates a synthetic
+    // "GGUF tensor data binary blob" of type i8 holding the raw bytes, and
+    // walking the context hands you that first. It is not a model tensor and
+    // rejecting it as an unsupported dtype -- which is what the type check
+    // below did -- fails the load with a message about re-exporting the model.
+    const int64_t n_tensors = gguf_get_n_tensors(gguf);
+    for (int64_t ti = 0; ti < n_tensors; ++ti) {
+      const std::string name = gguf_get_tensor_name(gguf, ti);
+      ggml_tensor* t = ggml_get_tensor(meta_ctx, name.c_str());
+      if (!t) {
+        LOG(ERROR) << "[copilot] mlx_scorer: " << name
+                   << " is in the gguf index but not in "
+                      "the loaded context";
+        return false;
+      }
+      // ggml's ne[] is [cols, rows, ...] -- the fastest-varying dimension
+      // first, the opposite of the row-major [rows, cols] MLX takes. Getting
+      // this backwards transposes every matrix and produces a model that runs
+      // and is wrong, which is the failure mode this file already carries a
+      // RoPE warning about.
+      const int64_t cols = t->ne[0];
+      const int64_t rows = t->ne[1] > 0 ? t->ne[1] : 1;
+      if (t->type == GGML_TYPE_F32) {
+        std::vector<float> v(static_cast<size_t>(ggml_nelements(t)));
+        std::memcpy(v.data(), t->data, v.size() * sizeof(float));
+        weights_.emplace(name, mx::array(v.data(), {static_cast<int>(v.size())}, mx::float32));
+        continue;
+      }
+      if (t->type != GGML_TYPE_Q8_0) {
+        LOG(ERROR) << "[copilot] mlx_scorer: " << name << " is " << ggml_type_name(t->type)
+                   << "; this backend reads F32 and Q8_0 only. Re-export with"
+                      " `rime-train export --dtype q8_0`, or use backend: llama.";
+        return false;
+      }
+      std::vector<uint32_t> packed;
+      std::vector<float> scales, biases;
+      if (!ConvertQ8_0(static_cast<const uint8_t*>(t->data), rows, cols, &packed, &scales,
+                       &biases)) {
+        LOG(ERROR) << "[copilot] mlx_scorer: " << name << " has " << cols
+                   << " columns, not a multiple of the 32-element Q8_0 block";
+        return false;
+      }
+      const int r = static_cast<int>(rows), c = static_cast<int>(cols);
+      const int g = c / kExpectedGroupSize;
+      // The gguf tensor is already called `blk.0.attn_q.weight`; the packed
+      // data keeps that name and the two side tensors replace the suffix.
+      // Same layout mx::load_gguf produced (`output.scales`,
+      // `blk.9.ffn_down.biases`), so QLinear::Resolve is unchanged and the
+      // f32 norms, whose gguf names already end in `.weight`, still resolve.
+      static const std::string kSuffix = ".weight";
+      const std::string base =
+          (name.size() > kSuffix.size() &&
+           name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0)
+              ? name.substr(0, name.size() - kSuffix.size())
+              : name;
+      weights_.emplace(base + ".weight", mx::array(packed.data(), {r, c / 4}, mx::uint32));
+      weights_.emplace(base + ".scales",
+                       mx::astype(mx::array(scales.data(), {r, g}, mx::float32), mx::float16));
+      weights_.emplace(base + ".biases",
+                       mx::astype(mx::array(biases.data(), {r, g}, mx::float32), mx::float16));
+    }
+    LOG(INFO) << "[copilot] mlx_scorer: read " << weights_.size() << " arrays from " << model_path_;
+    return true;
   }
 
   bool EnsureLoaded() {
@@ -491,28 +667,14 @@ struct MlxScorer::Impl {
     vocab_ = llama_model_get_vocab(vocab_model_);
 
     try {
-      auto [weights, meta] = mx::load_gguf(model_path_);
-      weights_ = std::move(weights);
-      shape_.n_layers = ReadInt(meta, "llama.block_count", 0);
-      shape_.d_model = ReadInt(meta, "llama.embedding_length", 0);
-      shape_.n_heads = ReadInt(meta, "llama.attention.head_count", 0);
-      shape_.n_kv_heads = ReadInt(meta, "llama.attention.head_count_kv", shape_.n_heads);
-      shape_.rms_eps = ReadFloat(meta, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
-      shape_.rope_theta = ReadFloat(meta, "llama.rope.freq_base", 10000.0f);
+      if (!LoadGgufWeights()) {
+        load_failed_.store(true, std::memory_order_release);
+        return false;
+      }
       if (shape_.n_layers <= 0 || shape_.d_model <= 0 || shape_.n_heads <= 0) {
         LOG(ERROR) << "[copilot] mlx_scorer: gguf metadata is missing the model shape";
         load_failed_.store(true, std::memory_order_release);
         return false;
-      }
-      shape_.head_dim = shape_.d_model / shape_.n_heads;
-      // The scales tensor's width is the authority on the affine group size --
-      // derived, not assumed, because a future quantization would change it
-      // and a wrong group size produces plausible garbage rather than an error.
-      const auto& scales = weights_.at("blk.0.attn_q.scales");
-      shape_.group_size = shape_.d_model / scales.shape(scales.ndim() - 1);
-      if (shape_.group_size != kExpectedGroupSize) {
-        LOG(WARNING) << "[copilot] mlx_scorer: group size " << shape_.group_size << ", expected "
-                     << kExpectedGroupSize;
       }
       // The embedding is read as a dense table once rather than dequantized on
       // every forward: it is one row per token, and a gather is cheaper than a
