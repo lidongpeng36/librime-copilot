@@ -73,11 +73,50 @@
 // Run it on the machine in question and read the lines it prints.
 //
 //   bench_scorer --model <gguf> [--iters N] [--threads N] [--gpu-layers N]
-//                [--context-chars N] [--candidates N]
+//                [--context-chars N] [--candidates N] [--candidate-chars N]
+//                [--idle-ms N] [--json]
+//
+// THE TABLE ABOVE MEASURES ONE MODE UNDER ONE CONDITION, and until 2026-09-04
+// nothing said so. Live telemetry then put the deployed scorer at p50 11.1 ms
+// where this tool reports 2.11 ms for what was believed to be the same work on
+// the same machine. Two properties of the loop below are why, and both are now
+// knobs:
+//
+//   * `--candidate-chars` (default 2, the pool this always used). Scoring cost
+//     is bimodal on ONE thing -- whether the batch reaches llama_decode at all.
+//     Every candidate's first token is scored off the prefill's own last
+//     logits, so a window whose candidates are all single tokens submits
+//     nothing and costs ~0.18 ms live, against ~11 ms for one that decodes.
+//     44% of real scorings are in the cheap mode. This tool could not produce
+//     it, so every number it has ever printed describes the expensive half.
+//     Read `tokens decoded/iter` in the output: THAT, not the character count,
+//     is which mode was measured -- a real two-character word is often one
+//     token, and then nothing decodes.
+//
+//   * `--idle-ms` (default 0). This loop runs iterations back to back, which
+//     is the one condition under which a cold-GPU or graph-rebuild cost cannot
+//     show up. Production scores once per keystroke with human-scale gaps. The
+//     sleep goes BETWEEN the prefill and the score, not between iterations,
+//     because that is where the deployed gap is: LlmScorer's worker prefills
+//     when a commit or composition start queues a warm, and Score() runs on a
+//     later keystroke. So the score phase -- the number under study -- is the
+//     first GPU work after the idle, exactly as it is live. An earlier draft
+//     of this that slept between iterations would have charged the wake-up to
+//     the prefill and reported the score as unaffected.
+//
+// `--json` prints one machine-readable object instead of the prose, which is
+// what tools/bench_matrix.py consumes to make before/after comparisons that
+// survive a llama.cpp bump or a constant change. Prefer it to eyeballing two
+// runs: the whole reason that Python driver is committed rather than ad-hoc is
+// the same reason compare_rerank.py is -- a measurement nobody can re-run
+// cannot be re-examined when the next one contradicts it.
 //
 #include <llama.h>
 
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -93,11 +132,24 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// Written by --idle-spin's busy-wait and by nothing else; volatile so the
+// compiler cannot delete the loop whose whole purpose is to keep a core busy.
+volatile long long spin_sink = 0;
+
 // llm_scorer.cc's constants of the same names. kNBatch also sizes the batch
 // arrays below (llama_batch_init), so every write into them must be bounded by
 // it -- production has that guard on the candidate loop and chunks its prefill;
 // here `--context-chars` and `--candidates` are user input and would otherwise
 // walk straight off the end.
+// Defaults, no longer hard limits: --n-batch, --n-ctx, --n-seq-max and
+// --n-ubatch override each of these. They exist as knobs because the cost this
+// tool measures turned out to be dominated by the FIXED price of issuing one
+// llama_decode -- 1.57 ms hot, 10.20 ms after an idle, against 0.13/0.54 ms
+// per decoded token -- and every one of these constants sizes per-call CPU
+// work (graph build, KV bookkeeping across n_seq_max sequences, compute
+// buffers) rather than arithmetic. Whether shrinking them moves that fixed
+// price is the question; they are deliberately NOT changed here, only made
+// measurable.
 constexpr int kNBatch = 512;
 constexpr int kMaxCandidates = 8;
 constexpr int kNCtx = 4096;
@@ -193,12 +245,45 @@ std::string BuildContext(int chars) {
 }
 
 // Candidates the length the re-ranker actually sees: `top_n` is 4 and the
-// window is words, not sentences, so 2-3 characters each.
-std::vector<std::string> BuildCandidates(int n) {
-  static const char* kPool[] = {"务必", "无比", "五笔", "舞弊", "无臂", "吴璧", "无笔", "芜鄙"};
+// window is words, not sentences, so 1-4 characters each.
+//
+// REAL words at every length, not sliced filler, and that is the point rather
+// than decoration. What decides whether the score phase decodes is the TOKEN
+// count, and a real word is frequently one token where an arbitrary run of the
+// same characters is never fewer than one per character. Slicing kFiller would
+// have produced candidates that always decode, i.e. the exact mode this tool
+// was already stuck in.
+//
+// The two-character pool is unchanged and is still the default, so every
+// number in the table at the top of this file remains reproducible.
+std::vector<std::string> BuildCandidates(int n, int chars) {
+  static const char* kPool1[] = {"的", "一", "是", "不", "了", "人", "我", "在"};
+  static const char* kPool2[] = {"务必", "无比", "五笔", "舞弊", "无臂", "吴璧", "无笔", "芜鄙"};
+  static const char* kPool3[] = {"计算机", "输入法", "候选词", "显示器",
+                                 "处理器", "存储器", "编译器", "解释器"};
+  static const char* kPool4[] = {"人工智能", "机器学习", "自然语言", "输入方法",
+                                 "候选窗口", "神经网络", "深度学习", "卷积网络"};
+  const char* const* pool = kPool2;
+  switch (chars) {
+    case 1:
+      pool = kPool1;
+      break;
+    case 2:
+      pool = kPool2;
+      break;
+    case 3:
+      pool = kPool3;
+      break;
+    case 4:
+      pool = kPool4;
+      break;
+    default:
+      pool = kPool2;
+      break;
+  }
   std::vector<std::string> out;
   for (int i = 0; i < n; ++i) {
-    out.push_back(kPool[i % (int)(sizeof(kPool) / sizeof(kPool[0]))]);
+    out.push_back(pool[i % 8]);
   }
   return out;
 }
@@ -210,8 +295,18 @@ int main(int argc, char** argv) {
   int iters = 500;
   int n_threads = (int)std::thread::hardware_concurrency();
   int n_gpu_layers = 99;
-  int context_chars = 32;  // copilot/rerank/llm/context_chars
-  int n_candidates = 4;    // copilot/rerank/llm/top_n
+  int context_chars = 32;   // copilot/rerank/llm/context_chars
+  int n_candidates = 4;     // copilot/rerank/llm/top_n
+  int candidate_chars = 2;  // characters per candidate; see BuildCandidates
+  int idle_ms = 0;          // idle inserted between prefill and score
+  bool json = false;
+  bool qos = false;            // raise this thread's QoS class (Apple only)
+  bool idle_spin = false;      // burn the gap instead of sleeping through it
+  int n_ctx = kNCtx;           // llm_scorer.cc's kNCtx
+  int n_seq_max = kNSeqMax;    // llm_scorer.cc's kNSeqMax
+  int n_batch = kNBatch;       // llm_scorer.cc's kNBatch
+  int n_ubatch = 0;            // 0 = leave llama.cpp's default (512) alone
+  int scores_per_prefill = 1;  // see the loop; 1 preserves the old behaviour
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--model") && i + 1 < argc) {
       model_path = argv[++i];
@@ -225,9 +320,33 @@ int main(int argc, char** argv) {
       context_chars = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "--candidates") && i + 1 < argc) {
       n_candidates = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--candidate-chars") && i + 1 < argc) {
+      candidate_chars = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--idle-ms") && i + 1 < argc) {
+      idle_ms = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--json")) {
+      json = true;
+    } else if (!strcmp(argv[i], "--qos")) {
+      qos = true;
+    } else if (!strcmp(argv[i], "--idle-spin")) {
+      idle_spin = true;
+    } else if (!strcmp(argv[i], "--n-ctx") && i + 1 < argc) {
+      n_ctx = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--n-seq-max") && i + 1 < argc) {
+      n_seq_max = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--n-batch") && i + 1 < argc) {
+      n_batch = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--n-ubatch") && i + 1 < argc) {
+      n_ubatch = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--scores-per-prefill") && i + 1 < argc) {
+      scores_per_prefill = atoi(argv[++i]);
     } else {
       fprintf(stderr, "usage: %s --model <gguf> [--iters N] [--threads N]\n", argv[0]);
-      fprintf(stderr, "       [--gpu-layers N] [--context-chars N] [--candidates N]\n");
+      fprintf(stderr,
+              "       [--gpu-layers N] [--context-chars N] [--candidates N]\n"
+              "       [--candidate-chars 1..4] [--idle-ms N] [--idle-spin] [--json] [--qos]\n"
+              "       [--n-ctx N] [--n-seq-max N] [--n-batch N] [--n-ubatch N]\n"
+              "       [--scores-per-prefill N]\n");
       return 2;
     }
   }
@@ -237,6 +356,29 @@ int main(int argc, char** argv) {
   }
   // kMaxCandidates in llm_scorer.cc: above this the plugin runs a second
   // sequential group, which this tool does not model.
+  if (candidate_chars < 1 || candidate_chars > 4) {
+    fprintf(stderr, "--candidate-chars must be 1..4 (BuildCandidates has a pool per length)\n");
+    return 1;
+  }
+  if (idle_ms < 0) {
+    fprintf(stderr, "--idle-ms must not be negative\n");
+    return 1;
+  }
+  if (n_ctx < 256 || n_seq_max < 1 || n_batch < 1 || n_ubatch < 0) {
+    fprintf(stderr, "--n-ctx must be >= 256, --n-seq-max/--n-batch >= 1, --n-ubatch >= 0\n");
+    return 1;
+  }
+  if (n_seq_max < n_candidates + 1) {
+    // kCtxSeq plus one scratch sequence per candidate. Below that, every
+    // candidate decode fails to find a KV slot -- score_candidates.cc hit
+    // exactly this with the default of 1.
+    fprintf(stderr, "--n-seq-max must be at least --candidates + 1 (%d)\n", n_candidates + 1);
+    return 1;
+  }
+  if (scores_per_prefill < 1) {
+    fprintf(stderr, "--scores-per-prefill must be at least 1\n");
+    return 1;
+  }
   if (n_candidates < 1 || n_candidates > kMaxCandidates) {
     fprintf(stderr, "--candidates must be 1..%d (kMaxCandidates in llm_scorer.cc)\n",
             kMaxCandidates);
@@ -252,6 +394,29 @@ int main(int argc, char** argv) {
   }
 
   // Same as the plugin: llama.cpp's own chatter is not part of the measurement.
+  // Why this flag exists. Everything in the table at the top of this file was
+  // measured with --idle-ms 0, and an idle of as little as 50 ms costs ~6x on
+  // BOTH arms -- 2.12 -> 12.50 ms of score latency with the layers on the GPU,
+  // 1.63 -> 13.41 without, and process CPU time rises with it (1.75 -> 11.21,
+  // 13.34 -> 58.34 ms/iteration). A cost that lands on the CPU arm too is not
+  // Metal's, and one that ignores --threads (1, 2, 4 and 12 all measure ~12.4
+  // ms after an idle) is not the thread pool's. What is left is the scheduler:
+  // a thread that has just slept is demoted, and the work runs on an
+  // efficiency core at a low clock until the ramp catches up.
+  //
+  // That is not an artifact of this tool. It is the deployed condition -- an
+  // IME scores once per keystroke, with human-scale gaps -- and it is why live
+  // telemetry reads p50 11.1 ms where this file's table says 2.11.
+  //
+  // So: does asking for a high QoS class buy it back? Apple only, and guarded,
+  // because tools/ builds on Linux CI too.
+  if (qos) {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#else
+    fprintf(stderr, "--qos is Apple-only; ignored\n");
+#endif
+  }
   llama_log_set([](ggml_log_level, const char*, void*) {}, nullptr);
   llama_backend_init();
 
@@ -269,9 +434,15 @@ int main(int argc, char** argv) {
   // Every one of these mirrors llm_scorer.cc's constants; see kNCtx's comment
   // there for why n_seq_max is candidates+1 and why n_ctx is the TOTAL cache.
   llama_context_params ctx_params = llama_context_default_params();
-  ctx_params.n_ctx = kNCtx;
-  ctx_params.n_batch = kNBatch;
-  ctx_params.n_seq_max = kNSeqMax;
+  ctx_params.n_ctx = n_ctx;
+  ctx_params.n_batch = n_batch;
+  ctx_params.n_seq_max = n_seq_max;
+  // Left untouched at 0: llama.cpp's own default is 512, and setting it
+  // explicitly to that is not the same as not setting it if a future version
+  // changes the default. The knob is here to try SMALLER.
+  if (n_ubatch > 0) {
+    ctx_params.n_ubatch = n_ubatch;
+  }
   ctx_params.no_perf = true;
   ctx_params.n_threads = n_threads;
   ctx_params.n_threads_batch = n_threads;
@@ -283,10 +454,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   llama_memory_t mem = llama_get_memory(ctx);
-  llama_batch batch = llama_batch_init(kNBatch, 0, kNSeqMax);
+  llama_batch batch = llama_batch_init(n_batch, 0, n_seq_max);
 
   const std::string context = BuildContext(context_chars);
-  const std::vector<std::string> candidates = BuildCandidates(n_candidates);
+  const std::vector<std::string> candidates = BuildCandidates(n_candidates, candidate_chars);
 
   // Reject an over-long context here rather than overrunning the batch arrays
   // inside the loop. Production chunks its prefill across kNBatch-sized batches
@@ -307,7 +478,7 @@ int main(int argc, char** argv) {
     // count this probe is deliberately controlling.
     const std::vector<llama_token> probe = Tokenize(vocab, context, /*add_special=*/false);
     const int n_ctx_seq = (int)llama_n_ctx_seq(ctx);
-    const int limit = std::min(kNBatch, n_ctx_seq - kCandidateHeadroom);
+    const int limit = std::min(n_batch, n_ctx_seq - kCandidateHeadroom);
     if (probe.empty() || (int)probe.size() > limit) {
       fprintf(stderr, "--context-chars %d tokenizes to %d tokens; must be 1..%d\n", context_chars,
               (int)probe.size(), limit);
@@ -329,14 +500,40 @@ int main(int argc, char** argv) {
 
   const double cpu_start = CpuMs();
   const double wall_start = NowMs();
+  double slept_ms = 0.0;
+  // Summed across iterations, reported as a per-iteration mean. This is the
+  // `n_decoded` the deployed path now records per scoring (telemetry v7), and
+  // it is what says WHICH of the two cost modes a run measured -- a
+  // character count does not, because a real multi-character word is often a
+  // single token and then nothing is submitted at all.
+  long long decoded_tokens = 0;
+  // The score phase split by whether a prefill immediately preceded it. Only
+  // consecutive scorings can hit llama.cpp's single-slot graph reuse, so the
+  // gap between these two is what that reuse is worth -- the one number this
+  // tool could not produce while the ratio was fixed at 1:1.
+  std::vector<double> score_first_ms;
+  std::vector<double> score_next_ms;
+  long long scorings = 0;
   for (int it = 0; it < iters; ++it) {
     const double t_begin = NowMs();
 
-    // --- Prefill: what WarmUp() posts to the worker thread. Repeated every
-    // iteration on purpose. In production it is amortized across the segments
-    // sharing a context, but it is also re-run on every commit and every
-    // composition start (rerank_filter.cc's warming call sites), so roughly one
-    // prefill per one score is the honest live ratio, not zero.
+    // --- Prefill: what WarmUp() posts to the worker thread. One per
+    // --scores-per-prefill scorings, which defaults to 1 -- the ratio this
+    // tool has always assumed, on the grounds that a warm fires on every
+    // commit and every composition start.
+    //
+    // That assumption is worth being able to break, and 1 is the pessimistic
+    // end of it. WITHIN a composition the scoring context does not change --
+    // it is the surrounding text plus the confirmed prefix, and neither moves
+    // while the user adds letters to the current segment -- so one prefill
+    // really does serve several keystrokes, each scoring a different candidate
+    // list. That case also happens to be the only one where llama.cpp's graph
+    // reuse can fire: gf_res_prev is a SINGLE slot keyed on ubatch shape
+    // (llama-graph.h, allow_reuse), so alternating prefill and score misses it
+    // every time -- measured, LLAMA_GRAPH_REUSE_DISABLE=1 changes score p50 by
+    // 0.004 ms, i.e. reuse is currently doing nothing at all. Consecutive
+    // scorings of the same shape are the only way to find out what it is
+    // worth.
     // Same reasoning as the probe above: no BOS, and no AlignToTrainingForm
     // since this context is synthetic and its token count is what is being
     // measured.
@@ -361,103 +558,212 @@ int main(int argc, char** argv) {
     ctx_logits.assign(last, last + n_vocab);
     const double t_prefilled = NowMs();
 
-    // --- ScoreGroup: what Score() runs on the caller's thread. THIS is the
-    // number the p99 < 10 ms budget is about; the prefill above already
-    // happened in the background by the time a real segment gets here.
-    const double ctx_log_sum_exp = LogSumExp(ctx_logits.data(), n_vocab);
-    std::vector<std::vector<llama_token>> cand_tokens(candidates.size());
-    std::vector<float> logprob_sum(candidates.size(), 0.0f);
-    // owner[k] maps a batch slot back to its candidate, next_index[k] to the
-    // token that slot's logits predict -- the same two arrays ScoreGroup keeps,
-    // and the reason the read-back loop below can stay a single pass.
-    std::vector<int> owner;
-    std::vector<int> next_index;
-    owner.reserve(kNBatch);
-    next_index.reserve(kNBatch);
-    batch.n_tokens = 0;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      cand_tokens[i] = Tokenize(vocab, candidates[i], /*add_special=*/false);
-      const llama_seq_id seq = 1 + (llama_seq_id)i;
-      llama_memory_seq_rm(mem, seq, -1, -1);
-      if (cand_tokens[i].empty()) {
-        continue;
+    for (int sp = 0; sp < scores_per_prefill; ++sp) {
+      // --- The gap production has and this loop did not. Between the prefill
+      // and the score, not between iterations: LlmScorer's worker prefills when
+      // a commit or a composition start queues a warm, and Score() runs on a
+      // later keystroke, so the score phase is the first GPU work after the
+      // idle. Sleeping between iterations instead would charge the wake-up to
+      // the NEXT prefill and leave the score -- the number under study --
+      // looking unaffected.
+      //
+      // Outside both timed spans by construction: t_prefilled is taken above it
+      // and t_score_begin below, so neither phase contains the sleep. The wall
+      // clock does contain it, which is why `slept_ms` is accumulated and
+      // subtracted before the cpu/wall ratio is formed -- left in, a run with
+      // --idle-ms would report a ratio that says "the work is on the GPU" purely
+      // because the process spent most of its wall time asleep.
+      if (idle_ms > 0) {
+        const double t_sleep_begin = NowMs();
+        if (idle_spin) {
+          // The discriminator, not a mode anyone should benchmark in. Same
+          // elapsed time, but this thread never yields, so whatever the
+          // scheduler and the DVFS governor do to an idle core does not happen.
+          // If the post-idle penalty survives this, it is time-based (a GPU
+          // power state, memory eviction) and keeping a CPU busy could not
+          // recover it; if it vanishes, the cost is the CPU clock and "keep
+          // something warm before scoring" becomes an option worth pricing.
+          while (NowMs() - t_sleep_begin < (double)idle_ms) {
+            spin_sink = spin_sink + 1;
+          }
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(idle_ms));
+        }
+        slept_ms += NowMs() - t_sleep_begin;
       }
-      llama_memory_seq_cp(mem, 0, seq, -1, -1);
-      // The first token is free: scored off the context's own last-token
-      // logits, which ctx_log_sum_exp already normalizes. No decode for it.
-      logprob_sum[i] = (float)((double)ctx_logits[cand_tokens[i][0]] - ctx_log_sum_exp);
-      // Every remaining token of every candidate goes into the SAME batch.
-      // `r + 1 < len`, not `r < len`: the LAST token of a candidate predicts
-      // nothing that is being scored, so ScoreGroup never submits it. Sending
-      // it anyway would decode len tokens where production decodes len - 1.
-      const int len = (int)cand_tokens[i].size();
-      for (int r = 0; r + 1 < len; ++r) {
-        if (batch.n_tokens >= kNBatch) {
-          fprintf(stderr, "candidate batch overflow at %d (kNBatch %d)\n", batch.n_tokens, kNBatch);
+      const double t_score_begin = NowMs();
+
+      // --- ScoreGroup: what Score() runs on the caller's thread. THIS is the
+      // number the p99 < 10 ms budget is about; the prefill above already
+      // happened in the background by the time a real segment gets here.
+      const double ctx_log_sum_exp = LogSumExp(ctx_logits.data(), n_vocab);
+      std::vector<std::vector<llama_token>> cand_tokens(candidates.size());
+      std::vector<float> logprob_sum(candidates.size(), 0.0f);
+      // owner[k] maps a batch slot back to its candidate, next_index[k] to the
+      // token that slot's logits predict -- the same two arrays ScoreGroup keeps,
+      // and the reason the read-back loop below can stay a single pass.
+      std::vector<int> owner;
+      std::vector<int> next_index;
+      owner.reserve(kNBatch);
+      next_index.reserve(kNBatch);
+      batch.n_tokens = 0;
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        cand_tokens[i] = Tokenize(vocab, candidates[i], /*add_special=*/false);
+        const llama_seq_id seq = 1 + (llama_seq_id)i;
+        llama_memory_seq_rm(mem, seq, -1, -1);
+        if (cand_tokens[i].empty()) {
+          continue;
+        }
+        llama_memory_seq_cp(mem, 0, seq, -1, -1);
+        // The first token is free: scored off the context's own last-token
+        // logits, which ctx_log_sum_exp already normalizes. No decode for it.
+        logprob_sum[i] = (float)((double)ctx_logits[cand_tokens[i][0]] - ctx_log_sum_exp);
+        // Every remaining token of every candidate goes into the SAME batch.
+        // `r + 1 < len`, not `r < len`: the LAST token of a candidate predicts
+        // nothing that is being scored, so ScoreGroup never submits it. Sending
+        // it anyway would decode len tokens where production decodes len - 1.
+        const int len = (int)cand_tokens[i].size();
+        for (int r = 0; r + 1 < len; ++r) {
+          if (batch.n_tokens >= kNBatch) {
+            fprintf(stderr, "candidate batch overflow at %d (kNBatch %d)\n", batch.n_tokens,
+                    kNBatch);
+            return 1;
+          }
+          const int k = batch.n_tokens++;
+          batch.token[k] = cand_tokens[i][r];
+          batch.pos[k] = (int)ctx_tokens.size() + r;
+          batch.n_seq_id[k] = 1;
+          batch.seq_id[k][0] = seq;
+          batch.logits[k] = 1;
+          owner.push_back((int)i);
+          next_index.push_back(r + 1);
+        }
+      }
+      const int n_decoded_this_iter = batch.n_tokens;
+      if (batch.n_tokens > 0) {
+        if (llama_decode(ctx, batch) != 0) {
+          fprintf(stderr, "candidate decode failed\n");
           return 1;
         }
-        const int k = batch.n_tokens++;
-        batch.token[k] = cand_tokens[i][r];
-        batch.pos[k] = (int)ctx_tokens.size() + r;
-        batch.n_seq_id[k] = 1;
-        batch.seq_id[k][0] = seq;
-        batch.logits[k] = 1;
-        owner.push_back((int)i);
-        next_index.push_back(r + 1);
+        // The half the first version of this tool left out. Both halves matter:
+        // llama_get_logits_ith() is the Metal synchronization point, and
+        // LogProbOf is a full n_vocab log-softmax per scored token.
+        for (int k = 0; k < batch.n_tokens; ++k) {
+          const int i = owner[k];
+          const float* logits = llama_get_logits_ith(ctx, k);
+          logprob_sum[i] += LogProbOf(logits, n_vocab, cand_tokens[i][next_index[k]]);
+        }
       }
-    }
-    if (batch.n_tokens > 0) {
-      if (llama_decode(ctx, batch) != 0) {
-        fprintf(stderr, "candidate decode failed\n");
-        return 1;
+      const double t_end = NowMs();
+      // Consumed below, printed at the end: without a live reader the compiler is
+      // free to delete the log-softmax the score phase exists to measure.
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        score_checksum += logprob_sum[i];
       }
-      // The half the first version of this tool left out. Both halves matter:
-      // llama_get_logits_ith() is the Metal synchronization point, and
-      // LogProbOf is a full n_vocab log-softmax per scored token.
-      for (int k = 0; k < batch.n_tokens; ++k) {
-        const int i = owner[k];
-        const float* logits = llama_get_logits_ith(ctx, k);
-        logprob_sum[i] += LogProbOf(logits, n_vocab, cand_tokens[i][next_index[k]]);
-      }
-    }
-    const double t_end = NowMs();
-    // Consumed below, printed at the end: without a live reader the compiler is
-    // free to delete the log-softmax the score phase exists to measure.
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      score_checksum += logprob_sum[i];
-    }
 
+      score_ms.push_back(t_end - t_score_begin);
+      if (sp == 0) {
+        score_first_ms.push_back(t_end - t_score_begin);
+      } else {
+        score_next_ms.push_back(t_end - t_score_begin);
+      }
+      whole.push_back((t_prefilled - t_begin) + (t_end - t_score_begin));
+      decoded_tokens += n_decoded_this_iter;
+      scorings += 1;
+    }
     prefill_ms.push_back(t_prefilled - t_begin);
-    score_ms.push_back(t_end - t_prefilled);
-    whole.push_back(t_end - t_begin);
   }
-  const double wall_total = NowMs() - wall_start;
+  // Busy wall time: what the cpu/wall ratio has always been about. Without the
+  // subtraction --idle-ms would drive it toward zero and read as "entirely on
+  // the GPU" for any configuration at all.
+  const double wall_total = (NowMs() - wall_start) - slept_ms;
   const double cpu_total = CpuMs() - cpu_start;
 
   std::sort(whole.begin(), whole.end());
   std::sort(prefill_ms.begin(), prefill_ms.end());
   std::sort(score_ms.begin(), score_ms.end());
+  std::sort(score_first_ms.begin(), score_first_ms.end());
+  std::sort(score_next_ms.begin(), score_next_ms.end());
 
-  printf("model %s  iters %d  threads %d  gpu_layers %d  context %d chars  candidates %d\n",
-         model_path.c_str(), iters, n_threads, n_gpu_layers, context_chars, n_candidates);
+  const double decoded_per_iter = (double)decoded_tokens / (double)scorings;
+
+  if (json) {
+    // Hand-rolled rather than pulling nlohmann in: this target links llama.cpp
+    // and nothing else on purpose (CLAUDE.md, "score_candidates links llama.cpp
+    // and nlohmann_json only" -- the same linkage discipline, one dependency
+    // tighter). The object is flat and every value is a number or a plain
+    // string with no escaping to do.
+    printf("{");
+    printf("\"model\": \"%s\", ", model_path.c_str());
+    printf("\"iters\": %d, ", iters);
+    printf("\"threads\": %d, ", n_threads);
+    printf("\"gpu_layers\": %d, ", n_gpu_layers);
+    printf("\"context_chars\": %d, ", context_chars);
+    printf("\"candidates\": %d, ", n_candidates);
+    printf("\"candidate_chars\": %d, ", candidate_chars);
+    printf("\"idle_ms\": %d, ", idle_ms);
+    printf("\"qos\": %d, ", qos ? 1 : 0);
+    printf("\"idle_spin\": %d, ", idle_spin ? 1 : 0);
+    printf("\"decoded_per_iter\": %.3f, ", decoded_per_iter);
+    printf("\"scores_per_prefill\": %d, ", scores_per_prefill);
+    printf("\"score_p50_ms\": %.4f, ", Percentile(score_ms, 0.50));
+    printf("\"score_first_p50_ms\": %.4f, ", Percentile(score_first_ms, 0.50));
+    printf("\"score_next_p50_ms\": %.4f, ", Percentile(score_next_ms, 0.50));
+    printf("\"score_p99_ms\": %.4f, ", Percentile(score_ms, 0.99));
+    printf("\"prefill_p50_ms\": %.4f, ", Percentile(prefill_ms, 0.50));
+    printf("\"prefill_p99_ms\": %.4f, ", Percentile(prefill_ms, 0.99));
+    printf("\"both_p50_ms\": %.4f, ", Percentile(whole, 0.50));
+    printf("\"both_p99_ms\": %.4f, ", Percentile(whole, 0.99));
+    printf("\"cpu_ms_per_iter\": %.4f, ", cpu_total / scorings);
+    printf("\"cpu_per_wall\": %.4f, ", cpu_total / wall_total);
+    printf("\"logprob_checksum\": %.4f",
+           score_checksum / ((double)scorings * (double)n_candidates));
+    printf("}\n");
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_backend_free();
+    return 0;
+  }
+
+  printf(
+      "model %s  iters %d  threads %d  gpu_layers %d  context %d chars  candidates %d x %d "
+      "chars  idle %d ms\n",
+      model_path.c_str(), iters, n_threads, n_gpu_layers, context_chars, n_candidates,
+      candidate_chars, idle_ms);
+  // The line that says which of the two cost modes was measured. 0.00 means no
+  // llama_decode ran at all -- every candidate was a single token, scored off
+  // the prefill's own last logits -- which is the cheap mode and 44% of live
+  // scorings. Any latency figure here is about the mode this number names.
+  printf("tokens decoded/iter: %.2f  (%s)\n", decoded_per_iter,
+         decoded_per_iter > 0.0 ? "the decode-bearing mode" : "the decode-free mode");
   printf("score   (the p99<10ms budget): p50 %.2f ms  p99 %.2f ms\n", Percentile(score_ms, 0.50),
          Percentile(score_ms, 0.99));
   printf("prefill (background warm-up):  p50 %.2f ms  p99 %.2f ms\n", Percentile(prefill_ms, 0.50),
          Percentile(prefill_ms, 0.99));
+  if (scores_per_prefill > 1) {
+    // The graph-reuse question, in two numbers. A scoring that follows another
+    // scoring of the same shape is the only one that can hit gf_res_prev; one
+    // that follows a prefill never can.
+    printf("  first after a prefill:       p50 %.2f ms   (graph reuse cannot fire)\n",
+           Percentile(score_first_ms, 0.50));
+    printf("  after another scoring:       p50 %.2f ms   (it can)\n",
+           Percentile(score_next_ms, 0.50));
+  }
   printf("both together:                 p50 %.2f ms  p99 %.2f ms\n", Percentile(whole, 0.50),
          Percentile(whole, 0.99));
   // cpu/wall well below 1 means the work is on the GPU and this line is NOT the
   // energy story -- pair it with `sudo powermetrics --samplers cpu_power,gpu_power`
   // while this runs. Above 1 it is the whole energy story: that many core-
   // milliseconds per scoring, on the CPU, and no GPU involved at all.
-  printf("cpu time: %.2f ms per iteration  (cpu/wall %.2f)\n", cpu_total / iters,
+  printf("cpu time: %.2f ms per scoring  (cpu/busy-wall %.2f)\n", cpu_total / scorings,
          cpu_total / wall_total);
   // Not a result -- the mean log-probability the scoring produced, printed so
   // the arithmetic above has a reader and cannot be optimized away. Constant
   // across runs of the same model and context; a change means the score phase
   // stopped mirroring ScoreGroup.
   printf("mean candidate logprob: %.4f  (checksum, not a measurement)\n",
-         score_checksum / ((double)iters * (double)n_candidates));
+         score_checksum / ((double)scorings * (double)n_candidates));
 
   llama_batch_free(batch);
   llama_free(ctx);
