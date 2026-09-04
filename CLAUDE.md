@@ -659,6 +659,112 @@ killall Squirrel                                  # if it was already running: t
 rime-copilot status                               # the check, not a formality
 ```
 
+### The MLX backend
+
+`copilot/rerank/llm/backend: mlx` scores on Apple's MLX instead of llama.cpp.
+Measured on an M4 Pro through the real Scorer seam, interleaved, at the
+deployed 100 ms idle: score p50 **10.38 → 5.33 ms (−48.7%)**, the two backends
+agreeing to 0.0187 nats. Energy is indistinguishable (5.06 vs 5.21 mJ per
+scoring, against a 20% round-to-round spread), and the whole feature is
+~0.0014 Wh/h against a laptop's 8–15 W, so energy is not a reason either way.
+The full record is the 2026-09-04 scoring-latency results, kept locally.
+
+**It is off by default and the default is not a hedge.** The prefill is 36–50%
+*slower* on MLX, so total work per composition favours it only above ~1.5
+scorings per warm; the score win is on ~40% of keystrokes (69.5% engage the
+model, 58% of those decode); and nothing in this tree establishes that 10 ms of
+keystroke latency is perceived at all. What it costs is a permanent second
+inference backend — llama.cpp cannot go, it is what Linux builds and what the
+prediction provider uses — plus ~197 MB of runtime artifacts against a 5.8 MB
+plugin.
+
+**STATUS: it does not run from a source build.** Everything below about the
+build works -- it configures, compiles, loads the model and passes every test --
+and then the first GPU operation throws `There is no Stream(gpu, 0) in current
+thread.` from `metal/device.cpp`'s thread-local command-encoder lookup. Ruled
+out by measurement: MLX version (0.32.1 and 0.32.2 fail identically), static
+versus shared linking, `$<LINK_LIBRARY:WHOLE_ARCHIVE>`, `$<LINK_ONLY>`, and the
+metallib's location (beside the executable and beside libmlx.dylib both). A
+minimal program against the same built libmlx does a matmul on the main thread
+AND on a spawned thread, so the library and threading are not it; what differs
+in the failing binary is that llama.cpp (with ggml-metal) and librime are in the
+same process. Cause unknown. Do not switch `backend` to `mlx` on a
+source-built plugin.
+
+**And every performance figure quoted for this backend was measured against
+MLX 0.32.1, not the 0.32.2 the build asked for.** The rpath fix changed the
+link from a full path to `-L`/`-l`, and `/opt/homebrew/lib` precedes everything
+added here -- so a Homebrew `mlx` formula supplied the library while
+`/opt/homebrew/include` supplied the headers. Both were 0.32.1 and internally
+consistent, so the numbers are not noise; they are about a version this file
+named wrongly. That Homebrew copy has since been removed, and the build now
+warns when a second MLX is installed. Treat -48.7% as a 0.32.1 figure that no
+longer has a running build behind it.
+
+Building it needs a pip-installed MLX for its headers and prebuilt libraries:
+
+```sh
+python3 -m venv ~/.local/share/rime-corpus/mlx-venv
+~/.local/share/rime-corpus/mlx-venv/bin/pip install mlx
+cmake -B build -DCOPILOT_WITH_MLX=ON \
+  -DMLX_ROOT=~/.local/share/rime-corpus/mlx-venv/lib/python3.12/site-packages/mlx
+```
+
+The source build (`FetchContent`, with `MLX_BUILD_GGUF=OFF`) is what the
+committed `CMakeLists.txt` does, and it is what does not run. It needs Apple's
+Metal toolchain, `xcodebuild -downloadComponent MetalToolchain`, ~700 MB.
+
+**`MLX_BUILD_GGUF=OFF` is the part that must survive whatever fixes the
+runtime.** The pip wheel's `libmlx.dylib` EXPORTS 31 `gguf_*`/`ggml_*` symbols
+-- MLX vendors its own ggml to read gguf -- against llama.cpp's 1150 of the same
+names. Linked together, the dynamic linker binds llama.cpp's own model loader to
+MLX's incompatible implementation whenever libmlx precedes the ggml archives on
+the link line, and `llama_model_loader` dies with SIGBUS inside `gguf_get_key`.
+Which one wins is pure link order; the first version of this backend happened to
+order them the other way and ran. It was never right, only lucky. Turning the
+option off removes the symbols instead of arranging for them to lose, and costs
+`mx::load_gguf` -- hence `MlxScorer::LoadGgufWeights`, which reads the same file
+through llama.cpp's gguf API and converts ggml Q8_0 into MLX's packed affine
+form (`q_mlx = q_ggml + 128`, `scale = d`, `bias = -128d`).
+
+Two expectations of the source build that did NOT hold: the metallib is still
+174 MB (kernels are built for every GPU family, not the local one), and static
+linking does not work (MLX registers its Metal backend from a static
+initializer, which a linker pulling only referenced objects drops).
+
+**Three files travel, and where they end up is not where `restore` puts them.**
+
+```sh
+rime-copilot restore --mlx          # -> ~/Library/Rime/private/mlx/  (transport only)
+sudo cp ~/Library/Rime/private/mlx/* \
+  "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/"
+killall Squirrel
+rime-copilot status                 # the `mlx:` line
+```
+
+MLX finds `mlx.metallib` next to the **binary that loaded it**
+(ml-explore/mlx#2061 searches the binary's directory, then `Resources/`), and
+that binary is `librime-copilot.dylib` inside `Squirrel.app`. No rpath reaches
+it — rpath applies to dylibs, not to the metallib — so the Rime user directory
+cannot be the answer and the `sudo cp` is not optional.
+
+`libmlx.dylib` is found through `@loader_path`, which the build puts **first**
+in the rpath list. It used to be second, after the absolute path CMake derives
+from a full-path link — so a deployed plugin loaded MLX out of the build
+machine's pip virtualenv, complete with its username and a `python3.12` that a
+`pip install --upgrade` renames. Linking with `-L`/`-l` rather than a full path
+is what stops CMake deriving that rpath and makes the order controllable. If
+this is ever changed, check it with `otool -l ... | grep -A2 LC_RPATH` and by
+moving the virtualenv aside, not by reading the CMake.
+
+**A missing or mismatched `mlx.metallib` does not degrade.** MLX throws
+`std::out_of_range` from inside its Metal device setup and takes the process —
+Squirrel — with it. `MlxScorer::EnsureLoaded` checks for the file with `dladdr`
+before touching MLX and disables the backend with a log line instead, and
+`rime-copilot status` reports the same thing before anyone switches the backend
+on. All three files must match the build: libmlx and libjaccl are what the
+plugin was linked against, and the metallib is what libmlx loads.
+
 ### And if that machine is also a development machine
 
 Every machine here is. Four more things, none of which travel by git:
@@ -976,6 +1082,7 @@ other**, and most changes touch more than one:
 | the **user dictionary** (`private.userdb`) | Rime's own user-data sync, from Squirrel's menu — NOT the vault |
 | the design records (`docs/superpowers/`) | iCloud, plus a symlink made by hand |
 | the **clients** (Neovim, the tmux reporter, including on a remote host reached over ssh) | `rime-copilot-clients`, via each ecosystem's own plugin manager (lazy.nvim, TPM) — not a channel this repo has any part in any more. **Order still matters across the boundary**, and it does not follow the plugin managers' own schedule: the dylib must reach the laptop before a remote's clients plugin is upgraded past the point where it started sending the identity message's `host` field, or an old handler reads it as an unknown key and ignores it, silently filing that remote pane's `ascii_mode` into the laptop's own local-pane memory. See "Remote tmux" in `README.md` |
+| the **MLX backend's runtime** (`libmlx.dylib`, `libjaccl.dylib`, `mlx.metallib`) | the vault, via `backup --mlx` / `restore --mlx` — **then a `sudo cp` beside the plugin**, which `restore` cannot do. ~197 MB, and off by default, which is why it is a separate group from `VAULTED_FILES` rather than part of it. See "The MLX backend" below |
 | the **telemetry** (`private/copilot_telemetry/`) | `<sync_dir>/copilot_telemetry/` — `tools/sync_telemetry.sh` by hand, or `copilot/telemetry/auto_sync: true` on a 30-min timer. NOT the vault, and never merged: one file per machine, so collecting is concatenation |
 
 **The telemetry filename is `installation_id`, and it used to go stale.** The
