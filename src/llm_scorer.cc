@@ -91,13 +91,51 @@ constexpr int kMaxCandidates = 8;
 // kNCtx is the TOTAL physical KV cache size handed to llama_init_from_model,
 // shared across kNSeqMax sequences -- it is NOT the per-sequence budget.
 // llama.cpp derives the real per-sequence limit as
-// n_ctx_seq = pad_to_256(kNCtx / kNSeqMax) (llama-context.cpp:293-294), e.g.
-// 4096/9 -> 512 here. Prefill's too-long guard must check that derived
+// n_ctx_seq = pad_to_256(kNCtx / kNSeqMax) (llama-context.cpp:293-294), so
+// 2304/9 -> 256 here. Prefill's too-long guard must check that derived
 // value (cached as n_ctx_seq_, read back via llama_n_ctx_seq() once the
 // context exists), not kNCtx itself -- a guard against kNCtx admits contexts
 // ~7x longer than a scratch sequence can actually hold, which fails inside
 // llama_decode() instead of degrading to "no scores".
-constexpr int kNCtx = 4096;
+//
+// 4096 -> 2304 on 2026-09-04, and the number that was tuned is the DERIVED
+// one: n_ctx_seq goes 512 -> 256, which is the floor (llama.cpp pads it to a
+// multiple of 256). kNSeqMax and kMaxCandidates are deliberately untouched --
+// 2304 is 9 * 256, so the batching width keeps its headroom and this is a
+// pure allocation change with no functional difference at all.
+//
+// Why it is worth a change at all: per-scoring cost is LINEAR in n_ctx_seq,
+// measured on an M4 Pro at the deployed 64-character context, three repeats
+// per point (tools/bench_matrix.py, tools/bench_scorer.cc --n-ctx):
+//
+//   n_ctx_seq   score p50 hot   score p50 after a 100 ms idle
+//   256              1.78 ms                     9.0 ms
+//   512              2.14 ms                    11.4 ms
+//   1024             3.21 ms                    16.4 ms
+//
+// The mechanism is CPU-side and per call, not arithmetic: ScoreGroup does
+// kMaxCandidates `seq_rm` plus `seq_cp` pairs per scoring and both walk cells,
+// and the KQ mask llama.cpp builds is [n_tokens, n_ctx_seq]. None of that
+// depends on how many tokens are actually decoded, which is why the saving
+// shows up as a flat ~19% rather than scaling with the candidate list.
+//
+// The idle column is the one that matters and the reason a hot benchmark
+// understates this ~6x: a scoring that follows any gap over ~50 ms runs on a
+// downclocked core, and that multiplies every CPU-side term. An IME scores
+// once per keystroke, so it is ALWAYS in that column. See tools/bench_scorer.cc's
+// header for the measurement and for the two conditions the tool could not
+// produce until it was given --idle-ms and --candidate-chars.
+//
+// Verified numerically identical, not just faster: the mean candidate
+// logprob is -15.6693 at every n_ctx_seq above. It also drops the KV
+// allocation from ~82 MB to ~46 MB (10 layers, 8 kv heads, head_dim 64, F16).
+//
+// 256 is the floor and this lever ends here. What remains is ~9 ms per
+// decode-bearing scoring, of which graph construction is 0.07 ms (measured:
+// LLAMA_GRAPH_REUSE_DISABLE=1 moves score p50 by 0.004 ms, so llama.cpp's
+// graph reuse is worth nothing here) -- the rest is Metal command encoding,
+// dispatch and synchronization.
+constexpr int kNCtx = 2304;
 constexpr int kNBatch = 512;
 // score_candidates.cc's own comment (line 149): left at the default of 1,
 // every llama_decode() against a scratch sequence fails to find a KV slot.

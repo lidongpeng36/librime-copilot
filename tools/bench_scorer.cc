@@ -152,7 +152,7 @@ volatile long long spin_sink = 0;
 // measurable.
 constexpr int kNBatch = 512;
 constexpr int kMaxCandidates = 8;
-constexpr int kNCtx = 4096;
+constexpr int kNCtx = 2304;  // llm_scorer.cc's, and must stay equal to it
 constexpr int kNSeqMax = kMaxCandidates + 1;
 // Same headroom llm_scorer.cc's Prefill keeps below the per-sequence budget for
 // the candidate tokens that follow the context.
@@ -465,10 +465,17 @@ int main(int argc, char** argv) {
   // (llama_n_ctx_seq, NOT kNCtx -- see llm_scorer.cc's kNCtx comment); this
   // tool submits the context in one batch, so BOTH bounds apply and the min
   // below is what enforces them. With these constants it is the per-sequence
-  // budget that binds, not kNBatch: n_ctx_seq is pad_to_256(4096/9) = 512, so
-  // the limit is 512 - 64 = 448 against kNBatch's 512. Change kNCtx, kNSeqMax
+  // budget that binds, not kNBatch: n_ctx_seq is pad_to_256(2304/9) = 256, so
+  // the limit is 256 - 64 = 192 against kNBatch's 512. Change kNCtx, kNSeqMax
   // or kCandidateHeadroom and the other term can take over -- which is why the
   // guard is a min and not a single comparison.
+  //
+  // 192 rather than the 448 this said before 2026-09-04, and that is a real
+  // narrowing of what this TOOL will accept: --context-chars much above ~190
+  // now refuses instead of measuring. It is not a narrowing of the deployed
+  // path, whose context is clamped to kMaxSurroundingPrefixChars = 64
+  // (src/surrounding_source.h) -- three times under the bound. The knobs
+  // --n-ctx and --n-seq-max exist to explore past it.
   {
     // No BOS: it never appears in the training stream (train.py writes
     // `sentence + EOS` repeated), and the deployed path dropped it on the
