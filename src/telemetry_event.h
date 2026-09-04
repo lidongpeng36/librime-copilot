@@ -58,7 +58,15 @@ namespace telemetry {
 // max(surrounding_context_chars, max_context_chars) -- 8 under the shipped
 // schema, but a reader cannot know that machine's schema and must not assume
 // it. Report absent as unrecorded, and never pool it with a recorded depth.
-inline constexpr int kSchemaVersion = 6;
+//
+// v7 adds `lock_us`, `work_us` and `n_decoded` to Event's `llm` object,
+// splitting the existing `us` into the two halves that have opposite fixes and
+// recording whether the batch decoded at all. `us` is unchanged and still the
+// whole Score() call, so a v6 reader loads a v7 line without noticing. A v6
+// line carries none of the three, and absent must be read as "not measured" --
+// in particular `n_decoded` absent is NOT 0, which is a real and common
+// measurement (see LlmRecord).
+inline constexpr int kSchemaVersion = 7;
 
 // What the re-ranking filter decided for one segment.
 struct RerankRecord {
@@ -101,7 +109,23 @@ struct LlmRecord {
                                      // the design's estimate and over its 16ms budget;
                                      // this is what settles that in live use rather than
                                      // on 20 offline samples.
-  std::string skip;                  // none|disabled|battery|nomodel|noctx|cold|nohan|margin
+  // v7. `us` above is the sum of these two plus the little either side of them,
+  // and the sum could not answer what it was collected for: live scoring runs
+  // p50 11.1ms where bench_scorer reports 2.1ms for the same batch on the same
+  // machine, and nothing distinguished "the model is slower in-process" from
+  // "the call spent that time waiting for a background prefill to release the
+  // model lock". See ScoreTiming (scorer.h) for both hypotheses and why
+  // neither was idle. -1, never 0, when the field was not measured: an
+  // uncontended lock and an unmeasured one are different findings.
+  int64_t lock_us = -1;  // of `us`, the wait for LlmScorer's model mutex
+  int64_t work_us = -1;  // of `us`, the part spent holding it
+  int n_decoded = -1;    // candidate tokens submitted to llama_decode. 0 is the
+                         // common and cheap case, not a missing measurement:
+                         // every candidate's first token is scored off the
+                         // prefill's own last logits, so a window of
+                         // single-token candidates decodes nothing and costs
+                         // ~0.18ms against ~11ms for one that decodes.
+  std::string skip;      // none|disabled|battery|nomodel|noctx|cold|nohan|margin
 };
 
 struct Event {
@@ -300,6 +324,18 @@ inline std::string SerializeJsonl(const Event& e) {
     l["margin"] = RoundFloat(e.llm->margin);
     l["n_scored"] = e.llm->n_scored;
     l["us"] = e.llm->us;
+    // Omitted rather than written as -1 when unmeasured, so a reader sees the
+    // same "absent" for a v7 line whose Score() never ran as for a v6 line
+    // that could not have measured it -- one rule, not two.
+    if (e.llm->lock_us >= 0) {
+      l["lock_us"] = e.llm->lock_us;
+    }
+    if (e.llm->work_us >= 0) {
+      l["work_us"] = e.llm->work_us;
+    }
+    if (e.llm->n_decoded >= 0) {
+      l["n_decoded"] = e.llm->n_decoded;
+    }
     l["skip"] = e.llm->skip;
     j["llm"] = std::move(l);
   }

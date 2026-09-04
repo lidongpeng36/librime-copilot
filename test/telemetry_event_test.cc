@@ -195,11 +195,82 @@ TEST(SerializeJsonl, CarriesTheModelsPickWhenNothingWasPromoted) {
   e.llm = llm;
 
   const auto j = nlohmann::json::parse(SerializeJsonl(e));
-  EXPECT_EQ(j["v"], 6);
+  EXPECT_EQ(j["v"], kSchemaVersion);
   EXPECT_EQ(j["llm"]["best"], "那里");
   EXPECT_EQ(j["llm"]["best_from"], 1);
   EXPECT_EQ(j["llm"]["text"], "");  // nothing was promoted
   EXPECT_EQ(j["llm"]["skip"], "margin");
+}
+
+// v7's latency split. `us` alone could not tell "the model was slow" from "the
+// call waited for a background prefill to release the model lock", and those
+// have opposite fixes -- see ScoreTiming (scorer.h) for the live 11.1ms
+// against bench_scorer's 2.1ms that made the distinction worth recording.
+TEST(SerializeJsonl, CarriesTheLatencySplitAndWhetherTheBatchDecoded) {
+  Event e;
+  e.ts = "2026-09-04T12:00:00+0800";
+  e.machine = "M4Pro";
+  e.sel = "那里";
+  LlmRecord llm;
+  llm.incumbent = "哪里";
+  llm.best = "那里";
+  llm.us = 11400;
+  llm.lock_us = 9100;
+  llm.work_us = 2200;
+  llm.n_decoded = 4;
+  llm.skip = "none";
+  e.llm = llm;
+
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  // `us` keeps its meaning: the whole Score() call, which is what the p99
+  // budget is written against and what every pre-v7 figure measures. The split
+  // is added beside it, not in place of it.
+  EXPECT_EQ(j["llm"]["us"], 11400);
+  EXPECT_EQ(j["llm"]["lock_us"], 9100);
+  EXPECT_EQ(j["llm"]["work_us"], 2200);
+  EXPECT_EQ(j["llm"]["n_decoded"], 4);
+}
+
+// A batch of single-token candidates submits nothing to llama_decode and costs
+// ~0.18ms against ~11ms for one that decodes. That zero is the measurement --
+// the cheap mode this field exists to identify -- so it must reach the line,
+// where an unmeasured field is omitted entirely.
+TEST(SerializeJsonl, ADecodelessBatchRecordsZeroRatherThanNothing) {
+  Event e;
+  e.ts = "2026-09-04T12:00:00+0800";
+  LlmRecord llm;
+  llm.us = 180;
+  llm.lock_us = 0;
+  llm.work_us = 175;
+  llm.n_decoded = 0;
+  llm.skip = "none";
+  e.llm = llm;
+
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_TRUE(j["llm"].contains("n_decoded"));
+  EXPECT_EQ(j["llm"]["n_decoded"], 0);
+  // Same rule for an uncontended lock: 0 microseconds of waiting is a finding.
+  EXPECT_TRUE(j["llm"].contains("lock_us"));
+  EXPECT_EQ(j["llm"]["lock_us"], 0);
+}
+
+// The other half of that rule. A record the scorer never filled leaves all
+// three at -1, and -1 must not reach the log: a reader would have to know the
+// sentinel, and "absent" already means "not measured" for every field added
+// since v3. This is also what a v6 line looks like, so one rule covers both.
+TEST(SerializeJsonl, OmitsTheLatencySplitWhenItWasNeverMeasured) {
+  Event e;
+  e.ts = "2026-09-04T12:00:00+0800";
+  LlmRecord llm;
+  llm.us = 0;
+  llm.skip = "cold";
+  e.llm = llm;
+
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_FALSE(j["llm"].contains("lock_us"));
+  EXPECT_FALSE(j["llm"].contains("work_us"));
+  EXPECT_FALSE(j["llm"].contains("n_decoded"));
+  EXPECT_TRUE(j["llm"].contains("us"));  // unchanged, always written
 }
 
 // Agreement is a value, not an absence: best == incumbent is how the report
@@ -300,7 +371,7 @@ TEST(TelemetryEvent, SerializesFetchDepthAndTruncation) {
   e.trunc = "config";
 
   auto j = nlohmann::json::parse(SerializeJsonl(e));
-  EXPECT_EQ(j["v"], 6);
+  EXPECT_EQ(j["v"], kSchemaVersion);
   EXPECT_EQ(j["before_depth"], 17);
   EXPECT_EQ(j["trunc"], "config");
 }

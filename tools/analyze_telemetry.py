@@ -73,6 +73,14 @@ CREATE TABLE ev (
   -- only the second makes `sel` incomparable with `rr.text`.
   head_displaced INT,    -- 1 when the pick survived, below position 0
   rr_pos_in_top INT      -- where it ended up, NULL when it is not in the list
+  ,
+  -- v7. NULL on any earlier line AND on a v7 line whose Score() returned
+  -- before it could measure. `llm_n_decoded = 0` is a real and common
+  -- measurement -- the batch submitted nothing to llama_decode -- so it must
+  -- not be conflated with NULL, which is why nothing here defaults.
+  llm_lock_us INT,       -- of llm_us, the wait for the model mutex
+  llm_work_us INT,       -- of llm_us, the part spent holding it
+  llm_n_decoded INT      -- candidate tokens decoded; 0 means none
 );
 
 -- One row per `type":"stats"` line (telemetry_event.h:StatsLine). Disjoint
@@ -147,7 +155,13 @@ CREATE TABLE recorder (
 # same two facts over EVERY segment rather than the sampled subset the event
 # stream keeps. The depth pair covers only the fetches the environment cut
 # short (screen/app) and is omitted when the window saw none.
-SCHEMA_VERSION = 6
+# v7 splits Event's `llm.us` into `lock_us` (waiting for LlmScorer's model
+# mutex, which a background prefill holds) and `work_us` (inside it), and adds
+# `n_decoded` -- candidate tokens submitted to llama_decode, where 0 is the
+# cheap mode rather than a missing measurement. `us` is unchanged. All three
+# are omitted when unmeasured, so a v6 line loads with them NULL and absent
+# must never be read as 0.
+SCHEMA_VERSION = 7
 
 # Below this many samples a percentage is noise, and the first percentage this
 # report prints becomes the baseline every later change is quoted against. The
@@ -381,7 +395,7 @@ def _load_event_line(db, e):
     engage_skip = e.get("llm_skip")
 
     db.execute(
-        "INSERT INTO ev VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO ev VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             e.get("ts"), e.get("machine"), e.get("schema"), e.get("src"),
             e.get("input"), e.get("ctx"), e.get("sel_idx"), e.get("sel"),
@@ -404,6 +418,8 @@ def _load_event_line(db, e):
             llm_best, llm_best_from, llm_dropped_n, sel_in_dropped,
             decline_kind, best_is_sel, engage_skip,
             head_displaced, rr_pos_in_top,
+            (llm or {}).get("lock_us"), (llm or {}).get("work_us"),
+            (llm or {}).get("n_decoded"),
         ),
     )
 
@@ -779,6 +795,7 @@ def main():
     if not total:
         print("No per-event lines (only stats lines) in the given files.")
         _print_skip_distribution(db)
+        _print_latency_split(db)
         _print_fetch_truncation(db)
         return 0
 
@@ -826,6 +843,7 @@ def main():
         # Independent of `usable`: it comes from the stats table, which
         # head_altered (a db-`rr` concept) has no bearing on.
         _print_skip_distribution(db)
+        _print_latency_split(db)
         _print_fetch_truncation(db)
         return 0
 
@@ -966,6 +984,7 @@ def main():
         print("  (no rejections recorded)")
 
     _print_skip_distribution(db)
+    _print_latency_split(db)
     _print_fetch_truncation(db)
     print()
     return 0
@@ -1082,6 +1101,110 @@ def _print_displaced_heads(db):
     print("  the tables below still do not count them: `sel != pick` under a")
     print("  displacement stays ambiguous, because the head the user was shown")
     print("  is not the head re-ranking produced.")
+
+
+def latency_split(db):
+    """Percentiles of the v7 latency split, bucketed by whether the batch decoded.
+
+    Returns [(bucket, n, us_p50, us_p95, lock_p50, work_p50)], coarsest first,
+    over the rows that actually carry a v7 measurement. `n_decoded IS NOT NULL`
+    is the gate, not `> 0`: zero is the cheap mode this exists to name.
+
+    Two questions in one table, because they are the two live hypotheses for
+    why production runs ~5x tools/bench_scorer.cc on the same batch geometry:
+
+      does it decode   `us` is bimodal on this and on nothing else that has
+                       been found -- ~0.18ms when every candidate is a single
+                       token (scored off the prefill's own last logits, nothing
+                       submitted) against ~11ms when one decode runs. Before v7
+                       this was inferred from candidate CHARACTER counts, which
+                       is a proxy: a character is not a token, and the log names
+                       only three of the scored candidates.
+      lock vs work     `lock_us` is time spent waiting for LlmScorer's model
+                       mutex, which the worker holds for the whole of a
+                       background prefill -- and a prefill is queued on every
+                       commit and every composition start, milliseconds before
+                       the Apply that then wants to score. A large lock share
+                       means the fix is scheduling (do not warm what is about
+                       to be scored, or let Score() pre-empt the warm), not the
+                       model.
+    """
+    by_bucket = {}
+    for r in db.execute(
+        "SELECT llm_n_decoded, llm_us, llm_lock_us, llm_work_us FROM ev"
+        " WHERE llm_n_decoded IS NOT NULL AND llm_us IS NOT NULL"
+    ):
+        n_dec, us, lock_us, work_us = r
+        bucket = ("no decode" if n_dec == 0
+                  else "1-4 tokens" if n_dec <= 4 else "5+ tokens")
+        by_bucket.setdefault(bucket, []).append((us, lock_us, work_us))
+    out = []
+    for bucket in ("no decode", "1-4 tokens", "5+ tokens"):
+        samples = by_bucket.get(bucket)
+        if not samples:
+            continue
+        out.append((
+            bucket, len(samples),
+            _pctl([x[0] for x in samples], 0.5),
+            _pctl([x[0] for x in samples], 0.95),
+            _pctl([x[1] for x in samples if x[1] is not None], 0.5),
+            _pctl([x[2] for x in samples if x[2] is not None], 0.5),
+        ))
+    return out
+
+
+def _pctl(xs, p):
+    """Nearest-rank percentile. None for an empty sample rather than a zero."""
+    if not xs:
+        return None
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(p * len(xs)))]
+
+
+def _print_latency_split(db):
+    print("\n" + "=" * 64)
+    print("SCORING LATENCY  which half of it, and whether it decoded")
+    print("=" * 64)
+    rows = latency_split(db)
+    if not rows:
+        print("  (no v7 line yet: every recorder here predates the split, or none of")
+        print("   their Score() calls got far enough to measure it. `llm.us` alone is")
+        print("   in the tables above and cannot answer this.)")
+        return
+    print(f"  {'batch':12s} {'n':>5s} {'us p50':>8s} {'us p95':>8s} "
+         f"{'lock p50':>9s} {'work p50':>9s}")
+    for bucket, n, us50, us95, lock50, work50 in rows:
+        def ms(v):
+            return "     --" if v is None else f"{v / 1000:7.2f}"
+        print(f"  {bucket:12s} {n:5d} {ms(us50)} {ms(us95)} {ms(lock50):>9s} {ms(work50):>9s}")
+    print()
+    print("  `no decode` is every candidate a single token: nothing is submitted to")
+    print("  llama_decode, each candidate's first token is scored off the prefill's")
+    print("  own last logits, and the whole call is essentially free. It is not a")
+    print("  degraded mode -- it is the cheap one, and it was 44% of scorings when")
+    print("  this was first measured.")
+    print()
+    total = sum(r[1] for r in rows)
+    lock_heavy = db.execute(
+        "SELECT COUNT(*) FROM ev WHERE llm_lock_us IS NOT NULL AND llm_us > 0"
+        " AND llm_lock_us * 2 > llm_us"
+    ).fetchone()[0]
+    if total < MIN_N:
+        print(f"  (shares withheld: {total} measured scoring(s) is below the {MIN_N} this")
+        print("   report will divide by)")
+        return
+    print(f"  the model lock was more than half the call on {lock_heavy} of {total} "
+         f"({lock_heavy / total:.1%}).")
+    if lock_heavy * 4 > total:
+        print("  That is the scheduling hypothesis, not the model: the worker holds")
+        print("  this mutex through a background prefill, and Copilot warms on every")
+        print("  commit and every composition start -- milliseconds before the Apply")
+        print("  that then wants to score. Look at copilot.cc's WarmRerankContext call")
+        print("  sites before touching n_gpu_layers or the model.")
+    else:
+        print("  So the lock is not where it goes, and a bench_scorer/production gap")
+        print("  has to be explained by something inside the lock -- contention for")
+        print("  the GPU with the candidate window, or the batch geometry itself.")
 
 
 def _print_skip_distribution(db):

@@ -185,10 +185,19 @@ bool RerankTranslation::Replenish() {
     // cache hit, not this. trace.score_us is the only place that measures the
     // real call.
     const auto score_t0 = std::chrono::steady_clock::now();
-    const auto scored = llm_scorer_->Score(llm_ctx_, to_score);
+    ScoreTiming timing;
+    const auto scored = llm_scorer_->Score(llm_ctx_, to_score, &timing);
     trace.score_us = std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - score_t0)
                          .count();
+    // Kept whole AND split. `score_us` stays the outer wall time -- it is what
+    // the p99 budget is written against and what every figure recorded before
+    // v7 measures -- while the split says which half of it moved. Assigning
+    // them here rather than inside Score() keeps the scorer seam free of
+    // telemetry types.
+    trace.score_lock_us = timing.lock_us;
+    trace.score_work_us = timing.work_us;
+    trace.score_n_decoded = timing.n_decoded;
     std::vector<float> raw_logprobs;
     std::vector<int> n_tokens;
     raw_logprobs.reserve(scored.size());
@@ -217,6 +226,9 @@ bool RerankTranslation::Replenish() {
     trace.llm.margin = decision.margin;
     trace.llm.n_scored = decision.n_scored;
     trace.llm.us = trace.score_us;
+    trace.llm.lock_us = trace.score_lock_us;
+    trace.llm.work_us = trace.score_work_us;
+    trace.llm.n_decoded = trace.score_n_decoded;
     trace.llm.skip = llm_rerank::SkipReasonName(decision.skip);
     if (decision.incumbent_index >= 0) {
       trace.llm.incumbent = to_score[static_cast<size_t>(decision.incumbent_index)];

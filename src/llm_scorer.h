@@ -54,7 +54,8 @@ class LlmScorer : public Scorer {
   ~LlmScorer() override;
 
   std::vector<CandidateScore> Score(const std::string& context,
-                                    const std::vector<std::string>& candidates) override;
+                                    const std::vector<std::string>& candidates,
+                                    ScoreTiming* timing) override;
   bool IsWarm(const std::string& context) const override;
   void WarmUp(const std::string& context) override;
 

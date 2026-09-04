@@ -93,6 +93,17 @@ struct RerankTrace {
   // a cache hit, not the scoring. This field is the only place that measures
   // the real thing.
   int64_t score_us = -1;
+  // The two halves of `score_us`, and whether the batch decoded -- straight
+  // off ScoreTiming (scorer.h), -1 when Score() was never called or returned
+  // before it could measure. `score_us` is deliberately NOT redefined as their
+  // sum: it is the outer wall time including the little either side of the
+  // lock, it is what the p99 budget is written against, and every figure
+  // recorded before schema v7 is that quantity. Two of these three are a
+  // latency attribution (which half moved) and the third is the cost class the
+  // latency turned out to be bimodal on.
+  int64_t score_lock_us = -1;
+  int64_t score_work_us = -1;
+  int score_n_decoded = -1;
   // The LLM path's decision, in the shape telemetry needs. Populated only
   // inside the `llm_scorer_` branch of RerankTranslation::Replenish(), i.e.
   // exactly when llm_skip above is kNone -- `text` empty then still

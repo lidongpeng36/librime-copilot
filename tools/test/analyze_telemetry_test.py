@@ -255,6 +255,93 @@ class LoweringTheThresholdHasTwoSides(unittest.TestCase):
         self.assertEqual(split["recovered_at"][0.5], split["blocked_at"][0.5]["obs_helped"])
 
 
+class LatencySplit(unittest.TestCase):
+    """v7 splits `llm.us` into the wait for LlmScorer's model mutex and the work
+    under it, and records whether the batch reached llama_decode at all. Before
+    it, production running ~5x tools/bench_scorer.cc on the same batch geometry
+    was unattributable -- the timer wrapped both halves, and the decode/no-decode
+    split had to be inferred from candidate CHARACTER counts."""
+
+    def _db(self, events):
+        db = sqlite3.connect(":memory:")
+        db.executescript(analyze.SCHEMA)
+        for e in events:
+            analyze._load_event_line(db, e)
+        return db
+
+    @staticmethod
+    def _scored(us, lock_us=None, work_us=None, n_decoded=None):
+        llm = {"incumbent": "哪", "best": "哪", "text": "哪", "from": 1,
+               "margin": 3.0, "skip": "none", "n_scored": 4, "dropped": [], "us": us}
+        for k, v in (("lock_us", lock_us), ("work_us", work_us), ("n_decoded", n_decoded)):
+            if v is not None:
+                llm[k] = v
+        return {"v": 7, "sel": "哪", "sel_idx": 0, "top": ["哪"], "llm_skip": "none",
+                "llm": llm}
+
+    def test_a_decodeless_batch_is_its_own_bucket(self):
+        db = self._db([self._scored(180, 0, 175, 0) for _ in range(3)]
+                      + [self._scored(11400, 100, 11200, 4) for _ in range(2)])
+        rows = {r[0]: r for r in analyze.latency_split(db)}
+        self.assertEqual(rows["no decode"][1], 3)
+        self.assertEqual(rows["1-4 tokens"][1], 2)
+        self.assertEqual(rows["no decode"][2], 180)
+        self.assertEqual(rows["1-4 tokens"][2], 11400)
+
+    def test_zero_decoded_tokens_is_a_measurement_not_a_missing_one(self):
+        # The whole cheap mode reports n_decoded == 0. Treating it as absent
+        # would hide exactly the half this field was added to name.
+        row = load_one(self._scored(180, 0, 175, 0))
+        self.assertEqual(row["llm_n_decoded"], 0)
+        self.assertEqual(row["llm_lock_us"], 0)
+
+    def test_a_v6_line_carries_none_of_the_three(self):
+        row = load_one({"v": 6, "sel": "哪", "sel_idx": 0, "top": ["哪"],
+                        "llm_skip": "none",
+                        "llm": {"incumbent": "哪", "best": "哪", "text": "哪",
+                                "from": 1, "margin": 3.0, "skip": "none",
+                                "n_scored": 4, "dropped": [], "us": 11400}})
+        self.assertIsNone(row["llm_lock_us"])
+        self.assertIsNone(row["llm_work_us"])
+        self.assertIsNone(row["llm_n_decoded"])
+
+    def test_a_line_without_the_split_is_left_out_of_the_table(self):
+        db = self._db([self._scored(11400)])          # v7 shape, nothing measured
+        self.assertEqual(analyze.latency_split(db), [])
+
+    def test_the_section_says_so_rather_than_printing_an_empty_table(self):
+        db = self._db([self._scored(11400)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_latency_split(db)
+        self.assertIn("no v7 line yet", buf.getvalue())
+
+    def test_a_lock_dominated_call_points_at_the_warm_trigger(self):
+        db = self._db([self._scored(11400, 9100, 2200, 4) for _ in range(analyze.MIN_N)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_latency_split(db)
+        out = buf.getvalue()
+        self.assertIn("WarmRerankContext", out)
+        self.assertNotIn("has to be explained by something inside the lock", out)
+
+    def test_an_uncontended_lock_points_away_from_scheduling(self):
+        db = self._db([self._scored(11400, 40, 11300, 4) for _ in range(analyze.MIN_N)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_latency_split(db)
+        out = buf.getvalue()
+        self.assertIn("inside the lock", out)
+        self.assertNotIn("WarmRerankContext", out)
+
+    def test_a_handful_of_scorings_gets_no_share(self):
+        db = self._db([self._scored(11400, 9100, 2200, 4)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            analyze._print_latency_split(db)
+        self.assertIn("shares withheld", buf.getvalue())
+
+
 class ImpliedSampleOk(unittest.TestCase):
     """`sample_ok` is a schema key the log does not carry, so the report has to
     be told it -- and a wrong value silently scales one side of the table

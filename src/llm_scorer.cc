@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <mutex>
@@ -194,11 +195,38 @@ struct LlmScorer::Impl {
   }
 
   std::vector<CandidateScore> Score(const std::string& context,
-                                    const std::vector<std::string>& candidates) {
+                                    const std::vector<std::string>& candidates,
+                                    ScoreTiming* timing) {
     if (warm_cache_.Lookup(context) != WarmCache::State::kHot) {
-      return {};
+      return {};  // nothing ran, so every ScoreTiming field stays -1
     }
+    // Timed separately from the work below because the two have opposite
+    // fixes and the sum of them cannot tell you which you are looking at --
+    // see ScoreTiming (scorer.h). The worker holds this same mutex for the
+    // whole of a background prefill, and a prefill is queued on every commit
+    // and every composition start, so a Score() arriving in that window waits
+    // here rather than in anything llama.cpp does.
+    const auto lock_t0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(model_mutex_);
+    const auto work_t0 = std::chrono::steady_clock::now();
+    if (timing) {
+      timing->lock_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(work_t0 - lock_t0).count();
+    }
+    // Records what actually happened even on the paths that return early, so
+    // a `work_us` of ~0 is legible as "returned without scoring" rather than
+    // as an impossibly fast scoring.
+    struct WorkTimer {
+      ScoreTiming* out;
+      std::chrono::steady_clock::time_point t0;
+      ~WorkTimer() {
+        if (out) {
+          out->work_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+        }
+      }
+    } work_timer{timing, work_t0};
     // Re-check under the lock: the worker can start warming a *different*
     // context between the Lookup above and this thread taking the lock, in
     // which case ctx_/ctx_last_logits_ no longer belong to `context` even
@@ -208,9 +236,16 @@ struct LlmScorer::Impl {
     }
     const int n = static_cast<int>(candidates.size());
     std::vector<CandidateScore> scores(n);
+    // Summed across groups, and set to 0 before the loop rather than left at
+    // -1: from here on a decode either happened or provably did not, and 0 is
+    // the finding -- the whole single-token-candidate mode this exists to
+    // measure reports exactly that.
+    if (timing) {
+      timing->n_decoded = 0;
+    }
     for (int base = 0; base < n; base += kMaxCandidates) {
       const int group_n = std::min(kMaxCandidates, n - base);
-      if (!ScoreGroup(candidates, base, group_n, &scores)) {
+      if (!ScoreGroup(candidates, base, group_n, &scores, timing)) {
         // A mid-group decode failure would otherwise leave the affected
         // candidates' sums truncated -- divided by their FULL n_tokens, a
         // shorter sum is a LESS negative (i.e. better-looking) score, so
@@ -413,7 +448,7 @@ struct LlmScorer::Impl {
   // the whole Score() result rather than keep the truncated sums, which
   // read as (incorrectly) favourable scores. See the call site's comment.
   bool ScoreGroup(const std::vector<std::string>& candidates, int base, int group_n,
-                  std::vector<CandidateScore>* out) {
+                  std::vector<CandidateScore>* out, ScoreTiming* timing = nullptr) {
     std::vector<std::vector<llama_token>> cand_tokens(group_n);
     // float, not double: this accumulates at most a few tokens' worth of
     // per-candidate log-probabilities (already individually rounded through
@@ -480,6 +515,9 @@ struct LlmScorer::Impl {
         next_index.push_back(r + 1);
         ++n_tok;
       }
+    }
+    if (timing) {
+      timing->n_decoded += n_tok;
     }
     if (n_tok > 0) {
       batch_.n_tokens = n_tok;
@@ -548,8 +586,9 @@ LlmScorer::LlmScorer(std::string model_path, LlmScorerOptions options)
 LlmScorer::~LlmScorer() = default;
 
 std::vector<CandidateScore> LlmScorer::Score(const std::string& context,
-                                             const std::vector<std::string>& candidates) {
-  return impl_->Score(context, candidates);
+                                             const std::vector<std::string>& candidates,
+                                             ScoreTiming* timing) {
+  return impl_->Score(context, candidates, timing);
 }
 
 bool LlmScorer::IsWarm(const std::string& context) const { return impl_->IsWarm(context); }
