@@ -596,20 +596,75 @@ Two things follow, and both were got wrong before this was measured:
   `bench_scorer` on an M4 Pro puts context 32 vs 64 at score p50 2.11 vs
   2.09ms with prefill (which is background anyway) at 1.86 vs 2.12ms. This is
   why `context_chars` went to 64 on 2026-09-04 for free.
-- **It is not GPU wake-up either.** Bucketed by idle gap since the previous
-  scoring, the decode-bearing mode is 11.41ms at a gap under 2 seconds and
-  10.06ms at a gap over 10 minutes -- flat.
+- **It is not GPU wake-up either** -- but the bucketing that established this
+  could not have seen the effect that IS there. Live gaps were bucketed at
+  "under 2 seconds" (11.41ms) against "over 10 minutes" (10.06ms), and it is
+  flat across them. The CPU-clock decay below completes within 50ms, so both
+  buckets sit on the far side of it. See the next paragraph: the answer is a
+  downclock, and every live gap is long enough to pay it in full.
 
-**Open, and currently unmeasurable: production is ~5x `bench_scorer` for the
-same work.** The bench does the same batch geometry (32-char context, four
-two-character candidates, GPU) and reports score p50 2.11ms / p99 3.70ms on
-the same machine that logs 11.1ms live. The instrument cannot settle it,
-because `trace.score_us` (`rerank_filter.cc:187-191`) wraps the whole
-`LlmScorer::Score()` call INCLUDING its wait on `model_mutex_` -- which
-`Prefill()` holds for the duration of a background warm, and warms fire on
-every commit and every composition start, i.e. milliseconds before the Apply
-that needs to score. Splitting that wait out of the work is the next
-measurement, not another guess.
+**Settled 2026-09-05: production is ~5x `bench_scorer` because the CPU is
+downclocked, and about 77% of the deployed scoring latency is that.** The
+question stood open with two suspects. Telemetry v7 killed the first -- the
+`model_mutex_` wait is now timed separately (`ScoreTiming::lock_us`) and is
+**0 across 97 scorings, maximum 0**, so a background prefill has never once
+blocked a scoring. `bench_scorer --idle-ms` kills the second by reproducing
+production exactly (M4 Pro, 64-char context):
+
+| idle before the score | 0ms | 20ms | 50ms | 100ms | 250ms |
+| --- | --- | --- | --- | --- | --- |
+| score p50 | **2.30** | 8.19 | 9.91 | 10.20 | 10.28 |
+| prefill p50 | 2.93 | 6.48 | 9.37 | 9.49 | 9.59 |
+
+The decay completes within 20-50ms and saturates. Real typing gaps are 150ms
+and up, so **production is permanently in the saturated column.**
+
+Matching that against live needs the geometry the deployment actually runs,
+which is NOT the table above: the dylib in `Squirrel.app` was copied at
+15:38 on 2026-09-04 and `669e79f` (kNCtx 4096 -> 2304) landed at 15:44, so
+every v7 line in the log was written at `n_ctx_seq` **512**, not 256. Re-run
+there: hot **2.17 / 2.36ms**, after a 100ms idle **12.54 / 12.61ms**. Live v7
+`work_us` p50 for decode-bearing scorings is **10.3ms** -- between the two and
+near the cold end, which is what a keystroke-driven mix should look like:
+`Apply()` runs for every live segment on every keystroke, so a multi-segment
+composition scores several times back to back and those later scorings are
+hot. A first draft of this paragraph claimed live and bench agreed "to a tenth
+of a millisecond"; they did, at two different `n_ctx_seq`, which is a
+coincidence and not a validation.
+
+Either way there is no gap left to explain -- 2.2ms hot against 12.5ms cold at
+the deployed geometry is a 10.3ms effect, and the competing hypothesis
+predicted 2.1ms flat. The tool's old figures were the hot column, and nothing
+before `--idle-ms` could print the other one.
+
+**Every latency figure in this file predating 2026-09-04 is a hot-column
+number unless it says otherwise**, which is a much larger caveat than it
+sounds. The `kNCtx` 4096 -> 2304 change was worth -22.7% of a number that is
+three-quarters downclock; the MLX backend's -48.7% was measured at the
+deployed 100ms idle and so is a comparison of two downclocked runs, which is
+the right comparison but not what its number was thought to mean.
+
+**Three mitigations were measured on 2026-09-05 and all three failed.**
+Recorded because the idea is the obvious one: `--qos`
+(`QOS_CLASS_USER_INTERACTIVE`) does nothing at all (10.02 vs 10.01), so this
+is frequency and not core placement; `--idle-spin` recovers half (score p50
+5.0ms, p99 11.6 -> 5.5) but costs a permanently occupied core; and
+`--pre-spin-us` / `--pre-spin-threads` -- a short burst triggered by the
+keystroke itself, which is the only shippable shape -- **loses at every point
+in the grid**. `keystroke p50` (the burst plus the score, which is what a user
+pays) rises monotonically from 10.26ms at no burst to 18.93ms at 10ms of
+burst, and it cannot do otherwise: the total recoverable is 5.3ms, so any
+burst longer than that loses by arithmetic, and at 5ms the measured recovery
+is 0.5ms. Eight cores instead of one changes nothing (9.68 vs 10.09, inside
+the 0.3ms spread) for 2.1x the CPU. The clock ramp needs tens of milliseconds
+of load whatever the core count; a keystroke gives microseconds of warning.
+Both flags are kept in `bench_scorer` -- they are the instrument that produced
+the negative, and a measurement nobody can re-run cannot be re-examined.
+
+What is left is not a scheduling trick but **less CPU-side work per scoring**:
+the penalty is paid on Metal command encoding and dispatch, so it scales with
+how much of that there is. That is also the most likely mechanism behind the
+MLX backend's win, which raises what fixing its runtime failure is worth.
 
 Three artifacts have to be present:
 

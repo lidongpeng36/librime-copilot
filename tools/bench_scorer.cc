@@ -74,7 +74,8 @@
 //
 //   bench_scorer --model <gguf> [--iters N] [--threads N] [--gpu-layers N]
 //                [--context-chars N] [--candidates N] [--candidate-chars N]
-//                [--idle-ms N] [--json]
+//                [--idle-ms N] [--idle-spin] [--pre-spin-us N]
+//                [--pre-spin-threads N] [--json] [--qos]
 //
 // THE TABLE ABOVE MEASURES ONE MODE UNDER ONE CONDITION, and until 2026-09-04
 // nothing said so. Live telemetry then put the deployed scorer at p50 11.1 ms
@@ -103,6 +104,76 @@
 //     first GPU work after the idle, exactly as it is live. An earlier draft
 //     of this that slept between iterations would have charged the wake-up to
 //     the prefill and reported the score as unaffected.
+//
+// WHAT `--idle-ms` TURNED OUT TO BE MEASURING: the CPU clock, and it is most
+// of the deployed latency. Swept on an M4 Pro, 64-char context, 60 iterations
+// per point:
+//
+//   idle before the score    0 ms   20 ms   50 ms   100 ms   250 ms
+//   score p50                2.30    8.19    9.91    10.20    10.28
+//   prefill p50              2.93    6.48    9.37     9.49     9.59
+//
+// The decay completes within 20-50 ms and saturates there. Real typing gaps
+// are 150 ms and up, so PRODUCTION IS ALWAYS IN THE SATURATED COLUMN.
+//
+// Matching that against live needs the geometry live actually runs, and it is
+// not the table above. The dylib in Squirrel.app predates the kNCtx 4096 ->
+// 2304 change, so every telemetry line was written at n_ctx_seq 512. Re-run
+// there (--n-ctx 4096 --n-seq-max 9): hot 2.17/2.36 ms, after a 100 ms idle
+// 12.54/12.61 ms, against a live v7 `work_us` p50 of 10.3 ms -- between the
+// two and near the cold end, which is right, because Apply() runs per live
+// segment on every keystroke and a multi-segment composition scores several
+// times back to back. An earlier draft compared that live 10.3 against the
+// 10.20 in the 256 table and called it agreement to a tenth of a millisecond;
+// that was two different geometries agreeing by coincidence. Check which
+// commit the running dylib contains before pairing any live number with a
+// bench one -- mtime cannot answer it.
+//
+// That settles the open question this tool was accused of: "production is ~5x
+// bench_scorer for the same work" was true and had two suspects, the
+// model_mutex_ wait and the batch geometry. Telemetry v7 killed the first
+// (`lock_us` 0 across 97 scorings, max 0) and this kills the second. There is
+// no gap left to explain: the tool's old figures were the hot column, and
+// nothing before --idle-ms could print the other one.
+//
+// THREE MITIGATIONS WERE MEASURED AND ALL THREE FAILED. Recorded because the
+// idea is the obvious one and will otherwise be had again:
+//
+//   * `--qos` (QOS_CLASS_USER_INTERACTIVE) does NOTHING: 10.02 against 10.01.
+//     So this is frequency, not core placement -- a scheduler hint cannot buy
+//     it, only actual work can.
+//   * `--idle-spin` burns the whole gap and recovers half of it (score p50
+//     5.01/5.05, p99 11.6 -> 5.5) at 101.8 ms of CPU per iteration, i.e. a
+//     permanently occupied core. It is the DISCRIMINATOR that proves the cost
+//     is the clock, and it is not a mode anyone should ship or benchmark in.
+//   * `--pre-spin-us` / `--pre-spin-threads` are the shippable form of the
+//     same idea: burst briefly right before the scoring, triggered live by the
+//     keystroke itself (Copilot::ProcessKeyEvent runs ahead of the filter's
+//     Apply). Measured at --idle-ms 100, two repeats per point:
+//
+//       pre-spin   score p50       keystroke p50    cpu ms/iter
+//       0 us       10.26 / 10.13   10.26 / 10.13     9.2
+//       1000 us    10.11 / 10.17   11.11 / 11.17    10.3
+//       5000 us     9.91 /  9.26   14.91 / 14.26    13.5
+//       10000 us    8.93 /  9.20   18.93 / 19.20    17.3
+//
+//     `keystroke p50` is the spin plus the score -- what a user would actually
+//     pay, since the burst is added latency and not a substitute for the work.
+//     It rises monotonically. There is no crossover, and there cannot be one:
+//     the TOTAL recoverable is 5.3 ms (10.26 down to the 5.0 that --idle-spin
+//     reaches), so any burst longer than 5.3 ms loses by arithmetic alone --
+//     and at 5 ms the measured recovery is 0.5 ms. Loading more cores does not
+//     change it either (8 threads for 5 ms: score 9.68/9.47 against 10.09/9.70
+//     at one thread, inside the 0.3 ms round-to-round spread, for 2.1x the CPU).
+//     The ramp needs tens of milliseconds of load whatever the core count, and
+//     a keystroke offers microseconds of warning.
+//
+// What is left, therefore, is not a scheduling trick but less CPU-side work
+// per scoring: the penalty is paid on command encoding and dispatch, so it
+// scales with how much of that there is. That is also the most likely
+// mechanism behind the MLX backend's measured -48.7% -- which was measured at
+// exactly this idle condition, and so is a comparison of two downclocked runs
+// rather than an artifact of one.
 //
 // `--json` prints one machine-readable object instead of the prose, which is
 // what tools/bench_matrix.py consumes to make before/after comparisons that
@@ -302,6 +373,8 @@ int main(int argc, char** argv) {
   bool json = false;
   bool qos = false;            // raise this thread's QoS class (Apple only)
   bool idle_spin = false;      // burn the gap instead of sleeping through it
+  int pre_spin_us = 0;         // busy-wait this long AFTER the idle, before scoring
+  int pre_spin_threads = 1;    // how many cores the pre-spin loads
   int n_ctx = kNCtx;           // llm_scorer.cc's kNCtx
   int n_seq_max = kNSeqMax;    // llm_scorer.cc's kNSeqMax
   int n_batch = kNBatch;       // llm_scorer.cc's kNBatch
@@ -330,6 +403,10 @@ int main(int argc, char** argv) {
       qos = true;
     } else if (!strcmp(argv[i], "--idle-spin")) {
       idle_spin = true;
+    } else if (!strcmp(argv[i], "--pre-spin-us") && i + 1 < argc) {
+      pre_spin_us = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--pre-spin-threads") && i + 1 < argc) {
+      pre_spin_threads = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "--n-ctx") && i + 1 < argc) {
       n_ctx = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "--n-seq-max") && i + 1 < argc) {
@@ -344,7 +421,8 @@ int main(int argc, char** argv) {
       fprintf(stderr, "usage: %s --model <gguf> [--iters N] [--threads N]\n", argv[0]);
       fprintf(stderr,
               "       [--gpu-layers N] [--context-chars N] [--candidates N]\n"
-              "       [--candidate-chars 1..4] [--idle-ms N] [--idle-spin] [--json] [--qos]\n"
+              "       [--candidate-chars 1..4] [--idle-ms N] [--idle-spin] [--pre-spin-us N]\n"
+              "       [--json] [--qos]\n"
               "       [--n-ctx N] [--n-seq-max N] [--n-batch N] [--n-ubatch N]\n"
               "       [--scores-per-prefill N]\n");
       return 2;
@@ -520,6 +598,13 @@ int main(int argc, char** argv) {
   // tool could not produce while the ratio was fixed at 1:1.
   std::vector<double> score_first_ms;
   std::vector<double> score_next_ms;
+  // --pre-spin-us: what the spin actually cost, and what a keystroke would
+  // therefore pay end to end. Kept as two vectors rather than one sum because
+  // the question has two halves and they move in opposite directions -- the
+  // spin is pure added latency, the score is what the ramp buys back, and only
+  // `keystroke_ms` says whether the trade is positive.
+  std::vector<double> spin_ms;
+  std::vector<double> keystroke_ms;
   long long scorings = 0;
   for (int it = 0; it < iters; ++it) {
     const double t_begin = NowMs();
@@ -598,6 +683,44 @@ int main(int argc, char** argv) {
         }
         slept_ms += NowMs() - t_sleep_begin;
       }
+      // --- The pre-spin. --idle-spin above proves the ceiling by never letting
+      // the core go idle at all, which costs a whole core and can never ship.
+      // This asks the shippable version of the same question: given that a
+      // keystroke arrives with the clock already decayed, does a SHORT burst of
+      // work immediately before the model runs bring it back?
+      //
+      // Deliberately AFTER the idle and OUTSIDE the score span. In production
+      // the trigger would be the keystroke itself -- Copilot::ProcessKeyEvent
+      // runs in the processor chain, ahead of the filter's Apply -- so the spin
+      // is latency the user pays on top of the scoring, not instead of it. A
+      // measurement that hid it inside the score phase would report a free win.
+      //
+      // --pre-spin-threads exists because one thread may only ramp one core.
+      // The helpers are spawned per iteration rather than kept in a pool on
+      // purpose: a pool of parked threads is itself a wake-up signal, and would
+      // make the measured cost of the burst smaller than the shipped version
+      // could ever be. Thread creation is ~20us here, inside the measured span
+      // where it belongs.
+      double spin_elapsed = 0.0;
+      if (pre_spin_us > 0) {
+        const double t_spin_begin = NowMs();
+        const double want_ms = (double)pre_spin_us / 1000.0;
+        std::vector<std::thread> helpers;
+        for (int t = 1; t < pre_spin_threads; ++t) {
+          helpers.emplace_back([t_spin_begin, want_ms]() {
+            while (NowMs() - t_spin_begin < want_ms) {
+              spin_sink = spin_sink + 1;
+            }
+          });
+        }
+        while (NowMs() - t_spin_begin < want_ms) {
+          spin_sink = spin_sink + 1;
+        }
+        for (auto& h : helpers) {
+          h.join();
+        }
+        spin_elapsed = NowMs() - t_spin_begin;
+      }
       const double t_score_begin = NowMs();
 
       // --- ScoreGroup: what Score() runs on the caller's thread. THIS is the
@@ -675,6 +798,8 @@ int main(int argc, char** argv) {
         score_next_ms.push_back(t_end - t_score_begin);
       }
       whole.push_back((t_prefilled - t_begin) + (t_end - t_score_begin));
+      spin_ms.push_back(spin_elapsed);
+      keystroke_ms.push_back(spin_elapsed + (t_end - t_score_begin));
       decoded_tokens += n_decoded_this_iter;
       scorings += 1;
     }
@@ -691,6 +816,8 @@ int main(int argc, char** argv) {
   std::sort(score_ms.begin(), score_ms.end());
   std::sort(score_first_ms.begin(), score_first_ms.end());
   std::sort(score_next_ms.begin(), score_next_ms.end());
+  std::sort(spin_ms.begin(), spin_ms.end());
+  std::sort(keystroke_ms.begin(), keystroke_ms.end());
 
   const double decoded_per_iter = (double)decoded_tokens / (double)scorings;
 
@@ -711,6 +838,11 @@ int main(int argc, char** argv) {
     printf("\"idle_ms\": %d, ", idle_ms);
     printf("\"qos\": %d, ", qos ? 1 : 0);
     printf("\"idle_spin\": %d, ", idle_spin ? 1 : 0);
+    printf("\"pre_spin_us\": %d, ", pre_spin_us);
+    printf("\"pre_spin_threads\": %d, ", pre_spin_threads);
+    printf("\"spin_p50_ms\": %.4f, ", Percentile(spin_ms, 0.50));
+    printf("\"keystroke_p50_ms\": %.4f, ", Percentile(keystroke_ms, 0.50));
+    printf("\"keystroke_p99_ms\": %.4f, ", Percentile(keystroke_ms, 0.99));
     printf("\"decoded_per_iter\": %.3f, ", decoded_per_iter);
     printf("\"scores_per_prefill\": %d, ", scores_per_prefill);
     printf("\"score_p50_ms\": %.4f, ", Percentile(score_ms, 0.50));
@@ -748,6 +880,11 @@ int main(int argc, char** argv) {
          Percentile(score_ms, 0.99));
   printf("prefill (background warm-up):  p50 %.2f ms  p99 %.2f ms\n", Percentile(prefill_ms, 0.50),
          Percentile(prefill_ms, 0.99));
+  if (pre_spin_us > 0) {
+    printf("pre-spin %.2f ms + score  =    p50 %.2f ms  p99 %.2f ms   <- what a keystroke pays\n",
+           Percentile(spin_ms, 0.50), Percentile(keystroke_ms, 0.50),
+           Percentile(keystroke_ms, 0.99));
+  }
   if (scores_per_prefill > 1) {
     // The graph-reuse question, in two numbers. A scoring that follows another
     // scoring of the same shape is the only one that can hit gf_res_prev; one
