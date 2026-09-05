@@ -25,7 +25,51 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/nlohmann/json.git
   GIT_TAG v3.11.3)
 
+# Keep a system ggml.h/llama.h from shadowing the vendored one.
+#
+# librime's root CMakeLists calls include_directories() for Boost, glog,
+# yaml-cpp, leveldb, marisa and opencc; on macOS every one of those resolves to
+# /opt/homebrew/include, which is then inherited by this directory and lands
+# FIRST on every compile line below -- ahead of the fetched ggml's own
+# ../include. Homebrew's `ggml` and `llama.cpp` formulae install ggml.h and
+# llama.h into exactly that prefix, so with either installed, ggml.c compiles
+# against a DIFFERENT ggml.h than the tree it belongs to and dies on
+#
+#   ggml.c:1258: static assertion failed due to requirement
+#   'GGML_GLU_OP_COUNT == 6': GGML_GLU_OP_COUNT != 6
+#
+# which names neither Homebrew nor the include path. Measured 2026-09-05: a
+# clean configure that had worked for weeks broke the moment `brew install
+# llama.cpp` pulled in ggml 0.23.0. Nothing in this repo changed.
+#
+# Same shape as the MLX header/library mixup CLAUDE.md records (Homebrew's
+# /opt/homebrew/include supplying headers for a library fetched elsewhere), and
+# fixed the same way: take the prefix out of the include list for the vendored
+# subtree ONLY, and say so out loud. Our own targets keep it -- they need
+# Boost and glog from there.
+get_property(_copilot_dir_includes DIRECTORY PROPERTY INCLUDE_DIRECTORIES)
+set(_copilot_shadowing "")
+foreach(_dir IN LISTS _copilot_dir_includes)
+  if(EXISTS "${_dir}/ggml.h" OR EXISTS "${_dir}/llama.h")
+    list(APPEND _copilot_shadowing "${_dir}")
+  endif()
+endforeach()
+if(_copilot_shadowing)
+  message(WARNING
+    "copilot: ${_copilot_shadowing} carries its own ggml.h/llama.h and would "
+    "shadow the llama.cpp fetched here. Dropping it from the include path for "
+    "the vendored subtree. This is a system package (brew: ggml, llama.cpp) "
+    "that nothing in this build needs -- uninstalling it is the tidier fix.")
+  set(_copilot_kept_includes ${_copilot_dir_includes})
+  list(REMOVE_ITEM _copilot_kept_includes ${_copilot_shadowing})
+  set_property(DIRECTORY PROPERTY INCLUDE_DIRECTORIES ${_copilot_kept_includes})
+endif()
+
 FetchContent_MakeAvailable(llama json)
+
+if(_copilot_shadowing)
+  set_property(DIRECTORY PROPERTY INCLUDE_DIRECTORIES ${_copilot_dir_includes})
+endif()
 
 # GCC 13 may emit false-positive -Wmaybe-uninitialized warnings in
 # upstream llama.cpp regex code (treated as errors in some CI setups).

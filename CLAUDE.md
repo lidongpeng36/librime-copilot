@@ -57,7 +57,30 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_ASAN=ON
 cmake --build build
 ```
 
+- **That command mirrors CI, and CI does not need the deployable dylib.**
+  `BUILD_MERGED_PLUGINS` is librime's own option and defaults to **ON**
+  (librime `CMakeLists.txt:16`), which folds the plugin into `librime.dylib`
+  and emits no `lib/rime-plugins/` at all. CI is fine that way — `copilot_test`
+  links the plugin objects directly — but every deploy recipe below copies
+  `build/lib/rime-plugins/librime-copilot.dylib`, so **a tree configured with
+  the command above has nothing to copy.** For a tree you will deploy from:
+  ```sh
+  cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_MERGED_PLUGINS=OFF
+  ```
+  Measured 2026-09-05: a from-scratch configure following the documented line
+  built cleanly, passed every test, and produced no dylib. Nothing said so —
+  the missing artifact is only visible at the `sudo cp`.
 - **llama.cpp** (tag `b10456`) and **nlohmann_json** are pulled via CMake `FetchContent` — the first configure downloads and builds llama.cpp, which is slow.
+- **A Homebrew `ggml` or `llama.cpp` formula breaks the build**, and the error
+  names neither. librime's root `include_directories()` calls for Boost, glog,
+  yaml-cpp, leveldb, marisa and opencc all resolve to `/opt/homebrew/include`
+  on macOS, and that lands FIRST on every compile line — ahead of the fetched
+  ggml's own `../include`. Those formulae install `ggml.h`/`llama.h` there, so
+  `ggml.c` compiles against a foreign header and dies on
+  `static_assert(GGML_GLU_OP_COUNT == 6)`. `CMakeLists.txt` now detects this,
+  drops the prefix for the vendored subtree only, and warns; the tidier fix is
+  `brew uninstall llama.cpp ggml`, which nothing here needs. Same shape as the
+  MLX header/library mixup recorded under "The MLX backend".
 - Lint (CI gates on this, `clang-format -Werror`):
   ```sh
   find src tools -name '*.cc' -o -name '*.h' | xargs clang-format -i
@@ -644,7 +667,10 @@ not know the model exists. It reports success. Same shape as the `dict.json`
 ```sh
 # 1. source and tools first
 git clone <librime>; cd librime; git clone <copilot> plugins/copilot
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+# BUILD_MERGED_PLUGINS=OFF is what produces lib/rime-plugins/ for step 4;
+# librime defaults it ON and then there is no dylib to copy -- see "Build & lint"
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_MERGED_PLUGINS=OFF
+cmake --build build
 # 2. installation.yaml needs `sync_dir` by hand -- Squirrel never writes it
 plugins/copilot/tools/rime-copilot install
 # 3. only now
@@ -706,7 +732,7 @@ Building it needs a pip-installed MLX for its headers and prebuilt libraries:
 ```sh
 python3 -m venv ~/.local/share/rime-corpus/mlx-venv
 ~/.local/share/rime-corpus/mlx-venv/bin/pip install mlx
-cmake -B build -DCOPILOT_WITH_MLX=ON \
+cmake -B build -DCOPILOT_WITH_MLX=ON -DBUILD_MERGED_PLUGINS=OFF \
   -DMLX_ROOT=~/.local/share/rime-corpus/mlx-venv/lib/python3.12/site-packages/mlx
 ```
 
@@ -1173,6 +1199,8 @@ binary contains something only the new code has:
 
 ```sh
 cmake --build build -j8          # ALL targets, not --target copilot_test
+ls build/lib/rime-plugins/librime-copilot.dylib   # absent => BUILD_MERGED_PLUGINS
+                                                  # was ON; see "Build & lint"
 strings "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/librime-copilot.dylib" \
   | grep -c "<a string added by the change you are shipping>"
 ```
