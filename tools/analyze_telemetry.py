@@ -1337,14 +1337,38 @@ def _print_skip_distribution(db):
     else:
         print("  warm-hit rate:      n/a (no engaged and no cold segments recorded)")
 
+    # `last seen` is not decoration. These counts pool every window ever
+    # recorded, across configuration changes nothing on the wire describes,
+    # and a reason that a config change RETIRED goes on contributing to its
+    # own share forever. Measured 2026-09-05: `battery` read 816 (10.0%) and
+    # looked like the second-largest live leak in the system; every one of
+    # those 816 was from 2026-08-21, before `battery_active: true` reached
+    # the schema, and the reason has not fired since. This is the same
+    # cross-configuration pooling trap `trunc_counts` already carries a
+    # warning for -- there it is the fetch depth, here it is any schema key
+    # the gate reads.
+    latest = db.execute(
+        "SELECT MAX(substr(ts, 1, 10)) FROM stats"
+    ).fetchone()[0]
     rows = db.execute(
-        "SELECT reason, SUM(count) AS n FROM skip GROUP BY reason ORDER BY n DESC"
+        "SELECT reason, SUM(count) AS n, MAX(substr(ts, 1, 10)) AS last_seen "
+        "FROM skip GROUP BY reason ORDER BY n DESC"
     ).fetchall()
-    print(f"\n  {'reason':<12}{'n':>10}{'share':>9}")
-    for reason, n in rows:
-        print(f"  {reason:<12}{n:>10}{n / segments:>8.1%}")
+    print(f"\n  {'reason':<12}{'n':>10}{'share':>9}  {'last seen':<12}")
+    retired = []
+    for reason, n, last_seen in rows:
+        mark = ""
+        if latest and last_seen and last_seen < latest:
+            mark = "  <- not since"
+            retired.append((reason, last_seen))
+        print(f"  {reason:<12}{n:>10}{n / segments:>8.1%}  {last_seen or '?':<12}{mark}")
     if not rows:
         print("  (no skips recorded -- the LLM path engaged on every segment observed)")
+    for reason, last_seen in retired:
+        print(f"\n  !!  `{reason}` last fired on {last_seen}; the newest window here is")
+        print(f"      {latest}. Its share above is history, not a live leak -- something")
+        print("      (a schema key, a code change) retired it. Split the files by date")
+        print("      before quoting that percentage as a thing to go and fix.")
     print("\n  If `cold` dominates, the problem is the warming trigger, not the model:")
     print("  see src/warm_cache.h and copilot.cc's WarmUp calls.")
 
