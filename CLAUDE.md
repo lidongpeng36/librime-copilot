@@ -1038,9 +1038,11 @@ behaviour and is left for real use — or a better instrument — to decide:
   for why a live p99 is roughly 2x either of them, and why the difference is
   one `llama_decode`, not context length.)
 - **`copilot/rerank/llm/require_han_context`** (default true) — the Han-context
-  gate. See "What is NOT built" below: it blocks 42.9% of all segments, lifting
-  it is safe, and lifting it changes the output on 75 of 27245. Stays true on
-  cost: 2.07x the scorings for no measurable gain.
+  gate. See "What is NOT built" below: it blocks ~28% of live segments, lifting
+  it is safe, and it stays true on cost. The 2026-08-21 replay that established
+  that was run in the 8-character régime, but re-checking it live in 2026-09-05
+  **confirmed the default rather than overturning it**: the blocked population
+  has LESS headroom than the rest, not more.
 - **`copilot/rerank/llm/n_gpu_layers`** (default 99) and **`.../n_threads`**
   (default 0 = `hardware_concurrency()`) — where the model runs. Both were
   hard-coded on no measurement; both defaults measure right on an M4, but on
@@ -1074,6 +1076,46 @@ ends any segment whose trailing **Han** run is empty — a db constraint the mod
 does not share, since it reads punctuation and Latin. It was re-measured on
 2026-08-21; the full record is
 the rerank cost-and-gate results record, kept locally.
+
+**That measurement was made with the model seeing 8 characters** — on
+2026-08-21 the fetch depth was
+`max(copilot/surrounding_context_chars, copilot/rerank/max_context_chars)`,
+both defaulting to 8 (`copilot.cc:100-108` at `66cea91`);
+`copilot/rerank/llm/context_chars` did not become a term in it until
+2026-08-28, and the deployed value did not reach 64 until 2026-09-04. That is
+the same stale-régime problem the margin sweep and the pre-2026-08-21 replay
+figures carry, and it looked like the largest un-annotated one in this file,
+because `noctx` is a stable 27–30% of all live segments.
+
+**Re-checked live on 2026-09-05, it confirms the default instead.** No replay
+arm is needed and none would help — see below. A gated segment is identifiable
+in the log by `ctx == ""` (`trace.ctx` is exactly the `TrailingCjkRun` the gate
+tests), and `ShouldRecord` keeps every `sel_idx != 0` in FULL, so a miss rate
+over that population needs no sampling correction. Over the 2026-08-31 →
+2026-09-05 window, 6248 segments, `noctx` 1786 (28.6%):
+
+| population | miss rate (user reached past the head) |
+| --- | --- |
+| gated by `require_han_context` (1786 segments, NOT re-ranked at all) | **2.58%** (46) |
+| everything else (4462 segments, already re-ranked) | 3.18% (142) |
+
+**The blocked population is the easier one.** Even un-re-ranked it misses less
+often than the re-ranked remainder, and the ceiling is flat arithmetic: 46
+misses in 6248 segments is **0.74% of all segments even if re-ranking fixed
+every one of them**, against a realistic conversion well under half that. The
+misses there are also the wrong shape for a language model — 38 of 46 are
+`sel_idx: 1` and 29 of 46 have a two-character (one-syllable) input, i.e.
+single-character homophone choices with no preceding text, which is the
+population a context model has least to say about.
+
+**And the replay harness could not have answered this anyway.** `evalset.py`
+exports only segments whose context ends in Han — the gate-blocked population
+is excluded from the ruler by construction, and for a good reason stated
+there: `replay_copilot` re-pushes real surrounding context only for segment 2+
+of a request, so in the corpus "no trailing Han run" is very nearly "no
+context at all", which is a property of how requests are cut at maximal Han
+runs rather than of the deployed 64-character fetch. Live telemetry is the
+only instrument that sees this population with a real context behind it.
 
 **Its safety question is settled: lifting it cannot repeat the 2026-08
 revert.** That revert happened because bucket B+D fell from 43.8% to 13.4% —
