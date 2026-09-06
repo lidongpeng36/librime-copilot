@@ -171,9 +171,10 @@
 // What is left, therefore, is not a scheduling trick but less CPU-side work
 // per scoring: the penalty is paid on command encoding and dispatch, so it
 // scales with how much of that there is. That is also the most likely
-// mechanism behind the MLX backend's measured -48.7% -- which was measured at
-// exactly this idle condition, and so is a comparison of two downclocked runs
-// rather than an artifact of one.
+// mechanism behind the -48.7% an MLX backend once measured at exactly this
+// idle condition -- a comparison of two downclocked runs rather than an
+// artifact of one. That backend is no longer in the tree; commit 464aab7 has
+// it, and CLAUDE.md's "The MLX backend, and why it is not here" says why.
 //
 // `--json` prints one machine-readable object instead of the prose, which is
 // what tools/bench_matrix.py consumes to make before/after comparisons that

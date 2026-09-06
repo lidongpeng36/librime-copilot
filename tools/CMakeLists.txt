@@ -50,20 +50,6 @@ add_executable(bench_scorer
 target_link_libraries(bench_scorer
   ${LINK_LIBS})
 
-# The two backends through the real Scorer seam, in one process. Unlike
-# score_candidates and bench_scorer above, this one deliberately DOES link the
-# plugin objects: measuring the shipped classes is the whole point, and that
-# brings rime and glog with it.
-if(TARGET rime-copilot-mlx)
-  add_executable(bench_backends
-    bench_backends.cc
-    ${COPILOT_ALL_OBJS})
-  target_link_libraries(bench_backends
-    ${LINK_LIBS}
-    ${rime_library}
-    ${rime_dict_library})
-endif()
-
 if(APPLE)
   find_library(APPSERVICES_LIBRARY ApplicationServices REQUIRED)
   find_library(APPKIT_LIBRARY AppKit REQUIRED)

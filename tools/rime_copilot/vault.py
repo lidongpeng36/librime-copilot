@@ -75,32 +75,6 @@ VAULTED_FILES = (
     "custom_phrase_double.txt",
 )
 
-# The MLX scoring backend's runtime, a SEPARATE group because it is ~197 MB and
-# only a machine running `copilot/rerank/llm/backend: mlx` needs any of it.
-# Folding it into VAULTED_FILES would push that onto every machine's iCloud and
-# every `restore`, for a backend that is off by default.
-#
-# They travel by vault rather than being built, because building MLX from
-# source needs Apple's Metal toolchain (`xcodebuild -downloadComponent
-# MetalToolchain`) which is a multi-gigabyte prerequisite on every machine; the
-# pip wheel these come from ships them prebuilt.
-#
-# WHERE THEY HAVE TO END UP IS NOT HERE. `restore --mlx` puts them under
-# private/mlx/ in the Rime directory, which is only transport: MLX searches for
-# mlx.metallib next to the BINARY that loaded it (ml-explore/mlx#2061), and
-# that binary is librime-copilot.dylib inside Squirrel.app. Getting them into
-# place is a `sudo cp` beside the plugin, in the same breath as the plugin
-# itself -- see `rime-copilot status`, the `mlx:` line.
-#
-# ALL THREE MUST MATCH THE BUILD. libmlx and libjaccl are what the plugin was
-# linked against and mlx.metallib is the kernel library that libmlx loads;
-# a mismatched metallib does not degrade, it throws std::out_of_range from
-# inside MLX's device setup and takes the input method process with it.
-MLX_FILES = (
-    "private/mlx/libmlx.dylib",
-    "private/mlx/libjaccl.dylib",
-    "private/mlx/mlx.metallib",
-)
 
 MANIFEST_NAME = "manifest.json"
 FILES_DIR = "files"
@@ -168,10 +142,9 @@ def write_manifest(vault: Path, records: dict[str, Record]) -> None:
     temporary.replace(path)
 
 
-def plan_restore(rime_dir: Path, vault: Path, *, force: bool = False,
-                 include_mlx: bool = False) -> list[Action]:
+def plan_restore(rime_dir: Path, vault: Path, *, force: bool = False) -> list[Action]:
     actions = []
-    for rel in VAULTED_FILES + (MLX_FILES if include_mlx else ()):
+    for rel in VAULTED_FILES:
         stored = safe_join(vault / FILES_DIR, rel)
         local = safe_join(rime_dir, rel)
         if not stored.is_file():
@@ -199,8 +172,7 @@ def apply_restore(rime_dir: Path, vault: Path, actions: Sequence[Action]) -> Non
         temporary.replace(local)
 
 
-def plan_backup(rime_dir: Path, vault: Path, *, machine: str, force: bool = False,
-                include_mlx: bool = False) -> list[Action]:
+def plan_backup(rime_dir: Path, vault: Path, *, machine: str, force: bool = False) -> list[Action]:
     """Plan a backup, refusing to overwrite another machine's copy.
 
     The mirror image of plan_restore's rule, and it is missing here for
@@ -219,7 +191,7 @@ def plan_backup(rime_dir: Path, vault: Path, *, machine: str, force: bool = Fals
     """
     records = read_manifest(vault)
     actions = []
-    for rel in VAULTED_FILES + (MLX_FILES if include_mlx else ()):
+    for rel in VAULTED_FILES:
         local = safe_join(rime_dir, rel)
         stored = safe_join(vault / FILES_DIR, rel)
         if not local.is_file():
