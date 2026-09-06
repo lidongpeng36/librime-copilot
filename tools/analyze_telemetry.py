@@ -1196,10 +1196,10 @@ def _pctl(xs, p):
 def warm_split(db):
     """[(kind, count)] over dedup|extend|rebuild, commonest first.
 
-    The applicability of an incremental prefill, and nothing else. Today both
-    backends wipe the KV cache and re-decode the whole context on every warm --
-    14.7 ms on llama.cpp, 22.0 ms on MLX -- and most of that work is already in
-    the cache the rebuild just discarded. Whether that is worth fixing depends
+    The applicability of an incremental prefill, and nothing else. The scorer
+    wipes the KV cache and re-decodes the whole context on every warm -- 14.7 ms
+    on llama.cpp, and 22.0 ms on the MLX backend that used to sit beside it --
+    and most of that work is already in the cache the rebuild just discarded. Whether that is worth fixing depends
     entirely on how often the new context merely EXTENDS the old one, which
     nothing in this tree could see before v8.
 

@@ -13,6 +13,7 @@
 #include <chrono>
 
 #include "caret_context.h"
+#include "copilot_config.h"
 #include "copilot_engine.h"
 #include "history.h"  // copilot::UTF8
 #include "prediction_context.h"
@@ -595,37 +596,35 @@ CopilotRerankFilterComponent::~CopilotRerankFilterComponent() {}
 
 CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) {
   RerankOptions options;
-  string db_name = "copilot.db";
-  if (auto* schema = ticket.schema) {
-    if (auto* config = schema->config()) {
-      config->GetString("copilot/db", &db_name);
-      config->GetBool("copilot/rerank/enable", &options.enable);
-      config->GetInt("copilot/rerank/max_context_chars", &options.max_context_chars);
-      config->GetInt("copilot/rerank/window", &options.window);
-      config->GetInt("copilot/rerank/max_rank", &options.max_rank);
-      config->GetBool("copilot/rerank/same_span_only", &options.same_span_only);
-      config->GetBool("copilot/rerank/llm/enable", &options.llm.enable);
-      config->GetString("copilot/rerank/llm/model", &options.llm.model);
-      config->GetBool("copilot/rerank/llm/battery_active", &options.llm.battery_active);
-      config->GetBool("copilot/rerank/llm/require_han_context", &options.llm.require_han_context);
-      config->GetInt("copilot/rerank/llm/top_n", &options.llm.top_n);
-      config->GetInt("copilot/rerank/llm/context_chars", &options.llm.context_chars);
-      // Config has GetDouble but no GetFloat (rime/config/config_component.h)
-      // -- read into a double, seeded with the struct default, then narrow.
-      double margin_double = static_cast<double>(options.llm.margin);
-      config->GetDouble("copilot/rerank/llm/margin", &margin_double);
-      double exponent_double = static_cast<double>(options.llm.length_exponent);
-      config->GetDouble("copilot/rerank/llm/length_exponent", &exponent_double);
-      options.llm.margin = static_cast<float>(margin_double);
-      options.llm.length_exponent = static_cast<float>(exponent_double);
-    }
+  Config* config = ticket.schema ? ticket.schema->config() : nullptr;
+  // The seven keys the processor and/or the engine component read too,
+  // including both length clamps -- copilot.cc used to carry its own copy of
+  // each, kept in step by hand. See copilot_config.h.
+  const CopilotSharedConfig shared = ReadCopilotSharedConfig(config);
+  string db_name = shared.db;
+  options.enable = shared.rerank_enable;
+  options.max_context_chars = shared.rerank_max_context_chars;
+  options.llm.enable = shared.llm_enable;
+  options.llm.model = shared.llm_model;
+  options.llm.battery_active = shared.llm_battery_active;
+  options.llm.context_chars = shared.llm_context_chars;
+  // Everything below has exactly one reader -- this one -- so it is read where
+  // it is used rather than routed through the shared struct.
+  if (config) {
+    config->GetInt("copilot/rerank/window", &options.window);
+    config->GetInt("copilot/rerank/max_rank", &options.max_rank);
+    config->GetBool("copilot/rerank/same_span_only", &options.same_span_only);
+    config->GetBool("copilot/rerank/llm/require_han_context", &options.llm.require_han_context);
+    config->GetInt("copilot/rerank/llm/top_n", &options.llm.top_n);
+    // Config has GetDouble but no GetFloat (rime/config/config_component.h)
+    // -- read into a double, seeded with the struct default, then narrow.
+    double margin_double = static_cast<double>(options.llm.margin);
+    config->GetDouble("copilot/rerank/llm/margin", &margin_double);
+    double exponent_double = static_cast<double>(options.llm.length_exponent);
+    config->GetDouble("copilot/rerank/llm/length_exponent", &exponent_double);
+    options.llm.margin = static_cast<float>(margin_double);
+    options.llm.length_exponent = static_cast<float>(exponent_double);
   }
-  options.max_context_chars = std::clamp(options.max_context_chars, 1, kMaxSurroundingPrefixChars);
-  // Clamped to the same ceiling the sources fetch to, and for the same
-  // reason copilot.cc clamps it: this key now sizes the per-keystroke
-  // surrounding query (SurroundingPrefixChars), so a value the sources can
-  // never return would make every fetch look truncated by config forever.
-  options.llm.context_chars = std::clamp(options.llm.context_chars, 1, kMaxSurroundingPrefixChars);
   options.window = std::clamp(options.window, 1, 200);
   options.max_rank = std::clamp(options.max_rank, 1, 100000);
   options.llm.top_n = std::clamp(options.llm.top_n, 1, options.window);

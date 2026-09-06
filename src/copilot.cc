@@ -24,6 +24,7 @@
 #include "auto_spacer.h"
 #include "caret_context.h"
 #include "context_identity.h"
+#include "copilot_config.h"
 #include "copilot_engine.h"
 #include "ime_bridge.h"
 #include "prediction_context.h"
@@ -85,16 +86,13 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
   // Read disabled plugins from config
   std::set<string> disabled_plugins;
   if (auto* config = engine_->schema()->config()) {
-    config->GetBool("copilot/telemetry/enable", &telemetry_options_.enable);
-    config->GetInt("copilot/telemetry/top_n", &telemetry_options_.top_n);
-    int max_file_bytes = static_cast<int>(telemetry_options_.max_file_bytes);
-    if (config->GetInt("copilot/telemetry/max_file_bytes", &max_file_bytes)) {
-      telemetry_options_.max_file_bytes = max_file_bytes;
-    }
-    config->GetInt("copilot/telemetry/keep_generations", &telemetry_options_.keep_generations);
-    config->GetInt("copilot/telemetry/sample_ok", &telemetry_options_.sample_ok);
-    config->GetBool("copilot/telemetry/auto_sync", &telemetry_options_.auto_sync);
-    telemetry::ClampOptions(telemetry_options_);
+    const CopilotSharedConfig shared = ReadCopilotSharedConfig(config);
+    // Re-read here rather than trusting the copy CopilotComponent::Create
+    // passed in: that one comes from `ticket.schema`, this one from
+    // `engine_->schema()`, and this constructor has always let its own read
+    // win. The eight lines that used to spell it out were byte-identical to
+    // Create's. One reader now, so they cannot drift apart again.
+    telemetry_options_ = ReadTelemetryOptions(config);
 
     config->GetBool("copilot/context_memory/enable", &context_memory_options_.enable);
     config->GetBool("copilot/context_memory/use_pane_command",
@@ -145,32 +143,24 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
         std::clamp(surrounding_context_chars_, 1, kMaxSurroundingPrefixChars);
     consumers.use_surrounding_context = use_surrounding_context_;
     consumers.surrounding_context_chars = surrounding_context_chars_;
-    bool rerank_enable = true;
-    int rerank_chars = 8;
-    config->GetBool("copilot/rerank/enable", &rerank_enable);
-    config->GetInt("copilot/rerank/max_context_chars", &rerank_chars);
-    rerank_max_context_chars_ = std::clamp(rerank_chars, 1, kMaxSurroundingPrefixChars);
-    consumers.rerank_enable = rerank_enable;
+    // Every rerank key below is also read by CopilotRerankFilterComponent, and
+    // the two lengths were clamped to the same bounds at both sites by hand.
+    // `shared` is that one read, clamps included (copilot_config.h). The
+    // SCORER's own context length is a different and longer string than the
+    // db's Han-only tail -- WarmRerankContext keys the warm cache on it while
+    // CopilotRerankFilter::Apply asks about the same function's result, so a
+    // disagreement here does not fail loudly: every warm lands on a string
+    // nobody asks about and the feature silently never runs. It was a
+    // hard-coded 32 in copilot.h against a filter that read config, agreeing
+    // only because the schema happened to say 32 and the 8-character source
+    // ceiling made every value above 8 indistinguishable.
+    rerank_max_context_chars_ = shared.rerank_max_context_chars;
+    rerank_llm_context_chars_ = shared.llm_context_chars;
+    rerank_llm_battery_active_ = shared.llm_battery_active;
+    consumers.rerank_enable = shared.rerank_enable;
     consumers.rerank_max_context_chars = rerank_max_context_chars_;
-    // The SCORER's own context length -- a different and longer string than the
-    // db's Han-only tail. Read here because WarmRerankContext keys the warm
-    // cache on it while CopilotRerankFilter reads the same key for Apply(); it
-    // was a hard-coded 32 (copilot.h) against a filter that read config, and
-    // the two agreed only because the schema happened to say 32 and the
-    // 8-character source ceiling made every value above 8 indistinguishable.
-    //
-    // Now a term in the fetch depth as well, which is what makes that ceiling
-    // go away: with it declared but not folded in, the sources stopped at 8
-    // whatever the schema said, and 71% of measured fetches ended in
-    // kByConfig. It is clamped here for the same reason -- an unclamped key
-    // that only ever truncated a string it could not lengthen now sizes a
-    // per-keystroke query.
-    config->GetInt("copilot/rerank/llm/context_chars", &rerank_llm_context_chars_);
-    rerank_llm_context_chars_ =
-        std::clamp(rerank_llm_context_chars_, 1, kMaxSurroundingPrefixChars);
-    config->GetBool("copilot/rerank/llm/enable", &consumers.llm_enable);
+    consumers.llm_enable = shared.llm_enable;
     consumers.llm_context_chars = rerank_llm_context_chars_;
-    config->GetBool("copilot/rerank/llm/battery_active", &rerank_llm_battery_active_);
     const int prefix_chars = SurroundingPrefixChars(consumers);
     surrounding_prefix_chars_ = prefix_chars;
     LOG(INFO) << "[copilot] surrounding prefix_chars=" << prefix_chars
@@ -510,7 +500,13 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
   }
   if (keycode == XK_space) {
     // 仅在输入状态启用预测: 预测候选仅能通过数字选择
-    if (!ctx->input().empty() || IsNavigationKey(last_keycode_)) {
+    // `ctx &&` for the same reason every other use of it in this function has
+    // one: the head of this function tests `!ctx || !ctx->IsComposing()` and
+    // falls through rather than returning, so ctx can still be null here. This
+    // was the one dereference that did not check -- engine_->context() is
+    // never null in practice, so it is the function's own convention that was
+    // broken, not a live crash.
+    if (ctx && (!ctx->input().empty() || IsNavigationKey(last_keycode_))) {
       last_action_ = kUnspecified;
       last_keycode_ = keycode;
       return RunProcessors(key_event);
@@ -888,23 +884,18 @@ CopilotComponent::CopilotComponent(an<CopilotEngineComponent> engine_factory)
 CopilotComponent::~CopilotComponent() {}
 
 Copilot* CopilotComponent::Create(const Ticket& ticket) {
-  telemetry::Options telemetry_options;
   string schema_id;
+  Config* config = nullptr;
   if (auto* schema = ticket.schema) {
     schema_id = schema->schema_id();
-    if (auto* config = schema->config()) {
-      config->GetBool("copilot/telemetry/enable", &telemetry_options.enable);
-      config->GetInt("copilot/telemetry/top_n", &telemetry_options.top_n);
-      int max_file_bytes = static_cast<int>(telemetry_options.max_file_bytes);
-      if (config->GetInt("copilot/telemetry/max_file_bytes", &max_file_bytes)) {
-        telemetry_options.max_file_bytes = max_file_bytes;
-      }
-      config->GetInt("copilot/telemetry/keep_generations", &telemetry_options.keep_generations);
-      config->GetInt("copilot/telemetry/sample_ok", &telemetry_options.sample_ok);
-      config->GetBool("copilot/telemetry/auto_sync", &telemetry_options.auto_sync);
-    }
+    config = schema->config();
   }
-  telemetry::ClampOptions(telemetry_options);
+  // The same reader the Copilot constructor uses, which is the point: these
+  // two sites held byte-identical eight-line copies of this block, and the
+  // writer built here is what GetTelemetryWriter freezes for the whole
+  // process while the constructor's copy is what every commit is stamped
+  // with. See copilot_config.h.
+  const telemetry::Options telemetry_options = ReadTelemetryOptions(config);
   return new Copilot(ticket, engine_factory_->GetInstance(ticket),
                      engine_factory_->GetRerankTraces(schema_id),
                      engine_factory_->GetTelemetryWriter(telemetry_options), telemetry_options);

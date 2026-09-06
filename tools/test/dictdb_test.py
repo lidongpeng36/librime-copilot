@@ -259,6 +259,73 @@ class WritePairs(unittest.TestCase):
         prefixes = [line.split("\t")[0] for line in self.lines()]
         self.assertEqual(2, prefixes.count("建"))
 
+    # --- the ordering invariant the runtime cap depends on -------------------
+    #
+    # Everything below pins ONE property: within a prefix, continuations are
+    # emitted weight-descending. Nothing in this file used to check it, and
+    # test_per_key_cap above counts survivors without asking WHICH survived --
+    # so the order could invert silently.
+    #
+    # It matters outside this module. copilot/max_candidates caps the runtime
+    # lookup inside DBProvider::Lookup (src/db_provider.h), and that cap is
+    # lossless ONLY because the stored list is weight-descending: the global
+    # top-K is then exactly the union of each key's top-K. Measured, a
+    # 10356-continuation key came back with zero inversions, and capping it at
+    # 100 cut a 2.43 ms prediction to 0.009 ms with identical output. Break the
+    # order here and that cap silently becomes "keep an arbitrary K".
+    #
+    # The property is EMERGENT, not asserted anywhere in the implementation:
+    # merge() sorts by (first character, -weight); write_pairs walks that order
+    # into a plain dict, whose iteration order is insertion order; and
+    # `if e.weight > block.get(key, 0)` means the first insertion (the heaviest
+    # word introducing that pair) is the one that sticks. Three independent
+    # steps, any of which someone could change without noticing this.
+
+    def test_continuations_are_emitted_weight_descending(self):
+        # write_pairs' documented precondition is merge()'s output order.
+        words = [entry("建议", 90), entry("建立", 80), entry("建设", 70),
+                 entry("建国", 60), entry("建造", 50)]
+        write_pairs(words, self.out, float("inf"))
+        weights = [int(line.split("\t")[2]) for line in self.lines()
+                   if line.split("\t")[0] == "建"]
+        self.assertEqual([90, 80, 70, 60, 50], weights)
+        self.assertEqual(sorted(weights, reverse=True), weights)
+
+    def test_per_key_cap_keeps_the_HEAVIEST_k_not_an_arbitrary_k(self):
+        # The consequence the runtime cap rides on. If write_pairs ever emits
+        # in some other order this fails, and so does the claim that
+        # copilot/max_candidates is lossless.
+        words = [entry("建议", 90), entry("建立", 80), entry("建设", 70),
+                 entry("建国", 60)]
+        write_pairs(words, self.out, 2)
+        kept = [line.split("\t")[1] for line in self.lines()
+                if line.split("\t")[0] == "建"]
+        self.assertEqual(["议", "立"], kept)
+
+    def test_duplicate_pairs_keep_the_largest_IN_MERGE_ORDER(self):
+        # The third step of the invariant, and the one nothing tested.
+        # test_duplicate_pairs_from_multiple_readings_keep_the_largest above
+        # feeds 5 then 9 -- ASCENDING, which is not the order write_pairs
+        # documents itself as receiving. In ascending order "keep the largest"
+        # and "keep the last" agree, so that test cannot tell them apart:
+        # replacing `if e.weight > block.get(key, 0)` with a plain assignment
+        # leaves the whole suite green. Descending is merge()'s real output,
+        # and there the two disagree -- last-wins would store 5.
+        write_pairs([Entry("空落", "kong luo", 9), Entry("空落", "kong lao", 5)],
+                    self.out, float("inf"))
+        self.assertEqual(["空\t落\t9"], self.lines())
+
+    def test_the_order_survives_a_real_merge(self):
+        # The two halves pinned together: merge() is what actually establishes
+        # the precondition, so a change to ITS sort key has to fail something.
+        source = Source(Path("/s"))
+        entries = [entry("建设", 70), entry("建议", 90), entry("建立", 80)]
+        merged = merge([(source, entries)])
+        write_pairs(merged, self.out, float("inf"))
+        weights = [int(line.split("\t")[2]) for line in self.lines()
+                   if line.split("\t")[0] == "建"]
+        self.assertEqual(sorted(weights, reverse=True), weights)
+
     def test_every_line_survives_build_copilot_column_split(self):
         write_pairs([entry("建议书", 5)], self.out, float("inf"))
         for line in self.lines():

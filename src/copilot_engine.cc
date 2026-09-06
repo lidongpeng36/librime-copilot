@@ -1,10 +1,12 @@
 #include "copilot_engine.h"
 
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <sstream>
 
 #include <rime/candidate.h>
+#include <rime/config.h>
 #include <rime/context.h>
 #include <rime/deployer.h>
 #include <rime/dict/db_pool_impl.h>
@@ -17,12 +19,10 @@
 #include <rime/ticket.h>
 #include <rime/translation.h>
 
+#include "copilot_config.h"
 #include "db_provider.h"
 #include "llm_provider.h"
 #include "llm_scorer.h"
-#ifdef COPILOT_WITH_MLX
-#include "mlx_scorer.h"
-#endif
 #include "utils.h"
 
 namespace rime {
@@ -163,37 +163,37 @@ CopilotEngineComponent::~CopilotEngineComponent() {}
 
 CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   std::vector<std::shared_ptr<Provider>> providers;
-  string db_name = "copilot.db";
   int max_iterations = 0;
 
   DBProvider::Config db_config;
   LLMProvider::Config llm_config;
   string model_name = "";
-  // copilot/rerank/*: same three keys CopilotRerankFilterComponent::Create
-  // reads to decide whether to build a Scorer -- kept in lockstep with it so
-  // "off by default" holds here too and the filter's LOG line ("llm.model=ok"
-  // when a scorer exists) still matches reality.
-  // Defaults true: a schema that names copilot/llm/model and expects
-  // predictions keeps getting them. Setting it false is how a schema stops
-  // paying for a model it never uses -- see the construction site below.
+  // copilot/llm/enable. Defaults true: a schema that names copilot/llm/model
+  // and expects predictions keeps getting them. Setting it false is how a
+  // schema stops paying for a model it never uses -- see the construction site
+  // below. Single reader, so it stays read here.
   bool llm_enable = true;
-  bool rerank_enable = true;
-  bool rerank_llm_enable = false;
-  string rerank_llm_model;
   LlmScorerOptions rerank_llm_scorer;
-  // copilot/rerank/llm/backend: llama | mlx. Defaults to llama everywhere --
-  // llama.cpp is what Linux builds, what the prediction provider uses, and the
-  // reference the MLX path is verified against.
+  // copilot/rerank/llm/backend. There is one backend now; this is still read
+  // so a schema that names another can be TOLD rather than silently given
+  // llama.cpp -- see the construction site below.
   std::string rerank_llm_backend = "llama";
-  // Read here rather than at the construction site: `config` is scoped to the
-  // block above, and every other option on this path is read in one place.
-  bool rerank_mlx_compile = true;
-  bool rerank_mlx_f16 = true;
-  if (auto* schema = ticket.schema) {
-    auto* config = schema->config();
-    if (config->GetString("copilot/db", &db_name)) {
-      LOG(INFO) << "custom copilot/db: " << db_name;
-    }
+  // copilot/db and the three copilot/rerank keys below are read by
+  // CopilotRerankFilterComponent::Create too (and rerank/enable by the Copilot
+  // processor as well). Those three used to be kept in lockstep with the
+  // filter by hand and by a comment saying so -- "off by default" has to hold
+  // in both places or the filter's LOG line ("llm.model=ok" when a scorer
+  // exists) stops matching reality. One reader now. See copilot_config.h.
+  Config* config = ticket.schema ? ticket.schema->config() : nullptr;
+  const CopilotSharedConfig shared = ReadCopilotSharedConfig(config);
+  const string db_name = shared.db;
+  const bool rerank_enable = shared.rerank_enable;
+  const bool rerank_llm_enable = shared.llm_enable;
+  const string rerank_llm_model = shared.llm_model;
+  if (db_name != "copilot.db") {
+    LOG(INFO) << "custom copilot/db: " << db_name;
+  }
+  if (config) {
     if (!config->GetInt("copilot/max_candidates", &db_config.max_candidates)) {
       LOG(INFO) << "copilot/max_candidates is not set in schema";
     }
@@ -211,16 +211,11 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
       config->GetBool("copilot/llm/battery_active", &llm_config.battery_active);
       config->GetBool("copilot/llm/enable", &llm_enable);
     }
-    config->GetBool("copilot/rerank/enable", &rerank_enable);
-    config->GetBool("copilot/rerank/llm/enable", &rerank_llm_enable);
-    config->GetString("copilot/rerank/llm/model", &rerank_llm_model);
     // Where the model runs. Absent, both keep the values that were hard-coded
     // before tools/bench_scorer.cc made them measurable; see LlmScorerOptions.
     config->GetInt("copilot/rerank/llm/n_gpu_layers", &rerank_llm_scorer.n_gpu_layers);
     config->GetInt("copilot/rerank/llm/n_threads", &rerank_llm_scorer.n_threads);
     config->GetString("copilot/rerank/llm/backend", &rerank_llm_backend);
-    config->GetBool("copilot/rerank/llm/mlx_compile", &rerank_mlx_compile);
-    config->GetBool("copilot/rerank/llm/mlx_f16", &rerank_mlx_f16);
   }
   std::shared_ptr<::copilot::History> history = std::make_shared<::copilot::History>(100);
   // `enable` gates CONSTRUCTION, not just output, and that distinction is the
@@ -239,7 +234,24 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     if (std::filesystem::exists(model_path)) {
       LOG(INFO) << "[copilot] LLM: " << model_path;
       llm_config.model = model_path;
-      providers.push_back(std::make_shared<LLMProvider>(llm_config, history));
+      // llama::ClientSimple's constructor THROWS on a model or context it
+      // cannot create (llm.cc), and LLMProvider builds one eagerly -- so a
+      // file that exists but is truncated, is not a gguf, or is too large for
+      // the machine takes the exception all the way out of Create() and out of
+      // whatever Rime was doing, inside Squirrel. Nothing above this catches.
+      //
+      // The rest of the plugin's answer to a model it cannot load is to log
+      // once and carry on without it -- LlmScorer::EnsureLoaded sets
+      // load_failed_ and every caller reads Loaded() -- so match that here
+      // rather than change ClientSimple's contract, which the offline tools
+      // also depend on. A schema that names an unusable prediction model then
+      // behaves exactly like one that names none.
+      try {
+        providers.push_back(std::make_shared<LLMProvider>(llm_config, history));
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "[copilot] LLM: failed to load '" << model_path << "': " << e.what()
+                   << "; prediction will run without it";
+      }
     }
   }
   if (!model_name.empty() && !llm_enable) {
@@ -270,34 +282,18 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
         the<ResourceResolver>(Service::instance().CreateResourceResolver(kCopilotLLMResourceType));
     auto model_path = r->ResolvePath(rerank_llm_model);
     if (std::filesystem::exists(model_path)) {
-#ifdef COPILOT_WITH_MLX
-      // Runtime, not build time. The two backends read the SAME gguf -- MLX's
-      // loader converts ggml Q8_0 into its own packed 8-bit affine form and
-      // agrees with llama.cpp's logprobs to 0.0023 -- so switching is a config
-      // edit and a redeploy, with no new artifact and nothing to keep in sync.
-      // That is what makes an A/B on one machine possible at all; a
-      // compile-time choice would mean two builds and two measurements taken
-      // at different times, which this project has already been bitten by.
-      if (rerank_llm_backend == "mlx") {
-        MlxScorerOptions mlx_options;
-        mlx_options.compile = rerank_mlx_compile;
-        mlx_options.f16 = rerank_mlx_f16;
-        LOG(INFO) << "[copilot] rerank llm: backend=mlx, compile=" << mlx_options.compile;
-        scorer = std::make_unique<MlxScorer>(model_path, mlx_options);
-      } else {
-        scorer = std::make_unique<LlmScorer>(model_path, rerank_llm_scorer);
-      }
-#else
-      if (rerank_llm_backend == "mlx") {
-        // Named rather than ignored: a schema asking for a backend this build
-        // does not have would otherwise run llama.cpp and report nothing,
-        // which is the shape of every silent-fallback bug this tree records.
-        LOG(WARNING) << "[copilot] rerank llm: backend=mlx requested, but this build has no "
-                        "MLX support (configure with -DCOPILOT_WITH_MLX=ON on Apple). "
-                        "Using llama.cpp.";
+      // Named rather than ignored: a schema asking for a backend that no
+      // longer exists would otherwise run llama.cpp and report nothing, which
+      // is the shape of every silent-fallback bug this tree records. An MLX
+      // backend existed until 2026-09-06 and never ran; the measurements, the
+      // failure and the reasoning are in commit 464aab7, and CLAUDE.md's "The
+      // MLX backend, and why it is not here" says how to find them.
+      if (rerank_llm_backend != "llama") {
+        LOG(WARNING) << "[copilot] rerank llm: backend=" << rerank_llm_backend
+                     << " requested, but llama.cpp is the only backend. Using it. Remove "
+                        "copilot/rerank/llm/backend from the schema to silence this.";
       }
       scorer = std::make_unique<LlmScorer>(model_path, rerank_llm_scorer);
-#endif
     } else {
       LOG(ERROR) << "[copilot] rerank llm: model not found at " << model_path
                  << " (copilot/rerank/llm/model: " << rerank_llm_model << ")";

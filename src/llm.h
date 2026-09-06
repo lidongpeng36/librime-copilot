@@ -1,12 +1,14 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
-#include <string_view>
+#include <thread>
 
 struct ClientConfig {
   float temp = -1;
@@ -37,73 +39,7 @@ struct ClientConfig {
   // the old "whatever the model declares" behaviour and its cost.
   int n_ctx = 512;
   bool no_perf = true;
-  bool apply_chat_template = false;
 };
-
-struct BackendConfig {
-  int n_ctx = 0;  // = 0 表示使用模型的上下文大小
-  int n_batch = 512;
-  int n_gpu_layers = 99;
-
-  bool no_perf = true;
-  bool flash_attn = true;
-  std::string model_path;
-};
-
-namespace llama {
-
-using StreamCallback = std::function<bool(const std::string_view&)>;
-using OnFinishCallback = std::function<void(const std::string&)>;
-
-class Client;
-
-bool PrintCallback(const std::string_view&);
-
-class LLMManager {
- public:
-  std::unique_ptr<Client> CreateClient(const std::string& model, const std::string& name,
-                                       const ClientConfig&, StreamCallback callback = PrintCallback,
-                                       OnFinishCallback on_finish = nullptr);
-
-  static LLMManager& Instance() {
-    static LLMManager manager;
-    return manager;
-  }
-
-  class Impl;
-
- private:
-  LLMManager();
-  ~LLMManager();
-  LLMManager(const LLMManager&) = delete;
-  LLMManager& operator=(const LLMManager&) = delete;
-
-  std::unique_ptr<LLMManager::Impl> impl_;
-};
-
-struct ClientImpl;
-class Client {
- public:
-  ~Client();
-
-  void commit(const std::string& prompt = "", bool async = true);
-  void wait();
-  void clear();
-  void pop_back();
-  void pop_front();
-
-  int seq_id() const;
-  const std::string& model() const;
-  const std::string& name() const;
-
- private:
-  friend class LLMManager::Impl;
-  explicit Client(const std::shared_ptr<ClientImpl>& impl);
-
-  std::shared_ptr<ClientImpl> client_;
-};
-
-}  // namespace llama
 
 struct llama_vocab;
 struct llama_model;
@@ -111,6 +47,9 @@ struct llama_context;
 struct llama_sampler;
 
 namespace llama {
+
+using OnFinishCallback = std::function<void(const std::string&)>;
+
 class ClientSimple {
  public:
   ClientSimple(ClientConfig config, const std::string& model, OnFinishCallback on_finish = nullptr);

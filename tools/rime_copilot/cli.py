@@ -896,69 +896,6 @@ def _print_lexicon_status(rime_dir: Path) -> None:
         print("          re-run `clean`, or `restore` the shared copy")
 
 
-# Where Squirrel keeps the plugin, and therefore where MLX's runtime has to be.
-# MLX finds mlx.metallib next to the BINARY that loaded it, and libmlx is found
-# through @loader_path -- both resolve to this directory, not to the Rime user
-# directory the vault restores into.
-SQUIRREL_PLUGINS = Path("/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins")
-MLX_RUNTIME_NAMES = ("libmlx.dylib", "libjaccl.dylib", "mlx.metallib")
-
-
-def mlx_state(rime_dir: Path) -> "tuple[str, str]":
-    """(state, detail) for the MLX backend's three runtime files.
-
-    Checked because none of the ways this goes wrong is loud. A missing
-    mlx.metallib does not degrade to the db re-ranker the way a missing model
-    does -- MLX throws std::out_of_range from inside its Metal device setup and
-    the input method process dies. MlxScorer guards against that with its own
-    check before touching MLX, so the outcome is a log line and a disabled
-    backend rather than a crash; this is the check that says so BEFORE a user
-    switches the backend on and wonders why nothing changed.
-
-    Two locations, and the distinction matters. `private/mlx/` is where
-    `restore --mlx` puts them, which is transport only. Beside the plugin is
-    where they have to BE, and getting them there is a sudo copy that nothing
-    automates -- the same channel as the dylib itself, which CLAUDE.md already
-    calls the one most likely to be forgotten.
-    """
-    staged = rime_dir / "private" / "mlx"
-    have_staged = [n for n in MLX_RUNTIME_NAMES if (staged / n).is_file()]
-    installed = [n for n in MLX_RUNTIME_NAMES if (SQUIRREL_PLUGINS / n).is_file()]
-
-    if not have_staged and not installed:
-        return "absent", ("no MLX runtime anywhere; only needed for "
-                          "copilot/rerank/llm/backend: mlx")
-    if len(installed) == len(MLX_RUNTIME_NAMES):
-        if not have_staged:
-            return "installed", (f"all three beside the plugin (nothing staged in "
-                                 f"{staged}, so this machine cannot check them)")
-        differing = [n for n in MLX_RUNTIME_NAMES
-                     if paths.sha256_file(staged / n) != paths.sha256_file(SQUIRREL_PLUGINS / n)]
-        if differing:
-            # Not cosmetic: libmlx and mlx.metallib are a matched pair, and the
-            # plugin was linked against a particular libmlx. Whichever copy is
-            # stale, the answer is to make them agree, not to guess which.
-            return "mismatch", ("installed copies differ from private/mlx/: "
-                                + ", ".join(differing))
-        return "ok", "all three beside the plugin, matching private/mlx/"
-    if installed:
-        return "partial", ("beside the plugin: " + ", ".join(installed) + "; missing: "
-                           + ", ".join(n for n in MLX_RUNTIME_NAMES if n not in installed))
-    return "staged", (f"in {staged} but not beside the plugin -- "
-                      + ", ".join(have_staged))
-
-
-def _print_mlx_status(rime_dir: Path) -> None:
-    state, detail = mlx_state(rime_dir)
-    if state == "absent":
-        return  # nothing to say on a machine that never asked for this backend
-    print(f"mlx:      {state} -- {detail}")
-    if state in ("staged", "partial", "mismatch"):
-        print("          sudo cp ~/Library/Rime/private/mlx/* \\")
-        print(f"            \"{SQUIRREL_PLUGINS}/\"")
-        print("          then killall Squirrel -- a copy is not a load")
-
-
 def _print_model_status(rime_dir: Path) -> None:
     state, detail = model_state(rime_dir)
     print(f"model:    {state} -- {detail}")
@@ -1084,7 +1021,6 @@ def cmd_status(args) -> int:
     _print_lexicon_status(rime_dir)
     _print_grammar_status(rime_dir)
     _print_model_status(rime_dir)
-    _print_mlx_status(rime_dir)
     _print_installed_status(rime_dir)
     # Both lines are gated on the feature actually being on. It ships off, and
     # a line that prints on every run on every machine -- including the ones
@@ -1122,7 +1058,6 @@ def cmd_backup(args) -> int:
         return 1
     this_machine = paths.machine_id(rime_dir)
     actions = vault.plan_backup(rime_dir, store, machine=this_machine,
-                                include_mlx=getattr(args, "mlx", False),
                                 force=args.force)
     for action in actions:
         print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
@@ -1150,8 +1085,7 @@ def cmd_restore(args) -> int:
     if store is None:
         print(error)
         return 1
-    actions = vault.plan_restore(rime_dir, store, force=args.force,
-                                 include_mlx=getattr(args, "mlx", False))
+    actions = vault.plan_restore(rime_dir, store, force=args.force)
     for action in actions:
         print(f"  {action.kind:<17} {action.rel} {action.detail}".rstrip())
     conflicts = [a for a in actions if a.kind == "conflict"]
@@ -1876,13 +1810,11 @@ def build_parser() -> argparse.ArgumentParser:
     backup = sub.add_parser("backup")
     backup.add_argument("--force", action="store_true",
                         help="overwrite a vault copy another machine backed up")
-    backup.add_argument("--mlx", action="store_true", help="also carry the MLX backend's runtime (~197 MB: libmlx, libjaccl, mlx.metallib). Off by default -- only a machine running copilot/rerank/llm/backend: mlx needs any of it, and it would otherwise land in every machine's iCloud for a backend that is off")
     backup.set_defaults(func=cmd_backup)
 
     restore = sub.add_parser("restore")
     restore.add_argument("--force", action="store_true",
                          help="overwrite local files the vault does not know about")
-    restore.add_argument("--mlx", action="store_true", help="also carry the MLX backend's runtime (~197 MB: libmlx, libjaccl, mlx.metallib). Off by default -- only a machine running copilot/rerank/llm/backend: mlx needs any of it, and it would otherwise land in every machine's iCloud for a backend that is off")
     restore.set_defaults(func=cmd_restore)
 
     sub.add_parser("fetch").set_defaults(func=cmd_fetch)

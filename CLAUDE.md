@@ -80,7 +80,8 @@ cmake --build build
   `static_assert(GGML_GLU_OP_COUNT == 6)`. `CMakeLists.txt` now detects this,
   drops the prefix for the vendored subtree only, and warns; the tidier fix is
   `brew uninstall llama.cpp ggml`, which nothing here needs. Same shape as the
-  MLX header/library mixup recorded under "The MLX backend".
+  MLX header/library mixup recorded under "The MLX backend, and why it is
+  not here".
 - Lint (CI gates on this, `clang-format -Werror`):
   ```sh
   find src tools -name '*.cc' -o -name '*.h' | xargs clang-format -i
@@ -144,6 +145,53 @@ so sub-plugins just define a `Process` method and don't touch the `Processor` bo
 `Entry` (`copilot::Entry` in `provider.h`) is the common candidate type carrying
 `text`/`weight`/`type`. `src/history.{h,cc}` tracks commit history used as prediction context.
 
+**`copilot/max_candidates: 0` costs more than it looks, and the fix is the
+config, not the code.** The key caps `DBProvider::Lookup` itself, not just the
+display, so unset (0 -> `INT_MAX`) a prediction round materialises every
+continuation of every one of its `max_hints` keys. Measured 2026-09-06 against
+the deployed db, timing `Predict` + `Retrive` + `MergeProviderCandidates`:
+
+| context | total p50 | candidates |
+| --- | --- | --- |
+| `尝试进行代码` | 0.031 ms | 207 |
+| `好的谢谢` | 0.14 ms | 846 |
+| `高屋建` | 0.61 ms | 2850 |
+| **`我`** | **2.43 ms** (p95 4.11) | **10,356** |
+
+The tail is reached whenever the last committed character is a common one, and
+it runs on the input thread after every commit.
+
+**The obvious code fix is worth 11% and should not be made.** `Predict` builds
+a `std::list` (a heap allocation per entry), `list::sort`s it, copies it into
+`candidates_`, `Retrive` returns that BY VALUE, and `MergeProviderCandidates`
+copies and sorts again -- four copies and two sorts, which reads like the
+problem and is not it. Measured on `我`: the copies and both sorts together are
+0.12 ms of the 2.43 ms, and a `std::vector` + `nth_element` rewrite lands at
+2.16 ms. **92% of the cost is the lookup**, and `max_candidates` removes it at
+the source: the same round with the key set to 100 costs **0.009 ms**, a 270x
+cut with no code change at all.
+
+**Capping is lossless, and the argument has a premise worth knowing.** Each
+key's continuations are stored weight-descending (measured: 0 inversions over
+`我`'s 10,356), so an entry in the true global top-K must also be in its own
+key's top-K -- capping each key at K therefore preserves the global top-K
+exactly. But that ordering is EMERGENT rather than asserted anywhere: it falls
+out of `dictdb.merge` sorting by `(first character, -weight)`, `write_pairs`
+walking that order into a plain dict whose iteration order is insertion order,
+and `if e.weight > block.get(key, 0)` letting the first (heaviest) insertion
+stick. Three independent steps, none of which mentions the others.
+
+`tools/test/dictdb_test.py` now pins all three, and each was verified to have
+teeth by breaking that step and watching the suite go red. The third one had
+none until 2026-09-06: `test_duplicate_pairs_from_multiple_readings_keep_the_largest`
+feeds ASCENDING input, and in ascending order "keep the largest" and "keep the
+last" agree, so replacing that condition with a plain assignment left the whole
+suite green.
+
+`max_per_key` (`dictdb.write_pairs`, the build-time analogue) defaults to `-1`
+-> `inf`, so both gates are open by default. That is why `我` carries 10,356
+continuations at all.
+
 ### Sub-plugins
 - **AutoSpacer** (`src/auto_spacer.{h,cc}`) — inserts spaces at CJK↔Latin/number boundaries.
   Two paths: a `surrounding` path using real before/after context (from IMK or IME Bridge),
@@ -155,6 +203,110 @@ so sub-plugins just define a `Process` method and don't touch the `Processor` bo
 - **SelectCharacter** (`src/select_character.{h,cc}`).
 
 All three can be turned off via `copilot/disabled_plugins` in the schema config.
+
+### The surrounding-text sources, and which one you actually pay for
+
+`GetSurroundingContext()` (`src/surrounding_source.cc`) is IMK, then ImeBridge,
+then a tmux pane scrape, first to answer wins. The first two are a mutex and a
+struct copy. The third is a `posix_spawn`, and on a machine that lives in a
+terminal it is the one that answers:
+
+| source | share of live fetches |
+| --- | --- |
+| tmux | 1041 (72%) |
+| IMK | 331 (23%) |
+| ImeBridge | 71 (5%) |
+
+**Measured 2026-09-06, the tmux query costs p50 3.86 ms / p95 4.23 ms** —
+`BuildTmuxArgs`' exact five-command exec, 60 repetitions against a live server.
+It runs on the input thread, synchronously, with `timeout_ms` (default 50) as
+the ceiling.
+
+The memo makes that **once per key event, not once per consumer** — three
+callers ask independently — and `Copilot::ProcessKeyEvent` skips the
+invalidation while composing, so a whole Chinese word costs one query rather
+than one per keystroke. What is left is one query per NON-composing key event:
+every keystroke in ASCII mode, every character typed at a shell prompt, and the
+first key of each word. In a terminal that is 3.86 ms per key.
+
+That is larger than everything remaining in the scorer. Do not quote the
+3.86 ms as "measured overhead of the tmux source" without saying it is per
+non-composing key event only.
+
+**Where the 3.86 ms goes, and why "ask for less" buys nothing.** Measured
+2026-09-06, 40-60 repetitions each:
+
+| | p50 |
+| --- | --- |
+| `/usr/bin/true` (process-spawn floor) | 1.46 ms |
+| `tmux display-message -p x` (the most trivial query there is) | 3.78 ms |
+| the real five-command query, 5 KB of pane | 3.86 ms |
+
+So it is ~1.46 ms of process spawn, ~2.3 ms of tmux client startup and
+server-socket handshake, and **~0.25 ms of actually doing the work**. Capturing
+fewer rows, dropping `-e`, asking for less — all of it is inside that 0.25 ms.
+The cost is the invocation, not the content. Reducing how OFTEN we ask is the
+only thing that would matter, and that is a question about AutoSpacer's trigger,
+not about the query.
+
+**Reading the pane's device file instead is not possible.** Recorded because it
+is the natural first idea. `#{pane_tty}` is a character device of size 0 -- a
+stream, not a stored screen -- and it is the SLAVE side, held by the pane's
+shell as fds 0/1/2, so reading it would compete with that shell for the user's
+keystrokes. The master side lives inside the tmux server with no filesystem
+name at all (it does not even appear in `lsof` on the server by name). The grid
+is reconstructed by the server's own VT parser into its heap; there is no file,
+no shared memory and no mmap that exposes it. Speaking the server's unix-socket
+protocol directly is the same dead end wearing a different hat: the 2.3 ms IS
+that protocol's handshake, and reimplementing it buys nothing a persistent
+connection does not already get, in exchange for an internal protocol tmux
+version-checks and does not support third parties using.
+
+**A persistent control-mode connection is worth 10x, and is deliberately not
+built.** `tmux -C attach` keeps one client alive and takes commands on its
+stdin, so the spawn and the handshake are paid once instead of per key event.
+Measured over 60 repetitions of the identical five-command query:
+
+| | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| today, `posix_spawn` per query | 3.86 ms | 4.23 ms | 4.74 ms |
+| `tmux -C`, persistent | **0.39 ms** | 0.50 ms | 0.54 ms |
+
+(The round-trip floor on that connection is 0.08 ms; the four metadata
+commands are 0.28 ms; the pane capture takes it to 0.39 ms.)
+
+It is not built because the win is unperceived -- typing in a terminal does not
+feel slow -- and because the cost is larger than "a subprocess and a reader
+thread". **A control-mode client is a real attached client**, and it collides
+head-on with the arbitration this source depends on:
+
+- It appears in `list-clients` as a second client, flagged
+  `attached,focused,control-mode`, with its own `client_activity` that bumps on
+  every query we make.
+- `JudgeClients` (`tmux_source_util.h`) returns `kFocusEventsOff` whenever
+  `activity.size() > 1` and `focus-events` is off -- **and `focus-events` is off
+  by default in tmux**. So on a default machine a permanent control-mode client
+  would make this source refuse every query, forever. The feature would not
+  degrade; it would stop.
+- With `focus-events on` it is worse rather than better: our own client is
+  frequently the most recently active one, and tmux answers `display-message`
+  for that client -- which is precisely the cross-talk `JudgeClients` exists to
+  refuse, arrived at confidently.
+
+Solvable, probably: filter control-mode clients out of the `CLI|` list by
+`client_flags`, or attach the connection to a throwaway session and switch the
+query to `list-clients -t <the user's session>`. But that means reopening the
+one piece of logic in this file whose whole job is to refuse to answer rather
+than answer wrongly, which is a much larger change than the connection itself.
+
+Verified NOT a problem: a control-mode client does not resize the session
+(window stayed 159x43 with the client reporting `80x`), and the existing
+5-second backoff on a failed or timed-out query already bounds the tail from a
+wedged server to one 50 ms keystroke.
+
+**What would reopen this**: terminal typing actually feeling slow. The
+measurement and the collision are both recorded above, so the work would start
+from the arbitration question rather than from the connection.
 
 ### AutoSpacer's commits and Rime's user dictionary
 
@@ -603,6 +755,65 @@ Two things follow, and both were got wrong before this was measured:
   buckets sit on the far side of it. See the next paragraph: the answer is a
   downclock, and every live gap is long enough to pay it in full.
 
+**Refined 2026-09-06: "one decode or none" is the shape, but the decode is not
+one price.** The bimodal table above is right about WHICH windows are cheap and
+wrong to imply the expensive ones all cost the same. Measured on an M4 Pro at
+the deployed geometry (64-character context, `--idle-ms 100`, 30-40 iterations
+per point), varying the two things `ScoreGroup` controls independently:
+
+| scratch sequences | batch tokens | score p50 |
+| --- | --- | --- |
+| 2 | 4 | 7.91 ms |
+| 4 | 4 | 9.07 ms |
+| 4 | 8 | 11.41 ms |
+| 8 | 8 | 14.28 ms |
+| 4 | 12 | 13.40 ms |
+
+Those five points fit **`score_p50 ≈ 4.6 + 0.6·(scratch sequences) + 0.55·(batch
+tokens)` ms**, and the pair at (2,4) vs (4,4) is what separates the two terms:
+same token count, two more branched sequences, +1.16 ms. So **branching a
+scratch sequence costs about as much as decoding a token** -- roughly 0.6 ms
+each, both of them Metal command encoding and dispatch on a downclocked core.
+
+Geometry, because this file has been burned by leaving it out: these were run
+at `bench_scorer`'s default `--n-ctx 2304`, i.e. `n_ctx_seq` 256, which is what
+the currently deployed dylib runs (recopied 2026-09-05 14:33, after `669e79f`).
+The (4,4) point at 9.07 ms reproduces the 9.0 ms this file already records for
+`n_ctx_seq` 256 after a 100 ms idle, so the model DECOMPOSES a number already
+here rather than adding a new one.
+
+**It has not been checked against live telemetry, and the reason is worth
+knowing.** Splitting `work_us` by schema version: v7 is p50 10.29 ms over 71
+decode-bearing scorings, but every v7 line was written at `n_ctx_seq` **512**
+(the dylib predating `669e79f`), so it is not comparable. v8 — the first
+version written at 256 — is p50 6.11 ms over **7** scorings, which is too few
+to compare against anything. A first draft of this paragraph quoted "9.64 ms
+live", which was those two populations pooled: exactly the mistake recorded
+two paragraphs down, made again. Re-check once v8 has a few hundred lines.
+
+Two things this makes measurable that the bimodal account could not:
+
+- **`top_n` is a latency lever of about 1.2 ms per candidate** (0.6 for the
+  sequence plus 0.55 for its token), which is 13% of a deployed scoring each.
+  See "`top_n` stays at 4" below for why it is not taken.
+- **The all-single-character mode is free for the right reason.** 4 sequences
+  with no decode measures 0.19 ms against 1 sequence with no decode at 0.16 ms
+  -- the per-sequence term is ~0.02 ms when no decode follows it, because
+  nothing ever attends across those cells. The 0.6 ms is the sequence's share
+  of a decode, not the `seq_cp` itself.
+
+**A consequence that looks like an optimisation and is not.** `ScoreGroup`
+does `seq_rm` + `seq_cp` for every candidate including single-token ones,
+whose score comes free off `ctx_last_logits_` and which submit no batch token.
+Skipping those branches should cut the sequence term in a mixed window. It
+would, and mixed windows essentially do not occur: over 78 decode-bearing
+scorings carrying `n_decoded` (telemetry v7+), **72 have `n_scored ==
+n_decoded`**, i.e. every scored candidate is exactly two tokens. The
+population is bimodal per WINDOW, not per candidate -- `(4, 0)` is 29.7% of
+scorings and `(4, 4)` is 42.3%, and almost nothing sits between. Recorded
+because the idea is the obvious one and the measurement is cheap: the joint
+distribution of `llm.n_scored` and `llm.n_decoded` in the telemetry log.
+
 **Settled 2026-09-05: production is ~5x `bench_scorer` because the CPU is
 downclocked, and about 77% of the deployed scoring latency is that.** The
 question stood open with two suspects. Telemetry v7 killed the first -- the
@@ -640,9 +851,10 @@ before `--idle-ms` could print the other one.
 **Every latency figure in this file predating 2026-09-04 is a hot-column
 number unless it says otherwise**, which is a much larger caveat than it
 sounds. The `kNCtx` 4096 -> 2304 change was worth -22.7% of a number that is
-three-quarters downclock; the MLX backend's -48.7% was measured at the
-deployed 100ms idle and so is a comparison of two downclocked runs, which is
-the right comparison but not what its number was thought to mean.
+three-quarters downclock; the -48.7% an MLX backend once measured was taken at
+the deployed 100ms idle and so is a comparison of two downclocked runs, which
+is the right comparison but not what its number was thought to mean. That
+backend is gone -- see "The MLX backend, and why it is not here".
 
 **Three mitigations were measured on 2026-09-05 and all three failed.**
 Recorded because the idea is the obvious one: `--qos`
@@ -663,8 +875,10 @@ the negative, and a measurement nobody can re-run cannot be re-examined.
 
 What is left is not a scheduling trick but **less CPU-side work per scoring**:
 the penalty is paid on Metal command encoding and dispatch, so it scales with
-how much of that there is. That is also the most likely mechanism behind the
-MLX backend's win, which raises what fixing its runtime failure is worth.
+how much of that there is. It is the most likely mechanism behind the win the
+removed MLX backend measured, and it is measurable inside llama.cpp too -- see
+the cost model above, where a scratch sequence and a batch token cost about the
+same 0.6 ms of encoding each.
 
 Three artifacts have to be present:
 
@@ -700,9 +914,10 @@ both re-ranking consumers live in `CopilotRerankFilter`, which returns early on
 `!options_.enable` — declaring 32 characters that nothing reads would buy a
 deeper per-keystroke query for nothing. And **each term is clamped before the
 max, not after**, so one out-of-range key cannot raise the fetch on behalf of a
-consumer that would itself have clamped down; `context_chars` is now clamped in
-`copilot.cc` and in `rerank_filter.cc` both, which it was not while it could
-only ever truncate a string already fetched.
+consumer that would itself have clamped down. `context_chars` used to be
+clamped in `copilot.cc` and in `rerank_filter.cc` both, which it was not while
+it could only ever truncate a string already fetched; since 2026-09-06 it is
+clamped once, inside the single reader — see "One reader per config key" below.
 
 Any `trunc_counts` figure from before 2026-08-28 describes the old fetch and is
 not comparable with one after it.
@@ -740,111 +955,66 @@ killall Squirrel                                  # if it was already running: t
 rime-copilot status                               # the check, not a formality
 ```
 
-### The MLX backend
+### The MLX backend, and why it is not here
 
-`copilot/rerank/llm/backend: mlx` scores on Apple's MLX instead of llama.cpp.
-Measured on an M4 Pro through the real Scorer seam, interleaved, at the
-deployed 100 ms idle: score p50 **10.38 → 5.33 ms (−48.7%)**, the two backends
-agreeing to 0.0187 nats. Energy is indistinguishable (5.06 vs 5.21 mJ per
-scoring, against a 20% round-to-round spread), and the whole feature is
-~0.0014 Wh/h against a laptop's 8–15 W, so energy is not a reason either way.
-The full record is the 2026-09-04 scoring-latency results, kept locally.
+There was one, `copilot/rerank/llm/backend: mlx`, from 2026-09-04 to
+2026-09-06. **It never ran**, and it was removed rather than carried. Nothing
+is lost: the code, the measurements, the failure and 60 lines of diagnosis are
+in commit `464aab7` (and its parent `f1e76e4`), both on the public remote.
+`git show 464aab7` is the whole record.
 
-**It is off by default and the default is not a hedge.** The prefill is 36–50%
-*slower* on MLX, so total work per composition favours it only above ~1.5
-scorings per warm; the score win is on ~40% of keystrokes (69.5% engage the
-model, 58% of those decode); and nothing in this tree establishes that 10 ms of
-keystroke latency is perceived at all. What it costs is a permanent second
-inference backend — llama.cpp cannot go, it is what Linux builds and what the
-prediction provider uses — plus ~197 MB of runtime artifacts against a 5.8 MB
-plugin.
+What it was worth, and why that was not enough:
 
-**STATUS: it does not run from a source build.** Everything below about the
-build works -- it configures, compiles, loads the model and passes every test --
-and then the first GPU operation throws `There is no Stream(gpu, 0) in current
-thread.` from `metal/device.cpp`'s thread-local command-encoder lookup. Ruled
-out by measurement: MLX version (0.32.1 and 0.32.2 fail identically), static
-versus shared linking, `$<LINK_LIBRARY:WHOLE_ARCHIVE>`, `$<LINK_ONLY>`, and the
-metallib's location (beside the executable and beside libmlx.dylib both). A
-minimal program against the same built libmlx does a matmul on the main thread
-AND on a spawned thread, so the library and threading are not it; what differs
-in the failing binary is that llama.cpp (with ggml-metal) and librime are in the
-same process. Cause unknown. Do not switch `backend` to `mlx` on a
-source-built plugin.
+- Score p50 **10.38 -> 5.33 ms (-48.7%)** on an M4 Pro through the real Scorer
+  seam, interleaved, at the deployed 100 ms idle, the two backends agreeing to
+  0.0187 nats. But **that figure was measured against MLX 0.32.1 supplied by a
+  Homebrew formula while the headers came from a 0.32.2 pip wheel** -- a mixed
+  build that no longer exists. It is a number about a version this tree named
+  wrongly.
+- The prefill was 36-50% *slower* on MLX, so total work per composition favours
+  it only above ~1.5 scorings per warm, and the score win lands on ~40% of
+  keystrokes. Energy was indistinguishable.
+- **Nothing in this tree establishes that 10 ms of keystroke latency is
+  perceived at all**, and the author reports that it is not. This is the same
+  ledger the tmux control-mode question is decided on (see "The
+  surrounding-text sources").
 
-**And every performance figure quoted for this backend was measured against
-MLX 0.32.1, not the 0.32.2 the build asked for.** The rpath fix changed the
-link from a full path to `-L`/`-l`, and `/opt/homebrew/lib` precedes everything
-added here -- so a Homebrew `mlx` formula supplied the library while
-`/opt/homebrew/include` supplied the headers. Both were 0.32.1 and internally
-consistent, so the numbers are not noise; they are about a version this file
-named wrongly. That Homebrew copy has since been removed, and the build now
-warns when a second MLX is installed. Treat -48.7% as a 0.32.1 figure that no
-longer has a running build behind it.
+Why it never ran: the first GPU operation throws `There is no Stream(gpu, 0) in
+current thread.` from `metal/device.cpp`'s thread-local command-encoder lookup.
+Three sophisticated hypotheses were tested and each was fixed -- a static
+initializer dropped by archive linking (fixed with WHOLE_ARCHIVE), two copies
+of MLX's Scheduler globals in one process (measured, 26398 mlx symbols in the
+executable beside the dylib's, fixed with LINK_ONLY and then by linking MLX as
+a dylib), and MLX and llama.cpp fighting over 31 exported `gguf_*`/`ggml_*`
+symbols (fixed with `MLX_BUILD_GGUF=OFF`). The failure survived all three.
+Also ruled out: MLX version, static vs shared, `$<LINK_LIBRARY:WHOLE_ARCHIVE>`,
+metallib location, and threading (a minimal program against the same libmlx
+does a matmul on the main thread and on a spawned thread). **Cause still
+unknown.** Anyone resuming should start there rather than from the backend.
 
-Building it needs a pip-installed MLX for its headers and prebuilt libraries:
+What the removal cost, precisely: ~2000 lines across `src/mlx_scorer.{cc,h}`,
+164 lines of this plugin's `CMakeLists.txt` spread over 18 regions,
+`tools/bench_backends.cc`, `tools/power_compare.py`, the vault's third file
+group (~197 MB of `libmlx.dylib`/`libjaccl.dylib`/`mlx.metallib`), `--mlx` on
+`backup`/`restore`, `status`'s `mlx:` line, and this section.
 
-```sh
-python3 -m venv ~/.local/share/rime-corpus/mlx-venv
-~/.local/share/rime-corpus/mlx-venv/bin/pip install mlx
-cmake -B build -DCOPILOT_WITH_MLX=ON -DBUILD_MERGED_PLUGINS=OFF \
-  -DMLX_ROOT=~/.local/share/rime-corpus/mlx-venv/lib/python3.12/site-packages/mlx
-```
+Two things were deliberately KEPT:
 
-The source build (`FetchContent`, with `MLX_BUILD_GGUF=OFF`) is what the
-committed `CMakeLists.txt` does, and it is what does not run. It needs Apple's
-Metal toolchain, `xcodebuild -downloadComponent MetalToolchain`, ~700 MB.
+- **`tools/bench_mlx.py`**, because it is self-contained -- a Python prototype
+  needing only `pip install mlx`, with no dependency on the deleted C++ -- and
+  it is the instrument that produced the numbers above. This tree's rule is
+  that a measurement nobody can re-run cannot be re-examined, which is also why
+  `bench_scorer` keeps the flags that produced its negatives.
+- **`copilot/rerank/llm/backend` is still read**, and a value other than
+  `llama` now logs a warning naming itself. A vaulted `.custom.yaml` may still
+  say `mlx`; silently running llama.cpp and reporting nothing is the shape of
+  every silent-fallback bug this tree records.
 
-**`MLX_BUILD_GGUF=OFF` is the part that must survive whatever fixes the
-runtime.** The pip wheel's `libmlx.dylib` EXPORTS 31 `gguf_*`/`ggml_*` symbols
--- MLX vendors its own ggml to read gguf -- against llama.cpp's 1150 of the same
-names. Linked together, the dynamic linker binds llama.cpp's own model loader to
-MLX's incompatible implementation whenever libmlx precedes the ggml archives on
-the link line, and `llama_model_loader` dies with SIGBUS inside `gguf_get_key`.
-Which one wins is pure link order; the first version of this backend happened to
-order them the other way and ran. It was never right, only lucky. Turning the
-option off removes the symbols instead of arranging for them to lose, and costs
-`mx::load_gguf` -- hence `MlxScorer::LoadGgufWeights`, which reads the same file
-through llama.cpp's gguf API and converts ggml Q8_0 into MLX's packed affine
-form (`q_mlx = q_ggml + 128`, `scale = d`, `bias = -128d`).
-
-Two expectations of the source build that did NOT hold: the metallib is still
-174 MB (kernels are built for every GPU family, not the local one), and static
-linking does not work (MLX registers its Metal backend from a static
-initializer, which a linker pulling only referenced objects drops).
-
-**Three files travel, and where they end up is not where `restore` puts them.**
-
-```sh
-rime-copilot restore --mlx          # -> ~/Library/Rime/private/mlx/  (transport only)
-sudo cp ~/Library/Rime/private/mlx/* \
-  "/Library/Input Methods/Squirrel.app/Contents/Frameworks/rime-plugins/"
-killall Squirrel
-rime-copilot status                 # the `mlx:` line
-```
-
-MLX finds `mlx.metallib` next to the **binary that loaded it**
-(ml-explore/mlx#2061 searches the binary's directory, then `Resources/`), and
-that binary is `librime-copilot.dylib` inside `Squirrel.app`. No rpath reaches
-it — rpath applies to dylibs, not to the metallib — so the Rime user directory
-cannot be the answer and the `sudo cp` is not optional.
-
-`libmlx.dylib` is found through `@loader_path`, which the build puts **first**
-in the rpath list. It used to be second, after the absolute path CMake derives
-from a full-path link — so a deployed plugin loaded MLX out of the build
-machine's pip virtualenv, complete with its username and a `python3.12` that a
-`pip install --upgrade` renames. Linking with `-L`/`-l` rather than a full path
-is what stops CMake deriving that rpath and makes the order controllable. If
-this is ever changed, check it with `otool -l ... | grep -A2 LC_RPATH` and by
-moving the virtualenv aside, not by reading the CMake.
-
-**A missing or mismatched `mlx.metallib` does not degrade.** MLX throws
-`std::out_of_range` from inside its Metal device setup and takes the process —
-Squirrel — with it. `MlxScorer::EnsureLoaded` checks for the file with `dladdr`
-before touching MLX and disables the backend with a log line instead, and
-`rime-copilot status` reports the same thing before anyone switches the backend
-on. All three files must match the build: libmlx and libjaccl are what the
-plugin was linked against, and the metallib is what libmlx loads.
+`nlohmann/json` is still declared to FetchContent as `json` rather than
+`nlohmann_json`. That name existed because MLX and JACCL each declare it under
+that name and FetchContent dedupes by declared name; it is kept because
+reverting costs churn for nothing and the next vendored dependency will collide
+the same way.
 
 ### And if that machine is also a development machine
 
@@ -1054,6 +1224,34 @@ behaviour and is left for real use — or a better instrument — to decide:
   they are not — 8 threads is worse than 4 on a 4-P-core machine, on both
   latency and core time.
 
+**`copilot/rerank/llm/top_n` stays at 4, and since 2026-09-06 that is a
+measurement rather than an inherited default.** It was known to beat 32 on
+accuracy AND speed; nothing had ever measured BELOW 4, and the cost model above
+prices each candidate at ~1.2ms — 13% of a deployed scoring — which makes this
+the largest latency lever left in the scorer.
+
+What it would cost is countable without a replay arm, because `llm.best_from`
+records which same-span position the model's own top pick came from and
+`ShouldRecord` keeps every promotion in full. Over 564 live engaged scorings:
+
+| best_from | share | cumulative |
+| --- | --- | --- |
+| 0 | 49.3% | 49.3% |
+| 1 | 37.6% | 86.9% |
+| 2 | 9.8% | 96.6% |
+| 3 | 3.4% | 100% |
+
+Of 248 actual promotions, 183 came from position 1, 51 from position 2 and 14
+from position 3. So **4 → 2 saves ~2.3ms (25% of a scoring) and gives up 26% of
+all promotions**; 4 → 3 saves ~1.15ms and gives up 5.6%. Against a promotion
+accept rate of 66-71% (see `margin` above) neither trade is worth taking, so
+the default is unchanged — but it is now unchanged for a reason, and the same
+two queries re-run the question on a new corpus or a new model.
+
+Note this cuts the opposite way from `margin`'s one-sided count: `best_from`
+covers every engaged scoring, promoted or not, so both sides of THIS question
+are recorded at the same rate.
+
 **`copilot/rerank/llm/battery_active` (default false) is the one whose default
 is now known to be wrong.** Its README justification was "the model's CPU cost
 is exactly the kind of thing a laptop should shed on battery"; measured, one
@@ -1205,7 +1403,6 @@ other**, and most changes touch more than one:
 | the **user dictionary** (`private.userdb`) | Rime's own user-data sync, from Squirrel's menu — NOT the vault |
 | the design records (`docs/superpowers/`) | iCloud, plus a symlink made by hand |
 | the **clients** (Neovim, the tmux reporter, including on a remote host reached over ssh) | `rime-copilot-clients`, via each ecosystem's own plugin manager (lazy.nvim, TPM) — not a channel this repo has any part in any more. **Order still matters across the boundary**, and it does not follow the plugin managers' own schedule: the dylib must reach the laptop before a remote's clients plugin is upgraded past the point where it started sending the identity message's `host` field, or an old handler reads it as an unknown key and ignores it, silently filing that remote pane's `ascii_mode` into the laptop's own local-pane memory. See "Remote tmux" in `README.md` |
-| the **MLX backend's runtime** (`libmlx.dylib`, `libjaccl.dylib`, `mlx.metallib`) | the vault, via `backup --mlx` / `restore --mlx` — **then a `sudo cp` beside the plugin**, which `restore` cannot do. ~197 MB, and off by default, which is why it is a separate group from `VAULTED_FILES` rather than part of it. See "The MLX backend" below |
 | the **telemetry** (`private/copilot_telemetry/`) | `<sync_dir>/copilot_telemetry/` — `tools/sync_telemetry.sh` by hand, or `copilot/telemetry/auto_sync: true` on a 30-min timer. NOT the vault, and never merged: one file per machine, so collecting is concatenation |
 
 **The telemetry filename is `installation_id`, and it used to go stale.** The
@@ -1455,6 +1652,59 @@ flakiness rather than as misconfiguration; the constructor logs a
 to `engine/translators`, plus a `copilot` switch. Full schema-config reference (db path,
 `max_candidates`, `max_iterations`, LLM `model`/`n_predict`, `ime_bridge`, `auto_spacer`)
 lives in `README.md`.
+
+### One reader per config key
+
+`ReadCopilotSharedConfig` / `ReadTelemetryOptions` (`src/copilot_config.{h,cc}`)
+are the only readers of every `copilot/*` key that more than one component
+needs. Before 2026-09-06 eight groups of keys had two or three independent
+readers, each with its own spelling of the path, its own default, and — for
+`rerank/max_context_chars` and `rerank/llm/context_chars` — its own clamp:
+
+| key | readers it used to have |
+| --- | --- |
+| `copilot/db` | filter + engine component |
+| `copilot/rerank/enable` | processor + filter + engine component |
+| `copilot/rerank/max_context_chars` | processor + filter (both clamped) |
+| `copilot/rerank/llm/enable` | processor + filter + engine component |
+| `copilot/rerank/llm/model` | filter + engine component |
+| `copilot/rerank/llm/battery_active` | processor + filter |
+| `copilot/rerank/llm/context_chars` | processor + filter (both clamped) |
+| `copilot/telemetry/*` | processor ctor + `CopilotComponent::Create`, byte-identical |
+
+A key with a single reader — `tmux_source/*`, `context_memory/*`,
+`disabled_plugins`, `surrounding_context_chars`, `llm/*`,
+`rerank/{window,max_rank,same_span_only}`, `rerank/llm/{top_n,margin,…}` — is
+deliberately still read where it is used. It cannot disagree with itself, and
+moving it would only put distance between the read and the use. The check is
+one line:
+
+```sh
+grep -rn 'config->Get[A-Za-z]*("copilot' src/   | sed -E 's/.*"(copilot[^"]*)".*/\1/' | sort | uniq -c | awk '$1>1'
+```
+
+Empty output is the invariant. A key that appears there has grown a second
+reader and belongs in `copilot_config.h` instead.
+
+**It is deliberately NOT cached**, and that is the part to not "fix". Caching
+by `schema_id` is the obvious shape — `CopilotEngineComponent` already keys two
+maps that way — and it is wrong here: a redeploy changes the config while the
+`schema_id` stays put, so the cache would serve the pre-deploy value forever.
+`copilot_engine_by_schema_id` escapes that only because it holds a `weak<>`
+that dies with the instance, which a plain value cache has no analogue for. So
+each component calls the reader at its own construction time and the keys are
+read two or three times — a YAML map lookup, at construction, off the critical
+path. **The goal was never to read once; it was to make the readers unable to
+disagree**, and one function is what does that.
+
+`test/copilot_config_test.cc` is the only test in the tree that drives real
+config, and it does so without breaking the "no Rime engine in tests" rule:
+`rime::Config` has a public default constructor and an exported
+`LoadFromStream`, so it takes YAML strings directly. It pins every default,
+every key, both clamps at both ends, and the FLOW MAP form Rime's deployer
+writes into `build/*.schema.yaml` (`llm: {battery_active: true, …}`) — which is
+what the plugin actually reads at runtime, and a shape `_config_leaves` had to
+be taught separately on the Python side.
 
 ### Flat vs nested keys in a `.custom.yaml` patch
 
