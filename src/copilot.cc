@@ -500,7 +500,13 @@ ProcessResult Copilot::ProcessKeyEvent(const KeyEvent& key_event) {
   }
   if (keycode == XK_space) {
     // 仅在输入状态启用预测: 预测候选仅能通过数字选择
-    if (!ctx->input().empty() || IsNavigationKey(last_keycode_)) {
+    // `ctx &&` for the same reason every other use of it in this function has
+    // one: the head of this function tests `!ctx || !ctx->IsComposing()` and
+    // falls through rather than returning, so ctx can still be null here. This
+    // was the one dereference that did not check -- engine_->context() is
+    // never null in practice, so it is the function's own convention that was
+    // broken, not a live crash.
+    if (ctx && (!ctx->input().empty() || IsNavigationKey(last_keycode_))) {
       last_action_ = kUnspecified;
       last_keycode_ = keycode;
       return RunProcessors(key_event);

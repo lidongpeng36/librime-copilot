@@ -1,5 +1,6 @@
 #include "copilot_engine.h"
 
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <sstream>
@@ -242,7 +243,24 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
     if (std::filesystem::exists(model_path)) {
       LOG(INFO) << "[copilot] LLM: " << model_path;
       llm_config.model = model_path;
-      providers.push_back(std::make_shared<LLMProvider>(llm_config, history));
+      // llama::ClientSimple's constructor THROWS on a model or context it
+      // cannot create (llm.cc), and LLMProvider builds one eagerly -- so a
+      // file that exists but is truncated, is not a gguf, or is too large for
+      // the machine takes the exception all the way out of Create() and out of
+      // whatever Rime was doing, inside Squirrel. Nothing above this catches.
+      //
+      // The rest of the plugin's answer to a model it cannot load is to log
+      // once and carry on without it -- LlmScorer::EnsureLoaded sets
+      // load_failed_ and every caller reads Loaded() -- so match that here
+      // rather than change ClientSimple's contract, which the offline tools
+      // also depend on. A schema that names an unusable prediction model then
+      // behaves exactly like one that names none.
+      try {
+        providers.push_back(std::make_shared<LLMProvider>(llm_config, history));
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "[copilot] LLM: failed to load '" << model_path << "': " << e.what()
+                   << "; prediction will run without it";
+      }
     }
   }
   if (!model_name.empty() && !llm_enable) {

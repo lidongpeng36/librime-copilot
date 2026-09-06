@@ -113,11 +113,13 @@ constexpr int kMaxCandidates = 8;
 //   512              2.14 ms                    11.4 ms
 //   1024             3.21 ms                    16.4 ms
 //
-// The mechanism is CPU-side and per call, not arithmetic: ScoreGroup does
-// kMaxCandidates `seq_rm` plus `seq_cp` pairs per scoring and both walk cells,
-// and the KQ mask llama.cpp builds is [n_tokens, n_ctx_seq]. None of that
-// depends on how many tokens are actually decoded, which is why the saving
-// shows up as a flat ~19% rather than scaling with the candidate list.
+// The mechanism is CPU-side and per call, not arithmetic: ScoreGroup does one
+// `seq_rm` plus `seq_cp` pair per CANDIDATE (group_n of them, not
+// kMaxCandidates -- only Prefill clears all kMaxCandidates scratch sequences),
+// both of which walk cells, and the KQ mask llama.cpp builds is
+// [n_tokens, n_ctx_seq]. None of that depends on how many tokens are actually
+// decoded, which is why the saving shows up as a flat ~19% rather than scaling
+// with the candidate list.
 //
 // The idle column is the one that matters and the reason a hot benchmark
 // understates this ~6x: a scoring that follows any gap over ~50 ms runs on a
@@ -490,9 +492,18 @@ struct LlmScorer::Impl {
     std::vector<std::vector<llama_token>> cand_tokens(group_n);
     // float, not double: this accumulates at most a few tokens' worth of
     // per-candidate log-probabilities (already individually rounded through
-    // float), not a 151936-term sum -- unlike LogSumExp's internal sum_exp,
+    // float), not an n_vocab-term sum -- unlike LogSumExp's internal sum_exp,
     // there is no catastrophic-cancellation risk here to buy precision
     // against.
+    //
+    // An earlier version of this comment said "151936-term", which is some
+    // other model's vocabulary. rime40m-v2-q8.gguf has n_vocab = 8573 (read
+    // off the gguf header), so LogSumExp is two passes over 8573 floats,
+    // ~17k operations, and is NOT a meaningful share of the ~9 ms a
+    // decode-bearing scoring costs. Do not go optimising it: measured, the
+    // cost is 4.6 ms fixed plus ~0.6 ms per branched scratch sequence plus
+    // ~0.55 ms per submitted batch token, and all three of those are Metal
+    // command encoding and dispatch. See tools/bench_scorer.cc.
     std::vector<float> logprob_sum(group_n, 0.0f);
     // Every candidate's first token is scored off the SAME row --
     // ctx_last_logits_, the context's own last-token logits -- so the

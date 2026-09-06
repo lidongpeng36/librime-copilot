@@ -63,6 +63,47 @@ TEST(Utf8View, RightIsEmptyWhenPunctuationTrails) {
   EXPECT_EQ("", u.right());
 }
 
+// An empty candidate text reaches UTF8 through SelectCharacter (it calls
+// left()/right() on whatever GetSelectedCandidate() returns). size() is 0
+// there, so `n - 1` is -1, and operator()'s clamp was std::clamp(start, 0, -1)
+// -- lo > hi, which is undefined behaviour, not a clamp. Every accessor must
+// answer "nothing" instead.
+TEST(Utf8View, EmptyStringIsAnswerableNotUndefined) {
+  std::string s;
+  UTF8 u(s);
+  EXPECT_EQ(0u, u.size());
+  EXPECT_EQ("", u[0]);
+  EXPECT_EQ("", u[-1]);
+  EXPECT_EQ("", u(0, -1));
+  EXPECT_EQ("", u(0, -2));
+  EXPECT_EQ("", u(-1, -1));
+  EXPECT_EQ("", u.left());
+  EXPECT_EQ("", u.right());
+}
+
+// The other boundary the same clamp got wrong, and the more interesting one.
+// With no punctuation left() means "all but the last character" and right()
+// means "from the second character on" (LeftRightWithoutPunctuation, above).
+// A one-character string has neither, so both are empty -- but left() asks
+// operator() for (0, -2) and right() for (1, -1), and on n == 1 those resolve
+// to empty ranges that the clamp then rescued INTO one-character ranges. Both
+// handed back the whole string.
+//
+// It is SelectCharacter that reads these, and its "nothing on that side"
+// guard (`if (picked.empty()) return kNoop;`) was written for exactly this
+// case -- it just never fired, because the clamp never let the answer be
+// empty. So select_left/right_characters on a single-character candidate
+// committed the whole candidate instead of declining the key.
+TEST(Utf8View, SingleCharacterHasNoLeftAndNoRight) {
+  std::string s = "中";
+  UTF8 u(s);
+  ASSERT_EQ(1u, u.size());
+  EXPECT_EQ("中", u[0]);
+  EXPECT_EQ("中", u(0, -1));
+  EXPECT_EQ("", u.left());
+  EXPECT_EQ("", u.right());
+}
+
 TEST(Utf8View, LeftRightAroundChinesePunctuation) {
   std::string s = "你，好";
   UTF8 u(s);

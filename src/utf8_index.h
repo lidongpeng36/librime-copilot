@@ -72,6 +72,13 @@ inline const std::vector<std::string_view> kUtf8IndexChinesePunct = {
 
 class UTF8 {
  public:
+  // `data_` is a string_view over the ARGUMENT -- this class never copies the
+  // text -- so the caller must keep it alive for the lifetime of the UTF8.
+  // That contract is unenforceable against a temporary, and `UTF8(a + b)` or
+  // `UTF8(f())` compiled fine and read freed memory. Deleting the rvalue
+  // overload makes it a compile error instead of a runtime one; every call
+  // site in the tree already passes an lvalue.
+  explicit UTF8(std::string&&) = delete;
   explicit UTF8(const std::string& data) {
     data_ = data;
     auto lens = SplitU8(data);  // 每个字符的长度
@@ -97,6 +104,11 @@ class UTF8 {
 
   std::string_view operator()(int start, int end) const {
     int n = size();
+    // std::clamp(v, 0, n - 1) below is UNDEFINED when n == 0: lo > hi. It does
+    // not merely return something odd -- measured, it throws out of the
+    // string_view construction, and SelectCharacter reaches here with whatever
+    // GetSelectedCandidate() returned. Answer "nothing" instead.
+    if (n == 0) return {};
 
     if (start < 0) start += n;
     if (end < 0) end += n;
@@ -126,7 +138,9 @@ class UTF8 {
       }
     }
 
-    // 没有遇到标点，返回整段
+    // 没有遇到标点: 除最后一字之外的全部。一个字符时那是空的 -- (0, -2)
+    // 解析成空区间, 而 clamp 会把它救成 (0, 0), 即整串。
+    if (n < 2) return {};
     return (*this)(0, -2);
   }
 
@@ -146,7 +160,9 @@ class UTF8 {
       }
     }
 
-    // 未找到标点，默认从第1位开始
+    // 未找到标点: 从第 1 位开始。一个字符时那是空的 -- 同 left() 的理由,
+    // (1, -1) 解析成空区间而 clamp 把它救成整串。
+    if (n < 2) return {};
     return (*this)(1, -1);
   }
 

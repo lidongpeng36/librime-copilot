@@ -156,6 +156,40 @@ so sub-plugins just define a `Process` method and don't touch the `Processor` bo
 
 All three can be turned off via `copilot/disabled_plugins` in the schema config.
 
+### The surrounding-text sources, and which one you actually pay for
+
+`GetSurroundingContext()` (`src/surrounding_source.cc`) is IMK, then ImeBridge,
+then a tmux pane scrape, first to answer wins. The first two are a mutex and a
+struct copy. The third is a `posix_spawn`, and on a machine that lives in a
+terminal it is the one that answers:
+
+| source | share of live fetches |
+| --- | --- |
+| tmux | 1041 (72%) |
+| IMK | 331 (23%) |
+| ImeBridge | 71 (5%) |
+
+**Measured 2026-09-06, the tmux query costs p50 3.81 ms / p95 4.13 ms** —
+`BuildTmuxArgs`' exact five-command exec, 25 repetitions against a live server.
+It runs on the input thread, synchronously, with `timeout_ms` (default 50) as
+the ceiling.
+
+The memo makes that **once per key event, not once per consumer** — three
+callers ask independently — and `Copilot::ProcessKeyEvent` skips the
+invalidation while composing, so a whole Chinese word costs one query rather
+than one per keystroke. What is left is one query per NON-composing key event:
+every keystroke in ASCII mode, every character typed at a shell prompt, and the
+first key of each word. In a terminal that is 3.81 ms per key.
+
+That is larger than everything remaining in the scorer, and unlike the scorer
+it has an untried lever: ~2.75 ms of the 3.37 ms measured in the
+context-ascii-memory design was starting the process, so a persistent
+connection (tmux control mode, `-CC`) would remove most of it. Nobody has
+built it; the hazards are a server that restarts underneath the connection and
+a second long-lived fd in the IME process. Do not quote the 3.81 ms as
+"measured overhead of the tmux source" without saying it is per non-composing
+key event only.
+
 ### AutoSpacer's commits and Rime's user dictionary
 
 AutoSpacer emits its own commits (`engine_->CommitText()`), so for a long time
@@ -603,6 +637,65 @@ Two things follow, and both were got wrong before this was measured:
   buckets sit on the far side of it. See the next paragraph: the answer is a
   downclock, and every live gap is long enough to pay it in full.
 
+**Refined 2026-09-06: "one decode or none" is the shape, but the decode is not
+one price.** The bimodal table above is right about WHICH windows are cheap and
+wrong to imply the expensive ones all cost the same. Measured on an M4 Pro at
+the deployed geometry (64-character context, `--idle-ms 100`, 30-40 iterations
+per point), varying the two things `ScoreGroup` controls independently:
+
+| scratch sequences | batch tokens | score p50 |
+| --- | --- | --- |
+| 2 | 4 | 7.91 ms |
+| 4 | 4 | 9.07 ms |
+| 4 | 8 | 11.41 ms |
+| 8 | 8 | 14.28 ms |
+| 4 | 12 | 13.40 ms |
+
+Those five points fit **`score_p50 ≈ 4.6 + 0.6·(scratch sequences) + 0.55·(batch
+tokens)` ms**, and the pair at (2,4) vs (4,4) is what separates the two terms:
+same token count, two more branched sequences, +1.16 ms. So **branching a
+scratch sequence costs about as much as decoding a token** -- roughly 0.6 ms
+each, both of them Metal command encoding and dispatch on a downclocked core.
+
+Geometry, because this file has been burned by leaving it out: these were run
+at `bench_scorer`'s default `--n-ctx 2304`, i.e. `n_ctx_seq` 256, which is what
+the currently deployed dylib runs (recopied 2026-09-05 14:33, after `669e79f`).
+The (4,4) point at 9.07 ms reproduces the 9.0 ms this file already records for
+`n_ctx_seq` 256 after a 100 ms idle, so the model DECOMPOSES a number already
+here rather than adding a new one.
+
+**It has not been checked against live telemetry, and the reason is worth
+knowing.** Splitting `work_us` by schema version: v7 is p50 10.29 ms over 71
+decode-bearing scorings, but every v7 line was written at `n_ctx_seq` **512**
+(the dylib predating `669e79f`), so it is not comparable. v8 — the first
+version written at 256 — is p50 6.11 ms over **7** scorings, which is too few
+to compare against anything. A first draft of this paragraph quoted "9.64 ms
+live", which was those two populations pooled: exactly the mistake recorded
+two paragraphs down, made again. Re-check once v8 has a few hundred lines.
+
+Two things this makes measurable that the bimodal account could not:
+
+- **`top_n` is a latency lever of about 1.2 ms per candidate** (0.6 for the
+  sequence plus 0.55 for its token), which is 13% of a deployed scoring each.
+  See "`top_n` stays at 4" below for why it is not taken.
+- **The all-single-character mode is free for the right reason.** 4 sequences
+  with no decode measures 0.19 ms against 1 sequence with no decode at 0.16 ms
+  -- the per-sequence term is ~0.02 ms when no decode follows it, because
+  nothing ever attends across those cells. The 0.6 ms is the sequence's share
+  of a decode, not the `seq_cp` itself.
+
+**A consequence that looks like an optimisation and is not.** `ScoreGroup`
+does `seq_rm` + `seq_cp` for every candidate including single-token ones,
+whose score comes free off `ctx_last_logits_` and which submit no batch token.
+Skipping those branches should cut the sequence term in a mixed window. It
+would, and mixed windows essentially do not occur: over 78 decode-bearing
+scorings carrying `n_decoded` (telemetry v7+), **72 have `n_scored ==
+n_decoded`**, i.e. every scored candidate is exactly two tokens. The
+population is bimodal per WINDOW, not per candidate -- `(4, 0)` is 29.7% of
+scorings and `(4, 4)` is 42.3%, and almost nothing sits between. Recorded
+because the idea is the obvious one and the measurement is cheap: the joint
+distribution of `llm.n_scored` and `llm.n_decoded` in the telemetry log.
+
 **Settled 2026-09-05: production is ~5x `bench_scorer` because the CPU is
 downclocked, and about 77% of the deployed scoring latency is that.** The
 question stood open with two suspects. Telemetry v7 killed the first -- the
@@ -700,9 +793,10 @@ both re-ranking consumers live in `CopilotRerankFilter`, which returns early on
 `!options_.enable` — declaring 32 characters that nothing reads would buy a
 deeper per-keystroke query for nothing. And **each term is clamped before the
 max, not after**, so one out-of-range key cannot raise the fetch on behalf of a
-consumer that would itself have clamped down; `context_chars` is now clamped in
-`copilot.cc` and in `rerank_filter.cc` both, which it was not while it could
-only ever truncate a string already fetched.
+consumer that would itself have clamped down. `context_chars` used to be
+clamped in `copilot.cc` and in `rerank_filter.cc` both, which it was not while
+it could only ever truncate a string already fetched; since 2026-09-06 it is
+clamped once, inside the single reader — see "One reader per config key" below.
 
 Any `trunc_counts` figure from before 2026-08-28 describes the old fetch and is
 not comparable with one after it.
@@ -1053,6 +1147,34 @@ behaviour and is left for real use — or a better instrument — to decide:
   `n_threads` is **inert** while the layers are on the GPU and decisive once
   they are not — 8 threads is worse than 4 on a 4-P-core machine, on both
   latency and core time.
+
+**`copilot/rerank/llm/top_n` stays at 4, and since 2026-09-06 that is a
+measurement rather than an inherited default.** It was known to beat 32 on
+accuracy AND speed; nothing had ever measured BELOW 4, and the cost model above
+prices each candidate at ~1.2ms — 13% of a deployed scoring — which makes this
+the largest latency lever left in the scorer.
+
+What it would cost is countable without a replay arm, because `llm.best_from`
+records which same-span position the model's own top pick came from and
+`ShouldRecord` keeps every promotion in full. Over 564 live engaged scorings:
+
+| best_from | share | cumulative |
+| --- | --- | --- |
+| 0 | 49.3% | 49.3% |
+| 1 | 37.6% | 86.9% |
+| 2 | 9.8% | 96.6% |
+| 3 | 3.4% | 100% |
+
+Of 248 actual promotions, 183 came from position 1, 51 from position 2 and 14
+from position 3. So **4 → 2 saves ~2.3ms (25% of a scoring) and gives up 26% of
+all promotions**; 4 → 3 saves ~1.15ms and gives up 5.6%. Against a promotion
+accept rate of 66-71% (see `margin` above) neither trade is worth taking, so
+the default is unchanged — but it is now unchanged for a reason, and the same
+two queries re-run the question on a new corpus or a new model.
+
+Note this cuts the opposite way from `margin`'s one-sided count: `best_from`
+covers every engaged scoring, promoted or not, so both sides of THIS question
+are recorded at the same rate.
 
 **`copilot/rerank/llm/battery_active` (default false) is the one whose default
 is now known to be wrong.** Its README justification was "the model's CPU cost
@@ -1455,6 +1577,59 @@ flakiness rather than as misconfiguration; the constructor logs a
 to `engine/translators`, plus a `copilot` switch. Full schema-config reference (db path,
 `max_candidates`, `max_iterations`, LLM `model`/`n_predict`, `ime_bridge`, `auto_spacer`)
 lives in `README.md`.
+
+### One reader per config key
+
+`ReadCopilotSharedConfig` / `ReadTelemetryOptions` (`src/copilot_config.{h,cc}`)
+are the only readers of every `copilot/*` key that more than one component
+needs. Before 2026-09-06 eight groups of keys had two or three independent
+readers, each with its own spelling of the path, its own default, and — for
+`rerank/max_context_chars` and `rerank/llm/context_chars` — its own clamp:
+
+| key | readers it used to have |
+| --- | --- |
+| `copilot/db` | filter + engine component |
+| `copilot/rerank/enable` | processor + filter + engine component |
+| `copilot/rerank/max_context_chars` | processor + filter (both clamped) |
+| `copilot/rerank/llm/enable` | processor + filter + engine component |
+| `copilot/rerank/llm/model` | filter + engine component |
+| `copilot/rerank/llm/battery_active` | processor + filter |
+| `copilot/rerank/llm/context_chars` | processor + filter (both clamped) |
+| `copilot/telemetry/*` | processor ctor + `CopilotComponent::Create`, byte-identical |
+
+A key with a single reader — `tmux_source/*`, `context_memory/*`,
+`disabled_plugins`, `surrounding_context_chars`, `llm/*`,
+`rerank/{window,max_rank,same_span_only}`, `rerank/llm/{top_n,margin,…}` — is
+deliberately still read where it is used. It cannot disagree with itself, and
+moving it would only put distance between the read and the use. The check is
+one line:
+
+```sh
+grep -rn 'config->Get[A-Za-z]*("copilot' src/   | sed -E 's/.*"(copilot[^"]*)".*/\1/' | sort | uniq -c | awk '$1>1'
+```
+
+Empty output is the invariant. A key that appears there has grown a second
+reader and belongs in `copilot_config.h` instead.
+
+**It is deliberately NOT cached**, and that is the part to not "fix". Caching
+by `schema_id` is the obvious shape — `CopilotEngineComponent` already keys two
+maps that way — and it is wrong here: a redeploy changes the config while the
+`schema_id` stays put, so the cache would serve the pre-deploy value forever.
+`copilot_engine_by_schema_id` escapes that only because it holds a `weak<>`
+that dies with the instance, which a plain value cache has no analogue for. So
+each component calls the reader at its own construction time and the keys are
+read two or three times — a YAML map lookup, at construction, off the critical
+path. **The goal was never to read once; it was to make the readers unable to
+disagree**, and one function is what does that.
+
+`test/copilot_config_test.cc` is the only test in the tree that drives real
+config, and it does so without breaking the "no Rime engine in tests" rule:
+`rime::Config` has a public default constructor and an exported
+`LoadFromStream`, so it takes YAML strings directly. It pins every default,
+every key, both clamps at both ends, and the FLOW MAP form Rime's deployer
+writes into `build/*.schema.yaml` (`llm: {battery_active: true, …}`) — which is
+what the plugin actually reads at runtime, and a shape `_config_leaves` had to
+be taught separately on the Python side.
 
 ### Flat vs nested keys in a `.custom.yaml` patch
 
