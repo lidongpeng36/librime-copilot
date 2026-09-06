@@ -11,6 +11,7 @@ set(copilot_test_src
   commit_text_test.cc
   context_identity_test.cc
   context_memory_test.cc
+  copilot_config_test.cc
   history_spacing_table_test.cc
   history_test.cc
   ime_bridge_socket_test.cc

@@ -5,6 +5,7 @@
 #include <sstream>
 
 #include <rime/candidate.h>
+#include <rime/config.h>
 #include <rime/context.h>
 #include <rime/deployer.h>
 #include <rime/dict/db_pool_impl.h>
@@ -17,6 +18,7 @@
 #include <rime/ticket.h>
 #include <rime/translation.h>
 
+#include "copilot_config.h"
 #include "db_provider.h"
 #include "llm_provider.h"
 #include "llm_scorer.h"
@@ -163,37 +165,41 @@ CopilotEngineComponent::~CopilotEngineComponent() {}
 
 CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
   std::vector<std::shared_ptr<Provider>> providers;
-  string db_name = "copilot.db";
   int max_iterations = 0;
 
   DBProvider::Config db_config;
   LLMProvider::Config llm_config;
   string model_name = "";
-  // copilot/rerank/*: same three keys CopilotRerankFilterComponent::Create
-  // reads to decide whether to build a Scorer -- kept in lockstep with it so
-  // "off by default" holds here too and the filter's LOG line ("llm.model=ok"
-  // when a scorer exists) still matches reality.
-  // Defaults true: a schema that names copilot/llm/model and expects
-  // predictions keeps getting them. Setting it false is how a schema stops
-  // paying for a model it never uses -- see the construction site below.
+  // copilot/llm/enable. Defaults true: a schema that names copilot/llm/model
+  // and expects predictions keeps getting them. Setting it false is how a
+  // schema stops paying for a model it never uses -- see the construction site
+  // below. Single reader, so it stays read here.
   bool llm_enable = true;
-  bool rerank_enable = true;
-  bool rerank_llm_enable = false;
-  string rerank_llm_model;
   LlmScorerOptions rerank_llm_scorer;
   // copilot/rerank/llm/backend: llama | mlx. Defaults to llama everywhere --
   // llama.cpp is what Linux builds, what the prediction provider uses, and the
   // reference the MLX path is verified against.
   std::string rerank_llm_backend = "llama";
-  // Read here rather than at the construction site: `config` is scoped to the
-  // block above, and every other option on this path is read in one place.
+  // Read here rather than at the construction site, so every option on this
+  // path is read in one place.
   bool rerank_mlx_compile = true;
   bool rerank_mlx_f16 = true;
-  if (auto* schema = ticket.schema) {
-    auto* config = schema->config();
-    if (config->GetString("copilot/db", &db_name)) {
-      LOG(INFO) << "custom copilot/db: " << db_name;
-    }
+  // copilot/db and the three copilot/rerank keys below are read by
+  // CopilotRerankFilterComponent::Create too (and rerank/enable by the Copilot
+  // processor as well). Those three used to be kept in lockstep with the
+  // filter by hand and by a comment saying so -- "off by default" has to hold
+  // in both places or the filter's LOG line ("llm.model=ok" when a scorer
+  // exists) stops matching reality. One reader now. See copilot_config.h.
+  Config* config = ticket.schema ? ticket.schema->config() : nullptr;
+  const CopilotSharedConfig shared = ReadCopilotSharedConfig(config);
+  const string db_name = shared.db;
+  const bool rerank_enable = shared.rerank_enable;
+  const bool rerank_llm_enable = shared.llm_enable;
+  const string rerank_llm_model = shared.llm_model;
+  if (db_name != "copilot.db") {
+    LOG(INFO) << "custom copilot/db: " << db_name;
+  }
+  if (config) {
     if (!config->GetInt("copilot/max_candidates", &db_config.max_candidates)) {
       LOG(INFO) << "copilot/max_candidates is not set in schema";
     }
@@ -211,9 +217,6 @@ CopilotEngine* CopilotEngineComponent::Create(const Ticket& ticket) {
       config->GetBool("copilot/llm/battery_active", &llm_config.battery_active);
       config->GetBool("copilot/llm/enable", &llm_enable);
     }
-    config->GetBool("copilot/rerank/enable", &rerank_enable);
-    config->GetBool("copilot/rerank/llm/enable", &rerank_llm_enable);
-    config->GetString("copilot/rerank/llm/model", &rerank_llm_model);
     // Where the model runs. Absent, both keep the values that were hard-coded
     // before tools/bench_scorer.cc made them measurable; see LlmScorerOptions.
     config->GetInt("copilot/rerank/llm/n_gpu_layers", &rerank_llm_scorer.n_gpu_layers);

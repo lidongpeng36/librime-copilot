@@ -143,18 +143,22 @@ class Copilot : public Processor {
   int last_keycode_ = 0;
   bool use_surrounding_context_ = true;
   int surrounding_context_chars_ = 8;
-  // Mirrors copilot/rerank/max_context_chars and copilot/rerank/llm/battery_active
-  // -- the same knobs CopilotRerankFilterComponent::Create reads -- so
-  // WarmRerankContext builds the identical context and honors the identical
-  // battery gate the filter itself applies before it would ever call WarmUp().
+  // copilot/rerank/max_context_chars, copilot/rerank/llm/context_chars and
+  // copilot/rerank/llm/battery_active, all three taken from
+  // ReadCopilotSharedConfig (copilot_config.h) -- the same call
+  // CopilotRerankFilterComponent::Create makes. That is what lets
+  // WarmRerankContext build the identical context and honor the identical
+  // battery gate the filter applies before it would ever call WarmUp(); the
+  // two used to read and clamp these keys separately, and a disagreement does
+  // not fail loudly -- every warm lands on a string nobody asks about and the
+  // feature silently never runs.
+  //
+  // The initializers below are dead weight now (the reader supplies its own
+  // defaults, and clamps both lengths) and are kept only so an instance is
+  // never momentarily uninitialized. The SCORER's context is a different and
+  // longer string than the db's Han-only tail: a language model reads
+  // punctuation and Latin, an n-gram key cannot.
   int rerank_max_context_chars_ = 8;
-  // Read from copilot/rerank/llm/context_chars -- what the SCORER is warmed
-  // with, which is a different and longer string than the db's Han-only tail.
-  // Initializer mirrors LlmRerankOptions::context_chars' own default
-  // (rerank_llm.h) so an unconfigured schema is bit-identical. Clamped to
-  // kMaxSurroundingPrefixChars here AND in the filter, in step: since it
-  // became a term in SurroundingPrefixChars it sizes a per-keystroke query,
-  // not just a truncation of a string already fetched.
   int rerank_llm_context_chars_ = 32;
   bool rerank_llm_battery_active_ = false;
   // SurroundingPrefixChars' result, kept only so FlushStatsIfAny can stamp it
