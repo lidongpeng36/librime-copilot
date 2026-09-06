@@ -216,8 +216,8 @@ terminal it is the one that answers:
 | IMK | 331 (23%) |
 | ImeBridge | 71 (5%) |
 
-**Measured 2026-09-06, the tmux query costs p50 3.81 ms / p95 4.13 ms** —
-`BuildTmuxArgs`' exact five-command exec, 25 repetitions against a live server.
+**Measured 2026-09-06, the tmux query costs p50 3.86 ms / p95 4.23 ms** —
+`BuildTmuxArgs`' exact five-command exec, 60 repetitions against a live server.
 It runs on the input thread, synchronously, with `timeout_ms` (default 50) as
 the ceiling.
 
@@ -226,16 +226,86 @@ callers ask independently — and `Copilot::ProcessKeyEvent` skips the
 invalidation while composing, so a whole Chinese word costs one query rather
 than one per keystroke. What is left is one query per NON-composing key event:
 every keystroke in ASCII mode, every character typed at a shell prompt, and the
-first key of each word. In a terminal that is 3.81 ms per key.
+first key of each word. In a terminal that is 3.86 ms per key.
 
-That is larger than everything remaining in the scorer, and unlike the scorer
-it has an untried lever: ~2.75 ms of the 3.37 ms measured in the
-context-ascii-memory design was starting the process, so a persistent
-connection (tmux control mode, `-CC`) would remove most of it. Nobody has
-built it; the hazards are a server that restarts underneath the connection and
-a second long-lived fd in the IME process. Do not quote the 3.81 ms as
-"measured overhead of the tmux source" without saying it is per non-composing
-key event only.
+That is larger than everything remaining in the scorer. Do not quote the
+3.86 ms as "measured overhead of the tmux source" without saying it is per
+non-composing key event only.
+
+**Where the 3.86 ms goes, and why "ask for less" buys nothing.** Measured
+2026-09-06, 40-60 repetitions each:
+
+| | p50 |
+| --- | --- |
+| `/usr/bin/true` (process-spawn floor) | 1.46 ms |
+| `tmux display-message -p x` (the most trivial query there is) | 3.78 ms |
+| the real five-command query, 5 KB of pane | 3.86 ms |
+
+So it is ~1.46 ms of process spawn, ~2.3 ms of tmux client startup and
+server-socket handshake, and **~0.25 ms of actually doing the work**. Capturing
+fewer rows, dropping `-e`, asking for less — all of it is inside that 0.25 ms.
+The cost is the invocation, not the content. Reducing how OFTEN we ask is the
+only thing that would matter, and that is a question about AutoSpacer's trigger,
+not about the query.
+
+**Reading the pane's device file instead is not possible.** Recorded because it
+is the natural first idea. `#{pane_tty}` is a character device of size 0 -- a
+stream, not a stored screen -- and it is the SLAVE side, held by the pane's
+shell as fds 0/1/2, so reading it would compete with that shell for the user's
+keystrokes. The master side lives inside the tmux server with no filesystem
+name at all (it does not even appear in `lsof` on the server by name). The grid
+is reconstructed by the server's own VT parser into its heap; there is no file,
+no shared memory and no mmap that exposes it. Speaking the server's unix-socket
+protocol directly is the same dead end wearing a different hat: the 2.3 ms IS
+that protocol's handshake, and reimplementing it buys nothing a persistent
+connection does not already get, in exchange for an internal protocol tmux
+version-checks and does not support third parties using.
+
+**A persistent control-mode connection is worth 10x, and is deliberately not
+built.** `tmux -C attach` keeps one client alive and takes commands on its
+stdin, so the spawn and the handshake are paid once instead of per key event.
+Measured over 60 repetitions of the identical five-command query:
+
+| | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| today, `posix_spawn` per query | 3.86 ms | 4.23 ms | 4.74 ms |
+| `tmux -C`, persistent | **0.39 ms** | 0.50 ms | 0.54 ms |
+
+(The round-trip floor on that connection is 0.08 ms; the four metadata
+commands are 0.28 ms; the pane capture takes it to 0.39 ms.)
+
+It is not built because the win is unperceived -- typing in a terminal does not
+feel slow -- and because the cost is larger than "a subprocess and a reader
+thread". **A control-mode client is a real attached client**, and it collides
+head-on with the arbitration this source depends on:
+
+- It appears in `list-clients` as a second client, flagged
+  `attached,focused,control-mode`, with its own `client_activity` that bumps on
+  every query we make.
+- `JudgeClients` (`tmux_source_util.h`) returns `kFocusEventsOff` whenever
+  `activity.size() > 1` and `focus-events` is off -- **and `focus-events` is off
+  by default in tmux**. So on a default machine a permanent control-mode client
+  would make this source refuse every query, forever. The feature would not
+  degrade; it would stop.
+- With `focus-events on` it is worse rather than better: our own client is
+  frequently the most recently active one, and tmux answers `display-message`
+  for that client -- which is precisely the cross-talk `JudgeClients` exists to
+  refuse, arrived at confidently.
+
+Solvable, probably: filter control-mode clients out of the `CLI|` list by
+`client_flags`, or attach the connection to a throwaway session and switch the
+query to `list-clients -t <the user's session>`. But that means reopening the
+one piece of logic in this file whose whole job is to refuse to answer rather
+than answer wrongly, which is a much larger change than the connection itself.
+
+Verified NOT a problem: a control-mode client does not resize the session
+(window stayed 159x43 with the client reporting `80x`), and the existing
+5-second backoff on a failed or timed-out query already bounds the tail from a
+wedged server to one 50 ms keystroke.
+
+**What would reopen this**: terminal typing actually feeling slow. The
+measurement and the collision are both recorded above, so the work would start
+from the arbitration question rather than from the connection.
 
 ### AutoSpacer's commits and Rime's user dictionary
 
