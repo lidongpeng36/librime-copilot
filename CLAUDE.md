@@ -144,6 +144,53 @@ so sub-plugins just define a `Process` method and don't touch the `Processor` bo
 `Entry` (`copilot::Entry` in `provider.h`) is the common candidate type carrying
 `text`/`weight`/`type`. `src/history.{h,cc}` tracks commit history used as prediction context.
 
+**`copilot/max_candidates: 0` costs more than it looks, and the fix is the
+config, not the code.** The key caps `DBProvider::Lookup` itself, not just the
+display, so unset (0 -> `INT_MAX`) a prediction round materialises every
+continuation of every one of its `max_hints` keys. Measured 2026-09-06 against
+the deployed db, timing `Predict` + `Retrive` + `MergeProviderCandidates`:
+
+| context | total p50 | candidates |
+| --- | --- | --- |
+| `尝试进行代码` | 0.031 ms | 207 |
+| `好的谢谢` | 0.14 ms | 846 |
+| `高屋建` | 0.61 ms | 2850 |
+| **`我`** | **2.43 ms** (p95 4.11) | **10,356** |
+
+The tail is reached whenever the last committed character is a common one, and
+it runs on the input thread after every commit.
+
+**The obvious code fix is worth 11% and should not be made.** `Predict` builds
+a `std::list` (a heap allocation per entry), `list::sort`s it, copies it into
+`candidates_`, `Retrive` returns that BY VALUE, and `MergeProviderCandidates`
+copies and sorts again -- four copies and two sorts, which reads like the
+problem and is not it. Measured on `我`: the copies and both sorts together are
+0.12 ms of the 2.43 ms, and a `std::vector` + `nth_element` rewrite lands at
+2.16 ms. **92% of the cost is the lookup**, and `max_candidates` removes it at
+the source: the same round with the key set to 100 costs **0.009 ms**, a 270x
+cut with no code change at all.
+
+**Capping is lossless, and the argument has a premise worth knowing.** Each
+key's continuations are stored weight-descending (measured: 0 inversions over
+`我`'s 10,356), so an entry in the true global top-K must also be in its own
+key's top-K -- capping each key at K therefore preserves the global top-K
+exactly. But that ordering is EMERGENT rather than asserted anywhere: it falls
+out of `dictdb.merge` sorting by `(first character, -weight)`, `write_pairs`
+walking that order into a plain dict whose iteration order is insertion order,
+and `if e.weight > block.get(key, 0)` letting the first (heaviest) insertion
+stick. Three independent steps, none of which mentions the others.
+
+`tools/test/dictdb_test.py` now pins all three, and each was verified to have
+teeth by breaking that step and watching the suite go red. The third one had
+none until 2026-09-06: `test_duplicate_pairs_from_multiple_readings_keep_the_largest`
+feeds ASCENDING input, and in ascending order "keep the largest" and "keep the
+last" agree, so replacing that condition with a plain assignment left the whole
+suite green.
+
+`max_per_key` (`dictdb.write_pairs`, the build-time analogue) defaults to `-1`
+-> `inf`, so both gates are open by default. That is why `我` carries 10,356
+continuations at all.
+
 ### Sub-plugins
 - **AutoSpacer** (`src/auto_spacer.{h,cc}`) — inserts spaces at CJK↔Latin/number boundaries.
   Two paths: a `surrounding` path using real before/after context (from IMK or IME Bridge),

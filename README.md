@@ -252,6 +252,19 @@ copilot:
   # max prediction candidates every time
   # default to 0, which means showing all candidates
   # you may set it the same with page_size so that period doesn't trigger next page
+  #
+  # 0 is not free. This caps the db lookup itself, not just the display, so
+  # with it unset a context whose last character is a common one materializes
+  # every continuation that character has. Measured on a real db: the key 我
+  # has 10,356 continuations, and one prediction round (10 lookups, since
+  # max_hints defaults to 10) costs 2.43 ms p50 / 4.11 ms p95 on the input
+  # thread, against 0.03-0.6 ms for an ordinary context. Setting this to 100
+  # takes the same round to 0.009 ms.
+  #
+  # Capping is lossless: the db stores each key's continuations
+  # weight-descending, so the top-K of the whole set is exactly the union of
+  # each key's top-K. That ordering is pinned by tools/test/dictdb_test.py --
+  # see "the ordering invariant the runtime cap depends on" there.
   max_candidates: 5
   # max continuous prediction times
   # default to 0, which means no limitation
