@@ -13,7 +13,7 @@
 // that lock is uncontended.
 //
 // llama.cpp types stay out of this header, same as llm.h keeps them out for
-// ClientImpl: everything here is forward-declared or hidden behind Impl, so
+// ClientSimple: everything here is forward-declared or hidden behind Impl, so
 // including this file does not pull in <llama.h>.
 
 #include <memory>

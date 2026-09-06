@@ -5,8 +5,6 @@
 #include "llm.h"
 #include "utils.h"
 
-#define USE_SIMPLE_CLIENT
-
 namespace rime {
 
 namespace {
@@ -42,7 +40,6 @@ inline std::string StripAndNormalize(const std::string& input) {
 LLMProvider::LLMProvider(const Config& c, const std::shared_ptr<::copilot::History>& history)
     : config_(c), history_(history) {
   --config_.rank;
-#ifdef USE_SIMPLE_CLIENT
   ClientConfig config;
   config.n_predict = c.n_predict;
   config.n_ctx = c.n_ctx;
@@ -56,11 +53,6 @@ LLMProvider::LLMProvider(const Config& c, const std::shared_ptr<::copilot::Histo
                                                   });
   client_->commit("WarmUp");
   client_->clear();
-#else
-  session_ = CreateSession("copilot");
-  Predict("WarmUp", "");
-  Clear(session_);
-#endif
   if (!config_.battery_active) {
     is_on_ac_ = copilot::IsACPowerConnected();
     power_token_ = copilot::RegisterPowerChange([this](bool is_ac_power) {
@@ -81,7 +73,6 @@ LLMProvider::~LLMProvider() {
 }
 
 void LLMProvider::Clear() {
-#ifdef USE_SIMPLE_CLIENT
   if (client_) {
     // Stop (and wait for) an in-flight run before dropping promise_: the
     // finish callback reads promise_ on the llama worker thread, so resetting
@@ -91,88 +82,12 @@ void LLMProvider::Clear() {
   }
   promise_.reset();
   future_ = std::shared_future<std::string>();
-#else
-  if (session_) {
-    Clear(session_);
-    session_->promise.reset();
-    session_->future = std::shared_future<std::string>();
-    session_->response.clear();
-  }
-#endif
 }
-
-void LLMProvider::Backspace(const std::shared_ptr<Session>& session) {}
-
-void LLMProvider::Commit(const std::string& input, const std::shared_ptr<Session>& session) {
-  std::string prompt = history_->gets(config_.max_history);
-  DLOG(INFO) << "[LLM] Prompt: '" << prompt << "'";
-  session->response.clear();
-  session->promise = std::make_shared<std::promise<std::string>>();
-  session->future = session->promise->get_future().share();
-  session->client->clear();
-  session->client->commit(prompt, /* async = */ true);
-}
-
-std::string LLMProvider::GetResults(const std::shared_ptr<LLMProvider::Session>& session,
-                                    int timeout_us) const {
-  static const std::string empty_result;
-  auto& response = session->response;
-  auto& future = session->future;
-  if (!future.valid()) {
-    return empty_result;
-  }
-  if (future.wait_for(std::chrono::microseconds(timeout_us)) != std::future_status::timeout) {
-    response = StripAndNormalize(future.get());
-    // LOG(INFO) << "[LLM] response: '" << response << "'";
-  }
-  return response;
-}
-
-std::string LLMProvider::GetCurrentResults(int timeout_us, const std::string& app_id) const {
-  static const std::string empty_result;
-  auto it = sessions_.find(app_id);
-  if (it == sessions_.end()) {
-    return empty_result;
-  }
-  return GetResults(it->second, timeout_us);
-}
-
-std::shared_ptr<LLMProvider::Session> LLMProvider::CreateSession(const std::string& app_id) {
-  auto session = std::make_shared<Session>();
-  session->history = std::make_shared<::copilot::History>(100);
-  ClientConfig config;
-  config.apply_chat_template = false;
-  config.n_predict = config_.n_predict;
-  config.no_perf = false;
-
-  auto& manager = llama::LLMManager::Instance();
-  std::weak_ptr<Session> weak_session = session;
-  session->client = manager.CreateClient(config_.model, app_id, config, nullptr,
-                                         [weak_session](const std::string& response) {
-                                           if (auto session = weak_session.lock()) {
-                                             session->promise->set_value(response);
-                                           }
-                                         });
-
-  return session;
-}
-
-std::shared_ptr<LLMProvider::Session> LLMProvider::GetOrCreateSession(const std::string& app_id) {
-  auto it = sessions_.find(app_id);
-  if (it != sessions_.end()) {
-    return it->second;
-  }
-  auto session = CreateSession(app_id);
-  return sessions_.emplace(app_id, session).first->second;
-}
-
-void LLMProvider::Clear(const std::shared_ptr<Session>& session) { session->client->clear(); }
 
 bool LLMProvider::Predict(const std::string& input, const std::string& context) {
   if (!is_on_ac_) {
     return false;
   }
-#ifdef USE_SIMPLE_CLIENT
   if (history_->size() < 3) {
     return false;
   }
@@ -183,17 +98,12 @@ bool LLMProvider::Predict(const std::string& input, const std::string& context) 
   future_ = promise_->get_future().share();
   client_->commit(prompt);
   return true;
-#else
-  Commit(input, session_);
-  return true;
-#endif
 }
 
 std::vector<copilot::Entry> LLMProvider::Retrive(int timeout_us) const {
   if (!is_on_ac_) {
     return {};
   }
-#ifdef USE_SIMPLE_CLIENT
   if (!future_.valid()) {
     return {};
   }
@@ -201,9 +111,6 @@ std::vector<copilot::Entry> LLMProvider::Retrive(int timeout_us) const {
   if (future_.wait_for(std::chrono::microseconds(timeout_us)) != std::future_status::timeout) {
     response = StripAndNormalize(future_.get());
   }
-#else
-  auto response = GetResults(session_, timeout_us);
-#endif
   DLOG(INFO) << "[LLM] response: '" << response << "'";
   if (response.empty()) {
     return {};
