@@ -430,9 +430,30 @@ void ImeBridgeState::HandleIdentity(const std::string& socket, const std::string
   identity_.command = command;
   identity_.host = host;
   has_identity_ = true;
+  const context_memory::Identity* bound_to = nullptr;
+  if (host.empty()) {
+    // The local reporter describing a local pane. Remembered separately so the
+    // next remote push can be paired with it.
+    last_local_ = identity_;
+    has_last_local_ = true;
+  } else if (has_last_local_) {
+    // A remote pane switch. Pair it NOW, with the local pane the user is in at
+    // this instant -- deciding at the next keystroke instead is what bound a
+    // plain `ssh` pane to another pane's remote tmux, permanently. Deliberately
+    // NOT cleared by the local push that follows when the user switches panes
+    // before typing: that push is precisely the event that used to misdirect
+    // this. See ALaterLocalPushDoesNotDisturbIt.
+    pending_bind_ = context_memory::PendingBind{identity_, last_local_};
+    bound_to = &pending_bind_->local_target;
+  }
   if (config_.debug) {
+    // bound_to, not pending_bind_: the slot can hold an EARLIER push's
+    // pairing (nothing has drained it yet) that THIS message did not create
+    // and a local push never creates at all. The line reports what this
+    // message did, not what happens to be parked.
     LOG(INFO) << "[ImeBridge] identity pushed: pane=" << pane_id << ", command=" << command
-              << (host.empty() ? "" : ", host=") << host;
+              << (host.empty() ? "" : ", host=") << host
+              << (bound_to ? ", bind_target=" + bound_to->pane_id : std::string());
   }
 }
 
@@ -440,6 +461,13 @@ std::optional<context_memory::Identity> ImeBridgeState::GetPushedIdentity() cons
   std::lock_guard<std::mutex> lock(mutex_);
   if (!has_identity_) return std::nullopt;
   return identity_;
+}
+
+std::optional<context_memory::PendingBind> ImeBridgeState::TakePendingBind() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto taken = std::move(pending_bind_);
+  pending_bind_.reset();
+  return taken;
 }
 
 void ImeBridgeState::RetainClientConnection(const std::string& client_key) {

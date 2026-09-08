@@ -118,6 +118,17 @@ class ImeBridgeState {
                       const std::string& command, const std::string& host);
   std::optional<context_memory::Identity> GetPushedIdentity() const;
 
+  // The remote identity most recently pushed, paired with the local pane the
+  // last local push named at the instant it arrived. DRAINS: the input thread
+  // calls it on every key event, and a slot that did not empty would rebind on
+  // each of them, against a different "now" each time.
+  //
+  // One slot, not a queue. Nothing bounds how long a keystroke takes to
+  // arrive, so a queue here is an unbounded buffer fed by the network; the
+  // slot is self-limiting, and a lost pairing corrects on that host's next
+  // push. Pinned by ASecondRemotePushReplacesTheFirst.
+  std::optional<context_memory::PendingBind> TakePendingBind();
+
   // Per-connection refcount for a client key. A reconnecting client briefly has
   // two live connections, so only the last one going away means it is really
   // gone — at which point we synthesize a reset(restore) so a killed client
@@ -186,6 +197,11 @@ class ImeBridgeState {
   std::chrono::steady_clock::time_point last_cleanup_;
   bool has_identity_ = false;
   context_memory::Identity identity_;
+  // The most recent push carrying NO host: the local reporter describing a
+  // local pane. Apart from identity_, which the next remote push overwrites.
+  bool has_last_local_ = false;
+  context_memory::Identity last_local_;
+  std::optional<context_memory::PendingBind> pending_bind_;
   std::atomic<uint64_t> applied_mode_writes_{0};
 };
 
@@ -221,6 +237,8 @@ class ImeBridgeServer {
 
   // The most recently pushed pane identity, if any.
   std::optional<context_memory::Identity> GetPushedIdentity() { return state_.GetPushedIdentity(); }
+
+  std::optional<context_memory::PendingBind> TakePendingBind() { return state_.TakePendingBind(); }
 
   // 获取待处理的 actions（线程安全）
   std::queue<ImeBridgePendingAction> TakePendingActions() { return state_.TakePendingActions(); }

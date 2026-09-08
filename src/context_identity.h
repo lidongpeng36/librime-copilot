@@ -35,9 +35,13 @@ struct ResolvedIdentity {
 std::optional<ResolvedIdentity> GetContextIdentity();
 
 using IdentityFn = std::optional<context_memory::Identity> (*)();
+using PendingBindFn = std::optional<context_memory::PendingBind> (*)();
 using TerminalPredicateFn = bool (*)();
-// Three nullptrs restore the real sources.
-void SetContextIdentityTestHooks(IdentityFn bridge, IdentityFn tmux, TerminalPredicateFn terminal);
+// Four nullptrs restore the real sources. The pending-bind hook MUST drain, as
+// the real TakePendingBind does; a fake that does not would rebind on every
+// key event and make a non-draining implementation pass.
+void SetContextIdentityTestHooks(IdentityFn bridge, PendingBindFn pending, IdentityFn tmux,
+                                 TerminalPredicateFn terminal);
 
 // The commands a local pane must be running before a remote identity is
 // bound behind it, and the bound table's LRU bound. Read from
