@@ -11,17 +11,13 @@ namespace rime {
 namespace {
 
 IdentityFn g_bridge_hook = nullptr;
+PendingBindFn g_pending_hook = nullptr;
 IdentityFn g_tmux_hook = nullptr;
 TerminalPredicateFn g_terminal_hook = nullptr;
 
 context_memory::RemoteBinding g_binding;
 std::mutex g_options_mutex;
 std::vector<std::string> g_remote_commands{"ssh", "mosh", "et"};
-// The remote identity most recently bound. Compared, not consumed: a remote
-// pane switch pushes once and is then read on every keystroke until the next
-// switch, and re-polling the local pane on each of those would put a
-// posix_spawn on every key.
-std::optional<context_memory::Identity> g_last_bound;
 
 std::vector<std::string> RemoteCommands() {
   std::lock_guard<std::mutex> lock(g_options_mutex);
@@ -43,10 +39,17 @@ bool FrontmostIsTerminalOrHook() {
   return FrontmostIsTerminal();
 }
 
+std::optional<context_memory::PendingBind> TakePendingBind() {
+  if (g_pending_hook) return g_pending_hook();
+  return ImeBridgeServer::Instance().TakePendingBind();
+}
+
 }  // namespace
 
-void SetContextIdentityTestHooks(IdentityFn bridge, IdentityFn tmux, TerminalPredicateFn terminal) {
+void SetContextIdentityTestHooks(IdentityFn bridge, PendingBindFn pending, IdentityFn tmux,
+                                 TerminalPredicateFn terminal) {
   g_bridge_hook = bridge;
+  g_pending_hook = pending;
   g_tmux_hook = tmux;
   g_terminal_hook = terminal;
 }
@@ -61,10 +64,7 @@ void SetRemoteBindingOptions(std::vector<std::string> remote_commands, int max_e
 
 int ClampMaxEntries(int configured) { return configured < 1 ? 1 : configured; }
 
-void ResetRemoteBindingForTest() {
-  g_binding.Clear();
-  g_last_bound.reset();
-}
+void ResetRemoteBindingForTest() { g_binding.Clear(); }
 
 const char* DescribeIdentitySource(ContextIdentitySource source) {
   switch (source) {
@@ -82,6 +82,24 @@ const char* DescribeIdentitySource(ContextIdentitySource source) {
 }
 
 std::optional<ResolvedIdentity> GetContextIdentity() {
+  // Ahead of the frontmost gate on purpose. The gate decides whether to
+  // BELIEVE a pushed identity -- the pushed cell has no expiry, so it must not
+  // be trusted once the user is in another application. Binding is a different
+  // claim ("local pane %15 has mini's %1 behind it") and is true whatever is
+  // frontmost; deferring it behind the gate loses the binding whenever the
+  // user tabs away and back by a route that produces no new push.
+  //
+  // The pair was captured on the bridge thread when the push arrived. Nothing
+  // is polled here: asking tmux where the user is NOW is what bound a plain
+  // `ssh` pane to another pane's remote tmux, permanently. See the 2026-09-08
+  // design.
+  if (auto pending = TakePendingBind()) {
+    if (!pending->local_target.pane_id.empty() &&
+        context_memory::IsRemoteCommand(RemoteCommands(), pending->local_target.command)) {
+      g_binding.Bind(pending->local_target.pane_id, pending->local_target.command, pending->remote);
+    }
+  }
+
   // Priority 1: pushed by a tmux hook. Costs nothing per keystroke.
   //
   // Gated on the frontmost app because the pushed value is a cell with no
@@ -91,25 +109,6 @@ std::optional<ResolvedIdentity> GetContextIdentity() {
     if (auto pushed = PushedIdentity()) {
       if (!pushed->pane_id.empty()) {
         if (!pushed->host.empty()) {
-          // A remote pane switch. Bind it behind whichever local pane the
-          // user is sitting in -- correct by construction, because a remote
-          // switch happens while they are in the local pane whose ssh
-          // carries it.
-          //
-          // This is the ONLY place that binding may happen. The bridge's
-          // connection thread must not do it: the FrontmostIsTerminalOrHook()
-          // above reaches [[NSWorkspace sharedWorkspace] frontmostApplication]
-          // (frontmost_app.mm:11), and AppKit off the main thread is not
-          // documented as safe.
-          if (!g_last_bound || *g_last_bound != *pushed) {
-            if (auto local = PolledIdentity()) {
-              if (!local->pane_id.empty() &&
-                  context_memory::IsRemoteCommand(RemoteCommands(), local->command)) {
-                g_binding.Bind(local->pane_id, local->command, *pushed);
-                g_last_bound = *pushed;
-              }
-            }
-          }
           return ResolvedIdentity{*pushed, ContextIdentitySource::kBridgeRemote};
         }
         // A local pane switch. If something remote was bound behind this
