@@ -576,6 +576,80 @@ TEST(ImeBridgeIdentity, AnAbsentExpectFieldIsNotAMismatch) {
   EXPECT_TRUE(state.GetPushedIdentity().has_value());
 }
 
+// 远端推送到达的那一刻，用户还在哪个本地 pane 里 —— 这是绑定唯一需要、
+// 而且当时就已经知道的信息。按键时再去问就晚了：用户完全来得及切走。
+TEST(ImeBridgePendingBind, PairsARemotePushWithTheLocalPaneAtArrival) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%15", "ssh"));
+  state.ProcessMessage(IdentityMessage("%1", "claude", "Mac-Mini"));
+  auto pending = state.TakePendingBind();
+  ASSERT_TRUE(pending.has_value());
+  EXPECT_EQ(pending->remote.pane_id, "%1");
+  EXPECT_EQ(pending->remote.host, "Mac-Mini");
+  EXPECT_EQ(pending->local_target.pane_id, "%15");
+  EXPECT_EQ(pending->local_target.command, "ssh");
+}
+
+// 这一条就是这次改动的全部意义。用户切远端窗口（推送到达，配对 %15），
+// 还没打字就切到另一个 ssh pane（本地推送 %18）—— 后到的本地推送绝不能
+// 动这个配对，否则绑定要么绑错（今天）要么整个丢失。
+TEST(ImeBridgePendingBind, ALaterLocalPushDoesNotDisturbIt) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%15", "ssh"));
+  state.ProcessMessage(IdentityMessage("%1", "claude", "Mac-Mini"));
+  state.ProcessMessage(IdentityMessage("%18", "ssh"));
+  auto pending = state.TakePendingBind();
+  ASSERT_TRUE(pending.has_value());
+  EXPECT_EQ(pending->local_target.pane_id, "%15");
+}
+
+// 取走即清空。输入线程每次按键都会调它，不清空的话一次推送会在之后的
+// 每一次按键上重新绑定 —— 而每一次的「当前」都可能不同。
+TEST(ImeBridgePendingBind, TakingItDrainsIt) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%15", "ssh"));
+  state.ProcessMessage(IdentityMessage("%1", "claude", "Mac-Mini"));
+  ASSERT_TRUE(state.TakePendingBind().has_value());
+  EXPECT_FALSE(state.TakePendingBind().has_value());
+}
+
+// 没见过本地推送的机器（本地 tmux 钩子没装）不配对，也就不绑定。
+TEST(ImeBridgePendingBind, NoLocalPushYetMeansNothingToBind) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%1", "claude", "Mac-Mini"));
+  EXPECT_FALSE(state.TakePendingBind().has_value());
+}
+
+// 本地推送自己不产生待绑定 —— 它就是本地 pane，没有远端可绑。
+TEST(ImeBridgePendingBind, ALocalPushAloneParksNothing) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%15", "ssh"));
+  EXPECT_FALSE(state.TakePendingBind().has_value());
+}
+
+// 槽只有一个：两次远端推送之间没有按键时，后一次覆盖前一次。这是记录在
+// spec 里的已知限制（队列会变成一个由网络喂料、无人限长的缓冲区），
+// 钉住它是为了让将来改成队列的人知道这里本来就是这么设计的。
+TEST(ImeBridgePendingBind, ASecondRemotePushReplacesTheFirst) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%15", "ssh"));
+  state.ProcessMessage(IdentityMessage("%1", "claude", "Mac-Mini"));
+  state.ProcessMessage(IdentityMessage("%9", "zsh", "devbox"));
+  auto pending = state.TakePendingBind();
+  ASSERT_TRUE(pending.has_value());
+  EXPECT_EQ(pending->remote.host, "devbox");
+  EXPECT_FALSE(state.TakePendingBind().has_value());
+}
+
+// 被 expect 丢掉的消息不配对 —— 它根本没到 HandleIdentity。
+TEST(ImeBridgePendingBind, AMessageAddressedElsewhereParksNothing) {
+  rime::ImeBridgeState state;
+  state.SetHostIdForTest("Lis-MacBook-Pro");
+  state.ProcessMessage(IdentityMessage("%15", "ssh"));
+  state.ProcessMessage(IdentityMessageWithExpect("%1", "Mac-Mini", "SomeOtherLaptop"));
+  EXPECT_FALSE(state.TakePendingBind().has_value());
+}
+
 // ---------------------------------------------------------------------------
 // applied_mode_writes(): the seam per-context memory uses to tell "the user's
 // mode in this pane" from "a mode this queue applied here by accident".

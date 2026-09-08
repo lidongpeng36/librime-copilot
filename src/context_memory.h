@@ -42,6 +42,19 @@ inline bool operator==(const Identity& a, const Identity& b) {
 }
 inline bool operator!=(const Identity& a, const Identity& b) { return !(a == b); }
 
+// A remote identity and the local pane it belongs behind, paired at the moment
+// the remote push ARRIVED.
+//
+// Why a pair rather than two reads: the local pane is only correct as of that
+// instant. Asking again later -- which is what the tmux poll at the next
+// keystroke did -- answers "where is the user now", and the user has had all
+// the time between a pane switch and a keystroke to move somewhere else. See
+// the 2026-09-08 design's "The mechanism".
+struct PendingBind {
+  Identity remote;
+  Identity local_target;
+};
+
 // The single string form. BOTH identity rungs must route through this: a
 // machine that adds the tmux hook after having used the polling fallback must
 // find the keys it already remembered, not orphan them.
