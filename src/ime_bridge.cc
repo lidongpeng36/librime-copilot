@@ -430,6 +430,7 @@ void ImeBridgeState::HandleIdentity(const std::string& socket, const std::string
   identity_.command = command;
   identity_.host = host;
   has_identity_ = true;
+  const context_memory::Identity* bound_to = nullptr;
   if (host.empty()) {
     // The local reporter describing a local pane. Remembered separately so the
     // next remote push can be paired with it.
@@ -443,12 +444,16 @@ void ImeBridgeState::HandleIdentity(const std::string& socket, const std::string
     // before typing: that push is precisely the event that used to misdirect
     // this. See ALaterLocalPushDoesNotDisturbIt.
     pending_bind_ = context_memory::PendingBind{identity_, last_local_};
+    bound_to = &pending_bind_->local_target;
   }
   if (config_.debug) {
+    // bound_to, not pending_bind_: the slot can hold an EARLIER push's
+    // pairing (nothing has drained it yet) that THIS message did not create
+    // and a local push never creates at all. The line reports what this
+    // message did, not what happens to be parked.
     LOG(INFO) << "[ImeBridge] identity pushed: pane=" << pane_id << ", command=" << command
               << (host.empty() ? "" : ", host=") << host
-              << (pending_bind_ ? ", bind_target=" + pending_bind_->local_target.pane_id
-                                : std::string());
+              << (bound_to ? ", bind_target=" + bound_to->pane_id : std::string());
   }
 }
 

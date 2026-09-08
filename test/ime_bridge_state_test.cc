@@ -14,12 +14,49 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <string>
 #include <thread>
+#include <vector>
 
+#include <glog/logging.h>
 #include <nlohmann/json.hpp>
 
 using rime::ImeBridgePendingAction;
 using rime::ImeBridgeState;
+
+namespace {
+
+// A glog sink that records every message's TEXT (no prefix -- glog strips
+// that before handing a sink the message), so a test can assert on exactly
+// what a LOG(INFO) call produced without redirecting a file descriptor.
+class CapturingLogSink : public google::LogSink {
+ public:
+  void send(google::LogSeverity severity, const char* full_filename, const char* base_filename,
+             int line, const google::LogMessageTime& time, const char* message,
+             size_t message_len) override {
+    messages_.emplace_back(message, message_len);
+  }
+  const std::vector<std::string>& messages() const { return messages_; }
+
+ private:
+  std::vector<std::string> messages_;
+};
+
+// RAII registration. Needed because an ASSERT_* inside the test body returns
+// early -- without this, a failed assertion would leave the sink registered
+// with glog while the local CapturingLogSink object it points to is
+// destroyed, and the next LOG() anywhere in the process would call into
+// freed memory.
+class ScopedLogSink {
+ public:
+  explicit ScopedLogSink(google::LogSink* sink) : sink_(sink) { google::AddLogSink(sink_); }
+  ~ScopedLogSink() { google::RemoveLogSink(sink_); }
+
+ private:
+  google::LogSink* sink_;
+};
+
+}  // namespace
 
 TEST(ImeBridgeState, NoActiveClientReturnsNullopt) {
   ImeBridgeState s;
@@ -648,6 +685,49 @@ TEST(ImeBridgePendingBind, AMessageAddressedElsewhereParksNothing) {
   state.ProcessMessage(IdentityMessage("%15", "ssh"));
   state.ProcessMessage(IdentityMessageWithExpect("%1", "Mac-Mini", "SomeOtherLaptop"));
   EXPECT_FALSE(state.TakePendingBind().has_value());
+}
+
+// 第二次本地推送必须更新 last_local_，哪怕上一次配对还没被按键取走 ——
+// 这不是"顺手保留"，是必须的：不然下一次远端推送会配对到一个已经离开
+// 的本地 pane。把 last_local_ 的更新挪到 `if (!pending_bind_)` 里看起来是
+// 在"修"注释里那句看似矛盾的话，实际会让这条测试失败。
+TEST(ImeBridgePendingBind, ALaterRemotePushPairsWithTheNewestLocalPane) {
+  rime::ImeBridgeState state;
+  state.ProcessMessage(IdentityMessage("%15", "ssh"));
+  state.ProcessMessage(IdentityMessage("%1", "claude", "Mac-Mini"));
+  state.ProcessMessage(IdentityMessage("%18", "ssh"));
+  state.ProcessMessage(IdentityMessage("%9", "zsh", "devbox"));
+  auto pending = state.TakePendingBind();
+  ASSERT_TRUE(pending.has_value());
+  EXPECT_EQ(pending->remote.pane_id, "%9");
+  EXPECT_EQ(pending->local_target.pane_id, "%18");
+}
+
+// 这个机制唯一的可观测手段就是 debug 日志，它必须报告"这条消息做了
+// 什么"，而不是"槽里现在停着什么"。本地推送（第三条消息）没有绑定
+// 任何东西，即使上一次远端推送留下的配对还原封不动地停在槽里 —— 用
+// `pending_bind_` 而不是"这次调用是否刚创建了配对"做判断，会让这条
+// 本地推送的日志印出 `bind_target=%15`，读起来像"%18 被绑到了 %15"。
+TEST(ImeBridgePendingBind, TheDebugLineNamesOnlyWhatThisMessageBound) {
+  rime::ImeBridgeState state;
+  state.config_.debug = true;
+  CapturingLogSink sink;
+  ScopedLogSink guard(&sink);
+
+  state.ProcessMessage(IdentityMessage("%15", "ssh"));
+  state.ProcessMessage(IdentityMessage("%1", "claude", "Mac-Mini"));
+  state.ProcessMessage(IdentityMessage("%18", "ssh"));
+
+  ASSERT_EQ(sink.messages().size(), 3u);
+  // The local push that seeds last_local_: nothing bound yet.
+  EXPECT_NE(sink.messages()[0].find("pane=%15"), std::string::npos);
+  EXPECT_EQ(sink.messages()[0].find("bind_target="), std::string::npos);
+  // The remote push: this call creates the pairing.
+  EXPECT_NE(sink.messages()[1].find("bind_target=%15"), std::string::npos);
+  // The regression this test guards: a later local push binds nothing, and
+  // must say so, regardless of what is still parked in pending_bind_.
+  EXPECT_NE(sink.messages()[2].find("pane=%18"), std::string::npos);
+  EXPECT_EQ(sink.messages()[2].find("bind_target="), std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
