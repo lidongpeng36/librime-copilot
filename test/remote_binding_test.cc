@@ -17,6 +17,16 @@ Identity Remote(const char* host, const char* pane, const char* command) {
   id.host = host;
   return id;
 }
+
+// Like Remote(), but with an explicit socket -- for pinning that the
+// eviction key includes it. Kept separate rather than adding a parameter to
+// Remote(), which four other tests already call positionally.
+Identity RemoteOnSocket(const char* host, const char* pane, const char* command,
+                        const char* socket) {
+  Identity id = Remote(host, pane, command);
+  id.socket = socket;
+  return id;
+}
 }  // namespace
 
 TEST(RemoteBinding, LookupMissesBeforeAnythingIsBound) {
@@ -123,6 +133,20 @@ TEST(RemoteBinding, EvictsTheLeastRecentlyUsedBeyondMaxEntries) {
   EXPECT_TRUE(b.Lookup("%1", "ssh").has_value());
   EXPECT_TRUE(b.Lookup("%3", "ssh").has_value());
   EXPECT_FALSE(b.Lookup("%2", "ssh").has_value());  // 最久未用的被丢掉
+}
+
+// The eviction key is (socket, host, pane_id), not (host, pane_id): two
+// independent tmux servers on the same host can number their panes
+// identically (both have a "%2"), and that collision must not evict across
+// servers. Mirrors TwoPanesOfOneHostAreNotAClaimOnEachOther above, but varies
+// socket while host and pane_id stay fixed, instead of the other way round.
+TEST(RemoteBinding, TwoTmuxServersOnOneHostAreNotAClaimOnEachOtherDespiteSamePaneId) {
+  RemoteBinding b;
+  b.Bind("%4", "ssh", RemoteOnSocket("devbox", "%2", "zsh", "/tmp/tmux-1000/default"));
+  b.Bind("%7", "ssh", RemoteOnSocket("devbox", "%2", "zsh", "/tmp/tmux-1000/alt"));
+  EXPECT_EQ(b.size(), 2u);
+  EXPECT_TRUE(b.Lookup("%4", "ssh").has_value());
+  EXPECT_TRUE(b.Lookup("%7", "ssh").has_value());
 }
 
 TEST(IsRemoteCommandTest, MatchesExactlyAndOnlyListedCommands) {
