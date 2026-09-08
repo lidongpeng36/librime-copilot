@@ -63,10 +63,11 @@ class RemoteBinding {
       it->second->command = local_command;
       it->second->remote = remote;
       order_.splice(order_.begin(), order_, it->second);
-      return;
+    } else {
+      order_.push_front(Entry{local_pane_id, local_command, remote});
+      index_[local_pane_id] = order_.begin();
     }
-    order_.push_front(Entry{local_pane_id, local_command, remote});
-    index_[local_pane_id] = order_.begin();
+    ReleaseOtherClaimsLocked(local_pane_id, remote);
     EvictLocked();
   }
 
@@ -114,6 +115,36 @@ class RemoteBinding {
     while (index_.size() > max_entries_) {
       index_.erase(order_.back().local_pane_id);
       order_.pop_back();
+    }
+  }
+
+  // The caret cannot be in two places, so two local panes claiming one remote
+  // pane is a contradiction and the newer claim is the better evidence. This
+  // is what stops a mis-bind from being permanent: the table is process-wide
+  // and survives a redeploy, so before this the only cure was restarting
+  // Squirrel.
+  //
+  // Keyed on (host, pane_id), NEVER on host alone. Two local panes ssh'd to
+  // one host and attached to two DIFFERENT remote panes is the case this whole
+  // feature exists for -- see DistinctLocalPanesHoldDistinctRemotes, and
+  // TwoPanesOfOneHostAreNotAClaimOnEachOther beside it. An empty host is not a
+  // claim on anything: Bind is only ever called with a remote identity, but a
+  // future caller passing one without a host must not evict every pane that
+  // happens to share a pane id.
+  //
+  // Callers hold mutex_.
+  void ReleaseOtherClaimsLocked(const std::string& keep_local_pane, const Identity& remote) {
+    if (remote.host.empty()) {
+      return;
+    }
+    for (auto it = order_.begin(); it != order_.end();) {
+      if (it->local_pane_id != keep_local_pane && it->remote.host == remote.host &&
+          it->remote.pane_id == remote.pane_id) {
+        index_.erase(it->local_pane_id);
+        it = order_.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
 
