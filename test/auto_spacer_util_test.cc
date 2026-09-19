@@ -165,6 +165,114 @@ TEST(AutoSpacerUtil, WhitespaceHardeningLeavesOrdinaryCasesAlone) {
   EXPECT_TRUE(NeedSpaceAfter("今天", true));
 }
 
+// IsContinuingSelfCommittedRawAscii is NeedAddSpace's "don't re-space a raw
+// ASCII run we are still typing" check, extracted as a single predicate.
+TEST(IsContinuingSelfCommittedRawAscii, TrueForRawOrThruEndingInAlnum) {
+  EXPECT_TRUE(IsContinuingSelfCommittedRawAscii("raw", " h"));
+  EXPECT_TRUE(IsContinuingSelfCommittedRawAscii("thru", "he"));
+  EXPECT_TRUE(IsContinuingSelfCommittedRawAscii("raw", "9"));
+}
+
+TEST(IsContinuingSelfCommittedRawAscii, FalseForOtherRecordTypes) {
+  // A selected CJK candidate is not a raw ASCII run, whatever it ends in.
+  EXPECT_FALSE(IsContinuingSelfCommittedRawAscii("select", "he"));
+  EXPECT_FALSE(IsContinuingSelfCommittedRawAscii("", "he"));
+}
+
+TEST(IsContinuingSelfCommittedRawAscii, FalseWhenLatestTextDoesNotEndInAlnum) {
+  EXPECT_FALSE(IsContinuingSelfCommittedRawAscii("raw", "中"));
+  EXPECT_FALSE(IsContinuingSelfCommittedRawAscii("raw", ""));
+  EXPECT_FALSE(IsContinuingSelfCommittedRawAscii("raw", " h "));  // trailing space
+}
+
+// ResolveBoundaryBefore decides between the screen (`raw_before`, which over
+// ssh lags the round trip) and our own last commit_history record. It is only
+// consulted once the caller has established that record is still at this
+// caret (LocalCommitStillAtCaret below).
+TEST(ResolveBoundaryBefore, TrustsRawBeforeWhenItEndsWithTheLatestCommit) {
+  // Caught up: keep raw_before, it carries more left context.
+  EXPECT_EQ("对比下 vLLM", ResolveBoundaryBefore("对比下 vLLM", " vLLM"));
+}
+
+TEST(ResolveBoundaryBefore, FallsBackWhenRawBeforeHasNotCaughtUp) {
+  // Live repro: raw_before was still the pre-"和" screen, so "和sglang".
+  EXPECT_EQ("和", ResolveBoundaryBefore("对, 下完自动校验. 另外,我们对比下", "和"));
+  EXPECT_EQ(" h", ResolveBoundaryBefore("中", " h"));
+}
+
+TEST(ResolveBoundaryBefore, KeepsRawBeforeWhenLatestTextIsEmpty) {
+  // librime clears commit_history on an unhandled Backspace/Return.
+  EXPECT_EQ("中文", ResolveBoundaryBefore("中文", ""));
+}
+
+// librime records an unhandled printable key as {"thru", ch} only when it has
+// no modifier (commit_history.cc), so a Shift-typed "?" is never in
+// commit_history while the screen shows it. Only such characters -- ASCII
+// punctuation/whitespace -- may trail our commit on a caught-up screen.
+TEST(ResolveBoundaryBefore, ToleratesTrailingAsciiPunctuationMissingFromHistory) {
+  EXPECT_EQ("❯ 好的, 步骤?", ResolveBoundaryBefore("❯ 好的, 步骤?", " 步骤"));
+  EXPECT_TRUE(NeedSpaceBefore(ResolveBoundaryBefore("❯ 好的, 步骤?", " 步骤"),
+                              /*content_is_ascii=*/false));
+}
+
+TEST(ResolveBoundaryBefore, DoesNotMatchAnEarlierOccurrenceOfTheSameText) {
+  // Live repro: "agent" committed in a sentence that already said "agent";
+  // the screen still ended in "是", so the CJK commit after it lost its space.
+  EXPECT_EQ(" agent",
+            ResolveBoundaryBefore("我现在需要的结论是当前我们构建的 agent 到底表现怎么样, "
+                                  "还有哪些问题, 这些问题是",
+                                  " agent"));
+}
+
+TEST(ResolveBoundaryBefore, AManualSpaceIsItsOwnCommit) {
+  // Live repro "请求.  百炼": the user's own Space is recorded as {"thru", " "}.
+  // Before the screen shows it, a space elsewhere in the line must not count
+  // as confirmation -- only the tail does.
+  EXPECT_EQ(" ", ResolveBoundaryBefore("我们构建的 agent 请求.", " "));
+  EXPECT_FALSE(NeedSpaceBefore(ResolveBoundaryBefore("我们构建的 agent 请求.", " "),
+                               /*content_is_ascii=*/false));
+  // Once rendered, the screen wins.
+  EXPECT_EQ("请求. ", ResolveBoundaryBefore("请求. ", " "));
+}
+
+TEST(ResolveBoundaryBefore, ContinuingARawAsciiRunDoesNotReSpace) {
+  // Screen still shows the pre-commit CJK tail; we just committed " h".
+  EXPECT_FALSE(NeedSpaceBefore(ResolveBoundaryBefore("中", " h"), /*content_is_ascii=*/true));
+}
+
+// LocalCommitStillAtCaret gates the fallback above. A disagreement between the
+// screen and commit_history means lag only if the commit is recent and was
+// made at this caret; commit_history is per Rime session (one terminal
+// window), so after a tmux pane switch or a caret move it describes somewhere
+// else, and the screen -- accurate locally -- must win.
+TEST(LocalCommitStillAtCaret, TrueForARecentCommitOnThisClient) {
+  LocalCommitWitness w{"中文", "tmux:s:%1", 1000};
+  EXPECT_TRUE(LocalCommitStillAtCaret(w, "中文", "tmux:s:%1", 1500, 3000));
+}
+
+TEST(LocalCommitStillAtCaret, FalseAfterAPaneSwitch) {
+  // Zero-lag regression this gate exists for: "中文" committed in pane %1,
+  // then `ls` typed at pane %2's "$ " prompt got a spurious leading space.
+  LocalCommitWitness w{"中文", "tmux:s:%1", 1000};
+  EXPECT_FALSE(LocalCommitStillAtCaret(w, "中文", "tmux:s:%2", 1100, 3000));
+}
+
+TEST(LocalCommitStillAtCaret, FalseOnceTheLagWindowHasPassed) {
+  LocalCommitWitness w{"中文", "tmux:s:%1", 1000};
+  EXPECT_FALSE(LocalCommitStillAtCaret(w, "中文", "tmux:s:%1", 4001, 3000));
+}
+
+TEST(LocalCommitStillAtCaret, FalseWhenTheWitnessIsForADifferentRecord) {
+  LocalCommitWitness w{"中文", "tmux:s:%1", 1000};
+  EXPECT_FALSE(LocalCommitStillAtCaret(w, "测试", "tmux:s:%1", 1100, 3000));
+}
+
+TEST(LocalCommitStillAtCaret, FalseWhenNothingWasWitnessed) {
+  // Default-constructed: no commit seen, or invalidated by a navigation key.
+  EXPECT_FALSE(LocalCommitStillAtCaret(LocalCommitWitness{}, "中文", "tmux:s:%1", 1100, 3000));
+  EXPECT_FALSE(LocalCommitStillAtCaret(LocalCommitWitness{}, "", "", 1100, 3000));
+}
+
 TEST(DecorateCommitText, TrimsAndSkipsChinesePunct) {
   // Surrounding whitespace in the raw text is trimmed before decoration.
   EXPECT_EQ(" test", DecorateCommitText("  test  ", "中", "", true, true));

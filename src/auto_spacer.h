@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
 
+#include "auto_spacer_util.h"
 #include "copilot_plugin.h"
 #include "imk_client.h"
 
@@ -106,6 +109,21 @@ class AutoSpacer : public CopilotPlugin<AutoSpacer> {
     std::string after;
   };
   std::unordered_map<std::string, ClientState> client_states_;
+
+  // Attributes each commit_history change to the client the previous key ran
+  // on (commits happen while a key is processed; this notices them on the
+  // next one). The seen_* snapshot is how a change is detected: librime's
+  // CommitHistory has no counter, so two identical records in a row once it
+  // is full go unnoticed -- harmless, the witness then keeps the older time
+  // for the same text. See LocalCommitStillAtCaret (auto_spacer_util.h).
+  auto_spacer_detail::LocalCommitWitness commit_witness_;
+  std::string seen_latest_text_;
+  std::string seen_last_type_;
+  size_t seen_history_size_ = 0;
+  // Empty after a key no surrounding source answered for, so a commit made
+  // then is never vouched for -- the screen stays authoritative.
+  std::string prev_client_key_;
+  int64_t prev_key_ms_ = -1;
   bool enable_right_space_ = true;
   CommitCallback on_commit_;
 };

@@ -9,6 +9,7 @@
 #include <rime/menu.h>
 #include <rime/schema.h>
 #include <cctype>
+#include <chrono>
 
 #include "auto_spacer_util.h"
 #include "caret_context.h"
@@ -143,6 +144,17 @@ inline bool IsNavigating(const KeyEvent& key_event) {
           keycode == XK_n || keycode == XK_p);
 }
 
+// How long after a commit a screen that disagrees with it is still assumed to
+// be lagging rather than showing a caret that moved. Over ssh the tmux scrape
+// was measured frozen for ~1.5 s while typing continued.
+constexpr int64_t kCommitLagWindowMs = 3000;
+
+inline int64_t SteadyNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 inline bool IsPunctString(const std::string latest_text) {
   if (latest_text.size() != 1) {
     return false;
@@ -173,16 +185,9 @@ inline bool NeedAddSpace(Context* ctx, const KeyEvent& key_event) {
   }
   if (input[0] != ' ' && !IsPunctString(latest_text)) {
     // 检查是否是连续的 raw/thru 英文上屏，如果是则不加空格
-    if (!history.empty()) {
-      const auto& last_record = history.back();
-      if (last_record.type == "raw" || last_record.type == "thru") {
-        // 如果上一次是直接上屏的 ASCII 内容，不加空格
-        int last_char = LastAsciiCharCode(latest_text);
-        if (IsAlphabetKey(last_char)) {
-          DLOG(INFO) << "[AutoSpacer] NeedAddSpace: skip for consecutive raw ASCII";
-          return false;
-        }
-      }
+    if (!history.empty() && IsContinuingSelfCommittedRawAscii(history.back().type, latest_text)) {
+      DLOG(INFO) << "[AutoSpacer] NeedAddSpace: skip for consecutive raw ASCII";
+      return false;
     }
     return true;
   }
@@ -291,6 +296,29 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
              << raw_before << "', raw_after='" << raw_after << "', client_before='"
              << client_state.before << "', client_after='" << client_state.after << "'";
 
+  // Before the ctrl/alt/super bail-out: Ctrl+A/E/B/F move the caret too.
+  const int64_t now_ms = SteadyNowMs();
+  const size_t history_size = ctx->commit_history().size();
+  if (latest_text != seen_latest_text_ || last_type != seen_last_type_ ||
+      history_size != seen_history_size_) {
+    seen_latest_text_ = latest_text;
+    seen_last_type_ = last_type;
+    seen_history_size_ = history_size;
+    commit_witness_ = LocalCommitWitness{latest_text, prev_client_key_, prev_key_ms_};
+  }
+  if (IsNavigating(key_event) || IsDelete(key_event)) {
+    commit_witness_ = LocalCommitWitness{};
+  }
+  prev_client_key_ = effective_client_key;
+  prev_key_ms_ = now_ms;
+  // The screen is authoritative unless our own last commit is known to sit at
+  // this caret, in which case a disagreement means the screen is lagging.
+  const std::string boundary_before =
+      LocalCommitStillAtCaret(commit_witness_, latest_text, effective_client_key, now_ms,
+                              kCommitLagWindowMs)
+          ? ResolveBoundaryBefore(raw_before, latest_text)
+          : raw_before;
+
   // 带 Ctrl/Alt/Super 的通常是快捷键, 不走标点/输入处理. Shift 要放行, 因为
   // ASCII 标点键本身就依赖 Shift (例如 '@' = Shift+2, '#' = Shift+3).
   if (key_event.ctrl() || key_event.alt() || key_event.super() || keycode >= XK_Shift_L) {
@@ -328,8 +356,8 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
       //    NeedAddSpace (this file) is a third reader, and it branches on
       //    `type == "raw" || type == "thru"` -- a block a punct record used to
       //    skip and now enters. What keeps that inert is not the absence of a
-      //    reader but the block's second condition:
-      //    IsAlphabetKey(LastAsciiCharCode(latest_text)), and no
+      //    reader but the block's second condition, in
+      //    IsContinuingSelfCommittedRawAscii (auto_spacer_util.h): no
       //    punctuator/full_shape or punctuator/symbols value ends in an ASCII
       //    letter or digit. The path is reachable -- a surrounding source can
       //    answer for the punct keystroke and stop answering before the next
@@ -363,7 +391,10 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     if (!IsAlphabetKey(keycode)) {
       return kNoop;
     }
-    if (NeedSpaceBefore(raw_before, true)) {
+    // boundary_before, not raw_before: over ssh a fast typist reaches the
+    // next letter before the screen shows the " x" just committed, and the
+    // stale CJK tail would earn a second leading space.
+    if (NeedSpaceBefore(boundary_before, true)) {
       auto commit_str = AddSpace(keycode);
       // NEW Clear(), and unlike the punct site above it is not inert. On
       // master this site ran CommitText + push_back and never cleared; the
@@ -389,7 +420,11 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
 
   // Non-ASCII mode: cache boundary whenever not composing.
   if (input.empty()) {
-    client_state.before = raw_before;
+    // This cache is read back at commit time and locks in whatever it holds
+    // for the whole composition, so a stale screen here costs the commit's
+    // leading space ("和sglang") or doubles one the user typed by hand
+    // ("请求.  百炼") -- both reproduced over ssh.
+    client_state.before = boundary_before;
     client_state.after = raw_after;
     if (IsLetterKey(keycode)) {
       const bool after_period = !ascii_mode && (latest_text == "。" || latest_text == ".");
@@ -708,6 +743,9 @@ ProcessResult AutoSpacer::Process(Context* ctx, const KeyEvent& key_event) {
     s.truncation = caret->truncation;
     return ProcessWithSurroundingContext(ctx, key_event, s, caret->client_key);
   }
+  // No client identity on this path: a commit made during this key must never
+  // be vouched for as sitting at some pane's caret.
+  prev_client_key_.clear();
   return ProcessWithCommitHistory(ctx, key_event, caret ? caret->before : std::string());
 }
 

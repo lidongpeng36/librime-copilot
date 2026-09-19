@@ -169,6 +169,79 @@ inline bool IsAsciiSpaceChar(const std::string& ch) {
   return ch.size() == 1 && std::isspace(static_cast<unsigned char>(ch[0])) != 0;
 }
 
+// Whether the last commit_history record is a raw/thru run ending in an ASCII
+// letter or digit, i.e. the user is still typing an ASCII word that has
+// already been leading-spaced, so NeedAddSpace must not space it again.
+inline bool IsContinuingSelfCommittedRawAscii(const std::string& last_record_type,
+                                              const std::string& latest_text) {
+  if (last_record_type != "raw" && last_record_type != "thru") {
+    return false;
+  }
+  return IsAsciiAlphaNumCode(LastAsciiCharCode(latest_text));
+}
+
+// Which client the latest commit_history record was made on, and when. See
+// LocalCommitStillAtCaret.
+struct LocalCommitWitness {
+  std::string text;
+  std::string client;
+  int64_t at_ms = -1;  // -1: nothing witnessed, or invalidated
+};
+
+// Whether the latest commit_history record can be assumed to sit immediately
+// left of THIS caret, so that a disagreement with the screen means the screen
+// is lagging (a remote pane over ssh) rather than that the caret is somewhere
+// else. commit_history belongs to the Rime session -- one per terminal window,
+// shared by every tmux pane in it -- so after a pane switch or a caret move it
+// describes another place, and the screen, which is accurate locally, must
+// win. Hence: witnessed on this client, for this very record, within the lag
+// window. The caller invalidates the witness on navigation and delete keys.
+inline bool LocalCommitStillAtCaret(const LocalCommitWitness& witness,
+                                    const std::string& latest_text, const std::string& client,
+                                    int64_t now_ms, int64_t lag_window_ms) {
+  return witness.at_ms >= 0 && !latest_text.empty() && witness.text == latest_text &&
+         witness.client == client && now_ms - witness.at_ms <= lag_window_ms;
+}
+
+// The text before the caret for a spacing decision, when the screen and our own
+// last commit disagree. `raw_before` comes from a real surrounding-text source
+// (IMK / ImeBridge / tmux); for a remote pane over ssh it is only as fresh as
+// the last round trip, so a fast typist can outrun it and a decision made on
+// it re-spaces or fails to space what was just committed. `latest_text` is
+// commit_history().back().text, current as of the previous key.
+//
+// Only valid when LocalCommitStillAtCaret has vouched that `latest_text` sits
+// at this caret; otherwise the screen is right and this must not be called.
+//
+// raw_before has caught up iff it ENDS with latest_text, optionally followed
+// by ASCII punctuation/whitespace. That tail is the one thing that can be on
+// screen yet missing from commit_history: librime records an unhandled
+// printable key as {"thru", ch} only when it has no modifier (commit_history.cc),
+// so a bare Space or "." IS recorded -- and becomes latest_text itself --
+// while a Shift-typed "?" is not. Matching the end, not merely containing it,
+// matters twice over: the same word can appear earlier in a long line, and a
+// one-character record such as {"thru", " "} occurs almost anywhere.
+inline std::string ResolveBoundaryBefore(const std::string& raw_before,
+                                         const std::string& latest_text) {
+  if (latest_text.empty()) {
+    return raw_before;
+  }
+  size_t end = raw_before.size();
+  while (true) {
+    if (end >= latest_text.size() &&
+        raw_before.compare(end - latest_text.size(), latest_text.size(), latest_text) == 0) {
+      return raw_before;
+    }
+    // ASCII bytes never occur inside a multi-byte UTF-8 sequence, so stepping
+    // back one byte at a time over them is safe.
+    const auto c = static_cast<unsigned char>(end == 0 ? 0 : raw_before[end - 1]);
+    if (end == 0 || c >= 0x80 || !(std::ispunct(c) || std::isspace(c))) {
+      return latest_text;
+    }
+    --end;
+  }
+}
+
 inline bool NeedSpaceBefore(const std::string& before, bool content_is_ascii) {
   std::string ch = GetLastUtf8Char(before);
   if (ch.empty() || IsChinesePunctuationChar(ch) || IsAsciiSpaceChar(ch)) {
