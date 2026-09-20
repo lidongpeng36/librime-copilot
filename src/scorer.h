@@ -79,6 +79,8 @@ class Scorer {
   // go true in the first place, so gating WarmUp() itself behind Loaded()
   // would mean it could never become true.
   virtual bool Loaded() const = 0;
+  // Content identity published with Loaded(), empty when unavailable.
+  virtual std::string ModelId() const { return {}; }
 };
 
 }  // namespace rime

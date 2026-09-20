@@ -175,3 +175,28 @@ copilot:
 
 }  // namespace
 }  // namespace rime
+
+TEST(TelemetryConfig, CapturesEffectiveDefaultsClampsAndNeverCopiesPrivateFields) {
+  rime::Config config;
+  std::istringstream yaml(R"(
+copilot:
+  rerank:
+    window: 3
+    llm:
+      top_n: 20
+      margin: 1.0
+      model: /private/local/model.gguf
+  telemetry:
+    sample_ok: 37
+secret: never-record-this
+)");
+  ASSERT_TRUE(config.LoadFromStream(yaml));
+  const auto recorded = rime::TelemetryConfig(&config, 64);
+  EXPECT_EQ(recorded["top_n"], 3);
+  EXPECT_EQ(recorded["sample_ok"], 37);
+  EXPECT_EQ(recorded["model"], "model.gguf");
+  EXPECT_EQ(recorded["require_han_context"], true);
+  EXPECT_EQ(recorded["fetch_chars"], 64);
+  EXPECT_EQ(recorded.dump().find("private/local"), std::string::npos);
+  EXPECT_EQ(recorded.dump().find("never-record-this"), std::string::npos);
+}

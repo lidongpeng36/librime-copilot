@@ -1,4 +1,7 @@
 #include "copilot_config.h"
+#include <filesystem>
+#include "llm_scorer.h"
+#include "rerank_filter.h"
 
 #include <rime/config.h>
 
@@ -56,6 +59,45 @@ telemetry::Options ReadTelemetryOptions(Config* config) {
   // spellings rather than a behaviour change.
   telemetry::ClampOptions(options);
   return options;
+}
+
+nlohmann::json TelemetryConfig(Config* config, int fetch_chars) {
+  const auto r = ReadRerankOptions(config);
+  const auto t = ReadTelemetryOptions(config);
+  LlmScorerOptions scorer;
+  nlohmann::json filters = nlohmann::json::array();
+  if (config) {
+    config->GetInt("copilot/rerank/llm/n_gpu_layers", &scorer.n_gpu_layers);
+    config->GetInt("copilot/rerank/llm/n_threads", &scorer.n_threads);
+    if (auto list = config->GetList("engine/filters")) {
+      for (size_t i = 0; i < list->size(); ++i) {
+        std::string name;
+        if (auto value = list->GetValueAt(i); value && value->GetString(&name)) {
+          filters.push_back(name);
+        }
+      }
+    }
+  }
+  return {{"rerank_enable", r.enable},
+          {"window", r.window},
+          {"max_rank", r.max_rank},
+          {"max_context_chars", r.max_context_chars},
+          {"same_span_only", r.same_span_only},
+          {"llm_enable", r.llm.enable},
+          {"model", std::filesystem::path(r.llm.model).filename().string()},
+          {"battery_active", r.llm.battery_active},
+          {"context_chars", r.llm.context_chars},
+          {"require_han_context", r.llm.require_han_context},
+          {"top_n", r.llm.top_n},
+          {"margin", r.llm.margin},
+          {"length_exponent", r.llm.length_exponent},
+          {"n_gpu_layers", scorer.n_gpu_layers},
+          {"n_threads", scorer.n_threads},
+          {"backend", "llama"},
+          {"fetch_chars", fetch_chars},
+          {"sample_ok", t.sample_ok},
+          {"telemetry_top_n", t.top_n},
+          {"filters", filters}};
 }
 
 }  // namespace rime

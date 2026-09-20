@@ -33,6 +33,9 @@ std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* trace
     // apart. See rerank_trace.h for why the span is the segment's original
     // extent rather than its possibly narrowed `end`.
     const TraceSpan span = TraceSpanOf(seg);
+    // Materialize the selected candidate before looking up its lazily written
+    // trace. Never materialize a highlighted-but-discarded candidate on bailout.
+    auto selected = selection_commit ? seg.GetSelectedCandidate() : nullptr;
     const RerankTrace* trace = traces ? traces->Find(input, span.start, span.end) : nullptr;
     // Every segment reaching this point observes stats, regardless of
     // ShouldRecord below -- that gate is what makes the per-event stream
@@ -41,13 +44,17 @@ std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* trace
     // the scorer engaged for this segment is a fact about the scorer, not
     // about what the user ultimately committed.
     if (stats) {
-      stats->Observe(trace);
+      const auto outcome = !selection_commit         ? CommitOutcome::kBailout
+                           : !selected               ? CommitOutcome::kMissingCandidate
+                           : seg.selected_index == 0 ? CommitOutcome::kFirst
+                                                     : CommitOutcome::kNonFirst;
+      stats->Observe(trace, outcome);
     }
     // A bail-out never reaches Event construction below: `seg.GetSelectedCandidate()`
     // still names whatever was highlighted when the user pressed Enter/a
     // stale number key instead, and Event::sel would report it as accepted
     // when it was in fact discarded. See this function's header comment.
-    if (!selection_commit) {
+    if (!selection_commit || !selected) {
       continue;
     }
     const bool traced = trace != nullptr;
@@ -76,12 +83,8 @@ std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* trace
     if (!ShouldRecord(sel_idx, promoted, ok_index, sample_ok)) {
       continue;
     }
-    auto selected = seg.GetSelectedCandidate();
-    if (!selected) {
-      continue;
-    }
-
     Event e;
+    e.sample_every = (!promoted && sel_idx == 0) ? sample_ok : 1;
     e.ts = ts;
     e.machine = machine;
     e.schema = schema;
@@ -103,6 +106,7 @@ std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* trace
       // worth context we already captured.
       e.ctx = trace->ctx;
       e.src = trace->src;
+      e.context_gate = trace->context_gate;
       e.before_depth = trace->before_depth;
       e.trunc = trace->truncation == Truncation::kUnknown
                     ? std::string()

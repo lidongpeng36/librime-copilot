@@ -537,3 +537,59 @@ TEST(BuildCommitEvents, RecordsNoPlainSuccessWithoutACounter) {
   EXPECT_TRUE(BuildCommitEvents(&ctx, nullptr, o, "M1", "flypy", "2026-08-20T10:00:00+0800")
                   .empty());
 }
+
+TEST(BuildCommitEvents, ExactOutcomesAreIndependentOfSamplingAndTraceAvailability) {
+  Context ctx;
+  ctx.set_input("abcd");
+  ctx.composition().Reset("abcd");
+  ctx.composition().push_back(MakeSegment(0, 1, {"甲", "乙"}, 0));
+  ctx.composition().push_back(MakeSegment(1, 2, {"甲", "乙"}, 1));
+  ctx.composition().push_back(MakeSegment(2, 3, {}, 0));
+  auto placeholder = MakeSegment(3, 4, {"甲"}, 0);
+  placeholder.tags.insert("copilot");
+  ctx.composition().push_back(placeholder);
+  Options options;
+  options.sample_ok = 20;
+  int64_t ok_seen = 1;  // this ordinary first choice is NOT sampled
+  StatsAccumulator stats;
+  auto events =
+      BuildCommitEvents(&ctx, nullptr, options, "M", "schema", "t", &stats, true, &ok_seen);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].sample_every, 1);
+  auto s = stats.Snapshot("t");
+  EXPECT_EQ(s.segments, 3);
+  EXPECT_EQ(s.selections, 2);
+  EXPECT_EQ(s.first_selected, 1);
+  EXPECT_EQ(s.nonfirst_selected, 1);
+  EXPECT_EQ(s.missing_candidates, 1);
+  EXPECT_EQ(s.untraced, 3);
+  EXPECT_EQ(s.bailouts, 0);
+  BuildCommitEvents(&ctx, nullptr, options, "M", "schema", "t", &stats, false, &ok_seen);
+  s = stats.Snapshot("t");
+  EXPECT_EQ(s.segments, 6);
+  EXPECT_EQ(s.selections, 2);
+  EXPECT_EQ(s.bailouts, 3);
+  stats.Reset();
+  s = stats.Snapshot("t");
+  EXPECT_EQ(s.selections + s.bailouts + s.missing_candidates + s.untraced, 0);
+}
+
+TEST(BuildCommitEvents, SampledSuccessCarriesActualSamplingDenominatorAndGate) {
+  Context ctx;
+  ctx.set_input("ni");
+  ctx.composition().Reset("ni");
+  ctx.composition().push_back(MakeSegment(0, 2, {"你", "尼"}, 0));
+  auto trace = TraceSkipped("ni", 0, 2, llm_rerank::SkipReason::kNoContext);
+  trace.context_gate = "non_han";
+  auto store = StoreOf({trace});
+  Options options;
+  options.sample_ok = 37;
+  int64_t ok_seen = 0;
+  StatsAccumulator stats;
+  auto events =
+      BuildCommitEvents(&ctx, &store, options, "M", "schema", "t", &stats, true, &ok_seen);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].sample_every, 37);
+  EXPECT_EQ(events[0].context_gate, "non_han");
+  EXPECT_EQ(stats.Snapshot("t").context_gate_counts.at("non_han"), 1);
+}

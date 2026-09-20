@@ -20,7 +20,9 @@
 
 #include "rerank_llm.h"  // llm_rerank::SkipReason, SkipReasonName
 #include "rerank_trace.h"
+#include "telemetry.h"
 #include "telemetry_event.h"
+#include "telemetry_identity.h"
 #include "utf8_index.h"
 
 namespace rime {
@@ -86,11 +88,27 @@ class StatsAccumulator {
     ++warm_counts_["rebuild"];
   }
 
-  void Observe(const RerankTrace* trace) {
+  void Observe(const RerankTrace* trace, CommitOutcome outcome = CommitOutcome::kMissingCandidate) {
     ++segments_;
+    switch (outcome) {
+      case CommitOutcome::kFirst:
+        ++first_selected_;
+        break;
+      case CommitOutcome::kNonFirst:
+        ++nonfirst_selected_;
+        break;
+      case CommitOutcome::kBailout:
+        ++bailouts_;
+        break;
+      case CommitOutcome::kMissingCandidate:
+        ++missing_candidates_;
+        break;
+    }
     if (!trace) {
+      ++untraced_;
       return;
     }
+    if (!trace->context_gate.empty()) ++context_gate_counts_[trace->context_gate];
     ObserveFetch(*trace);
     if (trace->llm_skip == llm_rerank::SkipReason::kNone) {
       ++llm_acted_;
@@ -116,6 +134,14 @@ class StatsAccumulator {
     s.ts = ts;
     s.fetch_chars = fetch_chars;
     s.segments = segments_;
+    s.first_selected = first_selected_;
+    s.nonfirst_selected = nonfirst_selected_;
+    s.selections = first_selected_ + nonfirst_selected_;
+    s.bailouts = bailouts_;
+    s.missing_candidates = missing_candidates_;
+    s.untraced = untraced_;
+    s.events_dropped = events_dropped_;
+    s.context_gate_counts = context_gate_counts_;
     s.llm_acted = llm_acted_;
     s.skip_counts = skip_counts_;
     s.warm_counts = warm_counts_;
@@ -136,6 +162,9 @@ class StatsAccumulator {
 
   void Reset() {
     segments_ = 0;
+    first_selected_ = nonfirst_selected_ = bailouts_ = missing_candidates_ = 0;
+    untraced_ = events_dropped_ = 0;
+    context_gate_counts_.clear();
     llm_acted_ = 0;
     skip_counts_.clear();
     us_samples_.clear();
@@ -146,6 +175,7 @@ class StatsAccumulator {
   }
 
   int64_t segments() const { return segments_; }
+  void EventDropped() { ++events_dropped_; }
 
  private:
   // Why this segment's surrounding fetch stopped, and -- only when it stopped
@@ -171,6 +201,9 @@ class StatsAccumulator {
   }
 
   int64_t segments_ = 0;
+  int64_t first_selected_ = 0, nonfirst_selected_ = 0;
+  int64_t bailouts_ = 0, missing_candidates_ = 0, untraced_ = 0, events_dropped_ = 0;
+  std::map<std::string, int64_t> context_gate_counts_;
   int64_t llm_acted_ = 0;
   std::map<std::string, int64_t> skip_counts_;
   std::vector<int64_t> us_samples_;
@@ -179,6 +212,16 @@ class StatsAccumulator {
   std::map<std::string, int64_t> trunc_counts_;
   std::vector<int64_t> depth_samples_;
 };
+
+// The production flush transaction: retain the complete window after a
+// failed append, including its identity, so a later commit can retry it.
+inline bool PersistStats(Writer& writer, StatsAccumulator& stats, Session& session,
+                         const StatsLine& snapshot) {
+  if (!writer.Write(SerializeStatsJsonl(snapshot))) return false;
+  stats.Reset();
+  session.CloseWindow();
+  return true;
+}
 
 }  // namespace telemetry
 }  // namespace rime

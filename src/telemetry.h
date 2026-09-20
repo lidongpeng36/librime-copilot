@@ -8,8 +8,8 @@
 // without a file (test/telemetry_test.cc).
 //
 // One file per machine, named after Deployer::user_id. Two machines therefore
-// never write the same file, which is what makes merging a concatenation with
-// no deduplication, no conflict resolution and no ordering requirement.
+// never write the same file. Copies/archives may still overlap; v9 record IDs
+// let analysis deduplicate them without collapsing legitimate same-second input.
 //
 // The file is a chronological transcript of the user's Chinese input, created
 // 0600. It reaches another machine only by being copied whole into the user's
@@ -117,9 +117,9 @@ class Writer {
   Writer(const Writer&) = delete;
   Writer& operator=(const Writer&) = delete;
 
-  // Appends `line` plus a newline. Silently does nothing when disabled or when
-  // the file cannot be opened: telemetry must never break input.
-  void Write(const std::string& line);
+  // True only after the complete line was appended. A failed write must not
+  // close/reset a stats window. No fsync durability guarantee is implied.
+  bool Write(const std::string& line);
 
   // Copies this machine's files into `dest_dir` -- SyncToDir with the
   // writer's own directory, machine name and generation count, so the file
@@ -146,6 +146,7 @@ class Writer {
   Options options_;
   int fd_ = -1;
   int64_t size_ = 0;
+  bool torn_line_ = false;
 };
 
 }  // namespace telemetry

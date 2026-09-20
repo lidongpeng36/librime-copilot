@@ -99,6 +99,21 @@ if (APPLE)
 endif()
 
 add_library(rime-copilot-objs OBJECT ${copilot_src})
+# A source-content build identity also distinguishes uncommitted builds. Make
+# changes trigger reconfiguration; a configure-time git HEAD alone goes stale.
+file(GLOB _copilot_identity_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/*")
+list(APPEND _copilot_identity_sources "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
+list(SORT _copilot_identity_sources)
+set(_copilot_identity "llama=b10456;${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_BUILD_TYPE}")
+foreach(_source IN LISTS _copilot_identity_sources)
+  file(SHA256 "${_source}" _source_hash)
+  get_filename_component(_name "${_source}" NAME)
+  string(APPEND _copilot_identity ";${_name}:${_source_hash}")
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_copilot_identity_sources})
+string(SHA256 _copilot_build_id "${_copilot_identity}")
+set_source_files_properties(src/telemetry_identity.cc PROPERTIES
+  COMPILE_DEFINITIONS "COPILOT_BUILD_ID=\"sha256:${_copilot_build_id}\"")
 # One variable rather than the generator expression repeated at each of the
 # four places that embed the plugin objects (the tools, the test target). It
 # held a second object library while the MLX backend existed; kept as the one

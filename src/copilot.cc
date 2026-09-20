@@ -295,6 +295,9 @@ Copilot::Copilot(const Ticket& ticket, an<CopilotEngine> copilot_engine,
   context_memory_step_ =
       std::make_unique<context_memory::Step>(&context_memory::Instance(), context_memory_options_);
 
+  telemetry_config_ = TelemetryConfig(engine_->schema()->config(), surrounding_prefix_chars_);
+  telemetry_config_id_ = telemetry::Fingerprint(telemetry_config_.dump());
+
   LOG(INFO) << "Copilot plugin Loaded. Disabled plugins: " << disabled_plugins.size();
 }
 
@@ -790,27 +793,20 @@ void Copilot::EmitCommitTelemetry(Context* ctx, bool selection_commit) {
   if (!telemetry_ || !telemetry_options_.enable) {
     return;
   }
-  // The SAME function GetTelemetryWriter derives the filename from, which is
-  // what actually keeps the `machine` field and the file it lives in in step.
-  // Two copies of the fallback used to sit here under a comment claiming they
-  // could not disagree; they disagreed for four days, because only one of the
-  // two re-reads user_id (telemetry.h, MachineName). Sharing the spelling is
-  // not what fixes that -- GetTelemetryWriter rebuilding on a change is -- but
-  // one spelling is what makes the two provably the same string.
-  const string machine = telemetry::MachineName(Service::instance().deployer().user_id);
-  // Only worth accumulating when there is an LLM path to report on -- same
-  // condition the constructor already uses for the AC/battery monitor.
-  // Without this, a schema with telemetry on but the LLM off would
-  // eventually flush an all-zero stats line, which is noise, not a "no LLM,
-  // no stats lines beyond what is meaningful" state.
-  telemetry::StatsAccumulator* stats =
-      (copilot_engine_ && copilot_engine_->scorer()) ? &stats_ : nullptr;
-  const auto events = telemetry::BuildCommitEvents(
+  // Match the actual destination even if installation_id changed mid-session.
+  const string machine = telemetry_->machine();
+  // Acceptance counts cover typing even when the model is disabled/missing.
+  telemetry::StatsAccumulator* stats = &stats_;
+  const std::string model_id = copilot_engine_ && copilot_engine_->scorer()
+                                   ? copilot_engine_->scorer()->ModelId()
+                                   : std::string();
+  auto events = telemetry::BuildCommitEvents(
       ctx, rerank_traces_.get(), telemetry_options_, machine,
       engine_->schema() ? engine_->schema()->schema_id() : string(),
       telemetry::FormatTimestamp(std::time(nullptr)), stats, selection_commit, &telemetry_ok_seen_);
-  for (const auto& e : events) {
-    telemetry_->Write(telemetry::SerializeJsonl(e));
+  for (auto& e : events) {
+    e.metadata = telemetry_session_.Event(telemetry_config_id_, model_id);
+    if (!telemetry_->Write(telemetry::SerializeJsonl(e))) stats_.EventDropped();
   }
 
   if (stats) {
@@ -873,9 +869,16 @@ void Copilot::FlushStatsIfAny() {
   if (stats_.segments() == 0) {
     return;  // nothing observed since construction or the last flush
   }
-  telemetry_->Write(telemetry::SerializeStatsJsonl(
-      stats_.Snapshot(telemetry::FormatTimestamp(std::time(nullptr)), surrounding_prefix_chars_)));
-  stats_.Reset();
+  auto snapshot =
+      stats_.Snapshot(telemetry::FormatTimestamp(std::time(nullptr)), surrounding_prefix_chars_);
+  const std::string model_id = copilot_engine_ && copilot_engine_->scorer()
+                                   ? copilot_engine_->scorer()->ModelId()
+                                   : std::string();
+  snapshot.metadata = telemetry_session_.Window(telemetry_config_id_, model_id);
+  snapshot.machine = telemetry_->machine();
+  snapshot.schema = engine_->schema() ? engine_->schema()->schema_id() : string();
+  snapshot.config = telemetry_config_;
+  telemetry::PersistStats(*telemetry_, stats_, telemetry_session_, snapshot);
 }
 
 CopilotComponent::CopilotComponent(an<CopilotEngineComponent> engine_factory)

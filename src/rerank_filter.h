@@ -33,6 +33,7 @@
 namespace rime {
 
 class CopilotEngine;
+class Config;
 class CopilotEngineComponent;
 struct Segment;
 
@@ -78,6 +79,9 @@ struct RerankOptions {
   // The LLM scoring path -- primary source when it can run; see rerank_llm.h.
   LlmRerankOptions llm;
 };
+
+// Shared by the filter and telemetry so defaults and clamps cannot drift.
+RerankOptions ReadRerankOptions(Config* config);
 
 class CopilotRerankFilter : public Filter {
  public:

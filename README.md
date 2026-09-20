@@ -535,8 +535,10 @@ quietly.
 
 One file per machine at
 `<rime user dir>/private/copilot_telemetry/<installation_id>.jsonl`, created `0600`.
-Because no two machines write the same file, merging several machines' data is
-concatenation — no deduplication and no conflict resolution. These settings are
+Read one local or synced copy per machine. The analyser deduplicates v9 records
+by ID if copies overlap, and rejects conflicting payloads for the same ID.
+Pre-v9 identical lines are flagged but retained: same-second records can be
+legitimate, so deleting them by text would destroy evidence. These settings are
 process-wide, taken from whichever schema loads first: setting them differently
 per schema does not work, and a later schema whose settings are ignored gets a
 one-time `WARNING` in the log rather than a silently empty file.
@@ -561,11 +563,58 @@ per flush interval, a `{"type":"stats", ...}` line aggregates every segment
 so rates like warm-hit can be computed against the true denominator instead
 of the hard-cases-only one. Its `skip_counts` names, for every segment the
 LLM path didn't act on, which of `disabled`/`battery`/`nomodel`/`noctx`/
-`cold`/`nohan`/`margin` stopped it. There is no stored `warm_hit` counter —
+`cold`/`nosource` stopped it. `nohan`/`margin` belong to the inner LLM
+decision, after the scorer engaged, and are not outer skip reasons. There is no stored `warm_hit` counter —
 under the fallback chain as implemented, a segment is never scored while the
 warm cache is cold, so warm-hit rate is derived as
 `llm_acted / (llm_acted + skip_counts["cold"])`, which `analyze_telemetry.py`
 computes for you.
+
+**Schema v9: acceptance and provenance.** Stats are collected even when the
+model is disabled or missing. Each closed window records `selections`,
+`first_selected`, `nonfirst_selected`, `bailouts`, `missing_candidates`, and
+`untraced`. Exact first-candidate acceptance is `first_selected / selections`;
+`segments = selections + bailouts + missing_candidates`. This measures actual
+candidate selections, not final text quality, Esc cancellations or prediction
+placeholders. Pre-v9 windows are excluded from that rate: subtracting event
+misses from `segments` incorrectly credits bailouts and mixes flush boundaries.
+An empty or legacy-only dataset reports the exact rate as unavailable.
+
+Every production record has a `record_id`, `session_id`, and `window_id`.
+Stats carry the machine/schema and an allowlisted effective configuration;
+events carry `sample_every` (1 for census records, N for every-N ordinary
+successes). Sampling remains deterministic per session, so weighting is a
+sensitivity estimate, not random-sample confidence bounds. Build identity is a
+SHA-256 of plugin source content and basic toolchain/build settings; config
+identity is a SHA-1 of canonical config JSON. The loaded model's file is hashed
+on its background worker, before and after loading; unequal/unreadable hashes
+leave `model_id` absent. SHA-1 is used for content identification, not security.
+No full model path or extra surrounding text is recorded. These fingerprints
+do not identify changing user-dictionary contents or certify the host runtime.
+
+`context_gate` (and full-stream `context_gate_counts`) distinguishes `empty`
+model context, `non_han` context blocked by `require_han_context`, `unavailable`
+surrounding-text sources, and `clear`. It is independent of the ordered LLM
+skip reason: a cold model can also be blocked by the Han gate. Source failure
+now writes a `nosource` trace instead of disappearing into untraced traffic.
+
+A stats window resets only after a complete append succeeds; otherwise its
+counters and ID survive for retry. Failed event writes increment
+`events_dropped`. Appending after a torn line starts a new line, including after
+restart. This is not fsync durability: a process killed before a flush can
+still lose its open window; a failed final flush cannot be recovered after the
+processor is destroyed. The analyser reports events with no matching closed
+window and never includes them in exact acceptance.
+
+Bound comparisons with `--since YYYY-MM-DD --until YYYY-MM-DD` (inclusive /
+exclusive local calendar dates), `--machine NAME`, and `--config-id HASH`.
+Stats are selected by closing date, so a window can cross a date boundary.
+The report names mixed/unknown deployments and separates promoted-word wins,
+returns to the original incumbent, and neutral third choices. Their paired
+difference assumes the selected text would remain fixed; it is not causal lift.
+Repeated head-to-selected corrections are ranked across all paths as regression
+candidates, with reverse corrections kept separate. Their counts are not
+per-word error rates and must not be turned into unconditional replacements.
 
 The stats line also carries `trunc_counts` — why the surrounding fetch stopped
 (`full`/`config`/`app`/`screen`/`unknown`), over every segment — and

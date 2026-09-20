@@ -50,8 +50,8 @@ class StatsAccumulator;
 // sees a bail-out at all, which is the correct "invisible" side of that
 // choice. `stats` still observes every segment either way: whether the LLM
 // engaged for a segment is a fact about the scorer, independent of what the
-// user ultimately did with the result, and StatsLine carries no `sel`-derived
-// field for a bail-out to corrupt.
+// user ultimately did with the result. Outcome counters classify these as
+// bailouts, never as selections; only actual selections enter acceptance.
 //
 // `ok_seen`, when non-null, counts the plain successes this walk saw and is
 // what makes Options::sample_ok's 1-in-N deterministic across calls. It is

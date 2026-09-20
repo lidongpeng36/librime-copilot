@@ -232,3 +232,13 @@ TEST(BailOnEmptyDbContext, LiftedGateStillBailsWithNoEligibleModel) {
   EXPECT_TRUE(BailOnEmptyDbContext(/*db_context_empty=*/true, /*llm_eligible=*/false,
                                    /*require_han_context=*/false));
 }
+
+TEST(ContextGate, SeparatesUnavailableEmptyAndNonHanWithoutChangingFallbackOrder) {
+  EXPECT_STREQ(ContextGate(false, true, true, true), "unavailable");
+  EXPECT_STREQ(ContextGate(true, true, true, true), "empty");
+  EXPECT_STREQ(ContextGate(true, false, true, true), "non_han");
+  EXPECT_STREQ(ContextGate(true, false, true, false), "clear");
+  EXPECT_STREQ(ContextGate(true, false, false, true), "clear");
+  EXPECT_STREQ(SkipReasonName(SkipReason::kNoSource), "nosource");
+  EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kCold), SkipReason::kCold);
+}

@@ -79,7 +79,31 @@ namespace telemetry {
 // the public remote for exactly that reason, and a field carrying 64
 // characters of it per warm would move that text into a file no such decision
 // was made about. A v7 line carries neither field.
-inline constexpr int kSchemaVersion = 8;
+// v9: exact commit outcomes, record/window/session identity, deployment
+// provenance, sampling denominator, and context-gate diagnostics. Old stats
+// cannot supply an exact acceptance denominator and must never be backfilled.
+inline constexpr int kSchemaVersion = 9;
+
+struct RecordMetadata {
+  std::string record_id;
+  std::string session_id;
+  std::string window_id;
+  std::string build_id;
+  std::string config_id;
+  std::string model_id;  // empty until the loaded model's file was fingerprinted
+};
+
+inline void SerializeMetadata(nlohmann::ordered_json& j, const RecordMetadata& m) {
+  if (m.record_id.empty()) return;
+  j["record_id"] = m.record_id;
+  j["session_id"] = m.session_id;
+  j["window_id"] = m.window_id;
+  j["build_id"] = m.build_id;
+  j["config_id"] = m.config_id;
+  if (!m.model_id.empty()) j["model_id"] = m.model_id;
+}
+
+enum class CommitOutcome { kFirst, kNonFirst, kBailout, kMissingCandidate };
 
 // What the re-ranking filter decided for one segment.
 struct RerankRecord {
@@ -142,6 +166,9 @@ struct LlmRecord {
 };
 
 struct Event {
+  RecordMetadata metadata;
+  int sample_every = 1;          // 1=census; N=one in N ordinary first selections
+  std::string context_gate;      // clear|empty|non_han|unavailable, absent without a trace
   std::string ts;                // local time, ISO 8601 with offset
   std::string machine;           // Deployer::user_id
   std::string schema;            // Rime schema id
@@ -173,6 +200,18 @@ struct Event {
 // records. That is the whole reason this is a second line type rather than a
 // running total bolted onto Event.
 struct StatsLine {
+  RecordMetadata metadata;
+  std::string machine;
+  std::string schema;
+  nlohmann::json config;  // effective, allowlisted settings, never user text
+  int64_t selections = 0;
+  int64_t first_selected = 0;
+  int64_t nonfirst_selected = 0;
+  int64_t bailouts = 0;
+  int64_t missing_candidates = 0;
+  int64_t untraced = 0;
+  int64_t events_dropped = 0;
+  std::map<std::string, int64_t> context_gate_counts;
   std::string ts;         // local time the window closed
   int64_t segments = 0;   // segments looked at in the window -- the
                           // denominator ShouldRecord throws away, and the one
@@ -296,6 +335,9 @@ inline std::string SerializeJsonl(const Event& e) {
   nlohmann::ordered_json j;
   j["v"] = kSchemaVersion;
   j["ts"] = e.ts;
+  SerializeMetadata(j, e.metadata);
+  j["sample_every"] = e.sample_every;
+  if (!e.context_gate.empty()) j["context_gate"] = e.context_gate;
   j["machine"] = e.machine;
   j["schema"] = e.schema;
   j["src"] = e.src;
@@ -370,6 +412,18 @@ inline std::string SerializeStatsJsonl(const StatsLine& s) {
   j["v"] = kSchemaVersion;
   j["type"] = "stats";
   j["ts"] = s.ts;
+  SerializeMetadata(j, s.metadata);
+  j["machine"] = s.machine;
+  j["schema"] = s.schema;
+  if (!s.config.is_null()) j["config"] = s.config;
+  j["selections"] = s.selections;
+  j["first_selected"] = s.first_selected;
+  j["nonfirst_selected"] = s.nonfirst_selected;
+  j["bailouts"] = s.bailouts;
+  j["missing_candidates"] = s.missing_candidates;
+  j["untraced"] = s.untraced;
+  j["events_dropped"] = s.events_dropped;
+  j["context_gate_counts"] = s.context_gate_counts;
   j["segments"] = s.segments;
   j["llm_acted"] = s.llm_acted;
   nlohmann::ordered_json skip;

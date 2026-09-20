@@ -15,6 +15,7 @@ command for the merged directory, which is the shared sync dir named in
 """
 
 import argparse
+from datetime import datetime
 import json
 import os
 import re
@@ -80,7 +81,8 @@ CREATE TABLE ev (
   -- not be conflated with NULL, which is why nothing here defaults.
   llm_lock_us INT,       -- of llm_us, the wait for the model mutex
   llm_work_us INT,       -- of llm_us, the part spent holding it
-  llm_n_decoded INT      -- candidate tokens decoded; 0 means none
+  llm_n_decoded INT,     -- candidate tokens decoded; 0 means none
+  sample_every INT, context_gate TEXT
 );
 
 -- One row per `type":"stats"` line (telemetry_event.h:StatsLine). Disjoint
@@ -110,7 +112,10 @@ CREATE TABLE stats (
   -- context. NULL on an earlier line and on a v8 window where nothing
   -- extended -- "not measured" and "measured zero appended characters" are
   -- different, and the second is not a state ObserveWarm can produce.
-  warm_extend_chars_p50 REAL
+  warm_extend_chars_p50 REAL,
+  selections INT, first_selected INT, nonfirst_selected INT, bailouts INT,
+  missing_candidates INT, untraced INT, events_dropped INT,
+  machine TEXT, schema TEXT, config_id TEXT, model_id TEXT, window_id TEXT
 );
 
 -- One row per (stats line, skip reason) pair, flattened out of that line's
@@ -149,6 +154,11 @@ CREATE TABLE warm (
 -- "that situation did not arise". `ts` is the newest line seen for the pair,
 -- so a machine that was upgraded mid-file is judged on its latest line and
 -- not on its history.
+CREATE TABLE context_gate (ts TEXT, kind TEXT, count INT);
+CREATE TABLE quality (kind TEXT, n INT);
+CREATE TABLE provenance (machine TEXT, schema TEXT, config_id TEXT, build_id TEXT,
+                         model_id TEXT, config TEXT, ts TEXT, type TEXT,
+                         session_id TEXT, window_id TEXT, record_id TEXT);
 CREATE TABLE recorder (
   machine TEXT, v INT, ts TEXT, n INT,
   PRIMARY KEY (machine, v)
@@ -179,7 +189,7 @@ CREATE TABLE recorder (
 # backends currently re-decode the whole context on every warm, and whether
 # that is worth fixing depends entirely on how often the new context merely
 # extends the old one. A classification and a count, never the context itself.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Below this many samples a percentage is noise, and the first percentage this
 # report prints becomes the baseline every later change is quoted against. The
@@ -208,19 +218,158 @@ HEAD_ALTERED_NOTE = """\
 """
 
 
-def load(paths):
+def _count(value):
+    return type(value) is int and value >= 0
+
+
+def _validate_identity(e):
+    for key in ("record_id", "session_id", "window_id", "build_id", "config_id", "machine", "schema"):
+        if not isinstance(e.get(key), str) or not e[key]:
+            raise ValueError(f"v9 missing identity: {key}")
+    if not e["window_id"].startswith(e["session_id"] + ":w:"):
+        raise ValueError("window does not belong to session")
+    if e.get("type") == "stats":
+        if e["record_id"] != e["window_id"] or not isinstance(e.get("config"), dict):
+            raise ValueError("invalid closed window metadata")
+    elif not e["record_id"].startswith(e["session_id"] + ":e:"):
+        raise ValueError("event does not belong to session")
+
+
+def _validate_event(e):
+    if not _count(e.get("sel_idx")) or not isinstance(e.get("sel"), str):
+        raise ValueError("invalid selected candidate")
+    if not isinstance(e.get("top"), list) or any(not isinstance(t, str) for t in e["top"]):
+        raise ValueError("invalid displayed candidates")
+    if e["sel_idx"] < len(e["top"]) and e["sel"] != e["top"][e["sel_idx"]]:
+        raise ValueError("selection disagrees with displayed list")
+    if not _count(e.get("sample_every")) or e["sample_every"] < 1:
+        raise ValueError("invalid sampling denominator")
+    full = e["sel_idx"] != 0 or bool((e.get("rr") or {}).get("text")) or (e.get("llm") or {}).get("skip") == "none"
+    if full and e["sample_every"] != 1:
+        raise ValueError("census event marked sampled")
+    if e.get("context_gate") not in (None, "clear", "empty", "non_han", "unavailable"):
+        raise ValueError("unknown context gate")
+
+
+def _validate_outcomes(e):
+    fields = ("segments", "llm_acted", "selections", "first_selected", "nonfirst_selected",
+              "bailouts", "missing_candidates", "untraced", "events_dropped")
+    if any(not _count(e.get(k)) for k in fields):
+        raise ValueError("v9 outcome counts must be nonnegative integers")
+    if e["selections"] != e["first_selected"] + e["nonfirst_selected"]:
+        raise ValueError("selection counters do not reconcile")
+    if e["segments"] != e["selections"] + e["bailouts"] + e["missing_candidates"]:
+        raise ValueError("segment outcomes do not reconcile")
+    if e["events_dropped"] > e["selections"]:
+        raise ValueError("more dropped events than selections")
+    for field in ("skip_counts", "context_gate_counts", "trunc_counts", "warm_counts"):
+        counts = e.get(field) or {}
+        if not isinstance(counts, dict) or any(not _count(n) for n in counts.values()):
+            raise ValueError(f"invalid {field}")
+    if e["llm_acted"] + sum((e.get("skip_counts") or {}).values()) + e["untraced"] != e["segments"]:
+        raise ValueError("trace coverage does not reconcile")
+    gates = e.get("context_gate_counts") or {}
+    if set(gates) - {"clear", "empty", "non_han", "unavailable"}:
+        raise ValueError("unknown context gate")
+    if sum(gates.values()) > e["segments"] - e["untraced"]:
+        raise ValueError("context gates exceed traced segments")
+
+
+def _print_quality(db):
+    acc = accuracy_line(db)
+    if acc:
+        hits, selections, rate = acc
+        print(f"  exact first-candidate acceptance (v9 closed windows): {pct(hits, selections, min_total=MIN_N).strip()} ({hits}/{selections})")
+    else:
+        print("  exact first-candidate acceptance: unavailable (no v9 selections in closed windows)")
+    old, new = db.execute("SELECT SUM(selections IS NULL), SUM(selections IS NOT NULL) FROM stats").fetchone()
+    print(f"  measured closed windows: {new or 0}; legacy windows excluded from acceptance: {old or 0}")
+    if old:
+        print("  Legacy segments include bailouts; segments minus sampled-event misses is NOT an acceptance numerator.")
+    outcome = db.execute("SELECT COALESCE(SUM(bailouts),0), COALESCE(SUM(missing_candidates),0),"
+                         "COALESCE(SUM(untraced),0), COALESCE(SUM(events_dropped),0) FROM stats"
+                         " WHERE selections IS NOT NULL").fetchone()
+    if new:
+        print("  v9 bailout / missing candidate / untraced / dropped event: " + " / ".join(map(str, outcome)))
+    else:
+        print("  v9 outcome/coverage counters: unavailable")
+    for kind, n in db.execute("SELECT kind,SUM(n) FROM quality GROUP BY kind"):
+        print(f"  {kind}: {n}" + (" (retained; no trustworthy ID)" if kind.startswith("ambiguous") else " (not counted twice)"))
+    print("  last record by machine (event time, not file modification time):")
+    for machine, stamp in db.execute("SELECT machine,MAX(ts) FROM provenance GROUP BY machine"):
+        print(f"    {machine}: {stamp}")
+    configs = db.execute("SELECT COUNT(DISTINCT config_id) FROM provenance").fetchone()[0]
+    builds = db.execute("SELECT COUNT(DISTINCT build_id) FROM provenance WHERE build_id != 'unknown'").fetchone()[0]
+    models = db.execute("SELECT COUNT(DISTINCT model_id) FROM provenance").fetchone()[0]
+    missing = db.execute("SELECT COUNT(*) FROM provenance WHERE config_id IS NULL OR model_id IS NULL OR build_id IS NULL OR build_id='unknown'").fetchone()[0]
+    print(f"  config / build / model identities: {configs} / {builds} / {models}; incomplete provenance: {missing} lines")
+    if configs > 1 or builds > 1 or models > 1:
+        print("  Mixed deployments: pooled diagnostics are descriptive only. Use --machine / --since / --until / --config-id.")
+    for machine, config_id, model_id, count in db.execute(
+            "SELECT machine,config_id,model_id,COUNT(*) FROM provenance WHERE config_id IS NOT NULL GROUP BY 1,2,3"):
+        print(f"    {machine} config={config_id} model={model_id or 'unavailable'} lines={count}")
+    for kind, count in db.execute("SELECT kind,SUM(count) FROM context_gate GROUP BY kind"):
+        print(f"  context gate {kind}: {count} segments (independent of ordered skip reason)")
+    pending = db.execute("SELECT COUNT(*) FROM provenance p WHERE p.type='event' AND p.window_id IS NOT NULL "
+                         "AND NOT EXISTS (SELECT 1 FROM stats s WHERE s.window_id=p.window_id)").fetchone()[0]
+    print(f"  events without a matching closed window in this input: {pending} (not used for exact acceptance)")
+    print("  Calendar filters select window END dates; windows may cross the requested boundary.")
+
+
+def confusion_pairs(db, limit=30):
+    """Rank observed corrections across ALL paths; counts, never sampled rates."""
+    return db.execute("""SELECT input,top0,sel,COUNT(*) AS corrections,
+        SUM(sel_idx=1) AS second_choices,
+        SUM(engage_skip='noctx') AS noctx,
+        SUM(llm_promoted=1) AS after_llm_promotion
+        FROM ev WHERE sel_idx>0 AND top0 IS NOT NULL AND top0!=sel
+        GROUP BY input,top0,sel
+        ORDER BY corrections DESC,input,top0,sel LIMIT ?""", (limit,)).fetchall()
+
+
+def _print_confusions(db, limit):
+    print("\nRepeated displayed-head corrections (all paths, full miss census):")
+    print("  input        head        selected       n   second   noctx   LLM-promoted")
+    for code, head, selected, count, second, noctx, promoted in confusion_pairs(db, limit):
+        print(f"  {code or '':<12}{head:<12}{selected:<12}{count:>5}{second:>9}{noctx or 0:>8}{promoted:>15}")
+    print("  These rank regression cases, not replacement rules or per-word error rates.")
+    print("  Reverse corrections are separate; evaluate context and time-held-out data before changing order.")
+
+
+def promotion_pairs(db):
+    """Paired retrospective comparison, not a randomized treatment effect."""
+    return db.execute("""SELECT
+        CASE WHEN llm_margin<2 THEN '<2' WHEN llm_margin<3 THEN '2-3'
+             WHEN llm_margin<5 THEN '3-5' ELSE '5+' END AS band,
+        COUNT(*), SUM(sel=llm_text), SUM(sel=llm_incumbent),
+        SUM(sel!=llm_text AND sel!=llm_incumbent)
+        FROM ev WHERE llm_promoted=1 AND llm_head_altered=0
+        GROUP BY 1 ORDER BY MIN(llm_margin)""").fetchall()
+
+
+def _print_promotion_pairs(db):
+    print("\n  Paired LLM promotion outcomes (fixed selected-text assumption, not causal lift):")
+    print("  margin       n   picked promoted   picked incumbent   picked other   net")
+    for band, n, helped, hurt, other in promotion_pairs(db):
+        print(f"  {band:<8}{n:>6}{helped:>18}{hurt:>19}{other:>15}{helped-hurt:>6}")
+
+
+def load(paths, since=None, until=None, machine=None, config_id=None):
     db = sqlite3.connect(":memory:")
     db.executescript(SCHEMA)
     skipped = 0
+    seen_ids = {}
+    seen_legacy = set()
     for path in paths:
-        # A stats line carries no `machine` of its own (telemetry_event.h's
-        # StatsLine has no such field), and the writer names the file after it
+        # Legacy stats carry no machine field; v9 stats name it explicitly.
+        # The writer names the file after the machine
         # -- telemetry.cc:41, `machine + ".jsonl"`, plus a `.N` suffix once
         # rotation has run. So the file name is the only attribution a stats
         # line has, and the machine name itself may contain dots.
         file_machine = re.sub(r"\.jsonl(\.\d+)?$", "", os.path.basename(path))
         with open(path, encoding="utf-8") as fh:
             for line in fh:
+                complete_line = line.endswith("\n")
                 line = line.strip()
                 if not line:
                     continue
@@ -234,6 +383,27 @@ def load(paths):
                     e = json.loads(line)
                     if not isinstance(e, dict):
                         raise ValueError("not a JSON object")
+                    if machine and e.get("machine", file_machine) != machine:
+                        continue
+                    if config_id and e.get("config_id") != config_id:
+                        continue
+                    if since or until:
+                        stamp = datetime.fromisoformat(e["ts"]).date().isoformat()
+                        if (since and stamp < since) or (until and stamp >= until):
+                            continue
+                    canonical = json.dumps(e, sort_keys=True, ensure_ascii=False)
+                    identity = e.get("record_id")
+                    if e.get("v", 1) >= 9:
+                        if not complete_line:
+                            raise ValueError("unterminated v9 record")
+                        _validate_identity(e)
+                    if identity and identity in seen_ids:
+                        if seen_ids[identity] != canonical:
+                            raise RuntimeError(f"conflicting payloads for record_id {identity}")
+                        db.execute("INSERT INTO quality VALUES ('duplicate_id', 1)")
+                        continue
+                    # Roll back the whole line if a child insert fails.
+                    db.execute("SAVEPOINT telemetry_line")
                     # `type` is the v2 discriminator (telemetry_event.h): an
                     # Event line has no `type` at all -- v1 files predate the
                     # concept and must keep loading on this same branch
@@ -248,7 +418,26 @@ def load(paths):
                     # writes, and counting it would let one torn line make a
                     # current machine look stale.
                     _record_version(db, e, file_machine)
-                except (ValueError, TypeError, AttributeError, sqlite3.InterfaceError):
+                    db.execute("INSERT INTO provenance VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+                        e.get("machine", file_machine), e.get("schema"), e.get("config_id"),
+                        e.get("build_id"), e.get("model_id"),
+                        json.dumps(e["config"], sort_keys=True) if "config" in e else None,
+                        e.get("ts"), e.get("type", "event"), e.get("session_id"),
+                        e.get("window_id"), identity))
+                    db.execute("RELEASE telemetry_line")
+                    if identity:
+                        seen_ids[identity] = canonical
+                    else:
+                        legacy_key = (file_machine, canonical)
+                        if legacy_key in seen_legacy:
+                            db.execute("INSERT INTO quality VALUES ('ambiguous_legacy_repeat', 1)")
+                        seen_legacy.add(legacy_key)
+                except (ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+                    try:
+                        db.execute("ROLLBACK TO telemetry_line")
+                        db.execute("RELEASE telemetry_line")
+                    except sqlite3.Error:
+                        pass
                     skipped += 1
                     continue
     db.commit()
@@ -317,6 +506,8 @@ def pct(n, total, width=6, min_total=None):
 
 
 def _load_event_line(db, e):
+    if e.get("v", 1) >= 9:
+        _validate_event(e)
     rr = e.get("rr")
     if rr is not None and not isinstance(rr, dict):
         raise ValueError("rr is not a JSON object")
@@ -413,7 +604,7 @@ def _load_event_line(db, e):
     engage_skip = e.get("llm_skip")
 
     db.execute(
-        "INSERT INTO ev VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO ev VALUES (" + ",".join("?" for _ in range(44)) + ")",
         (
             e.get("ts"), e.get("machine"), e.get("schema"), e.get("src"),
             e.get("input"), e.get("ctx"), e.get("sel_idx"), e.get("sel"),
@@ -438,11 +629,14 @@ def _load_event_line(db, e):
             head_displaced, rr_pos_in_top,
             (llm or {}).get("lock_us"), (llm or {}).get("work_us"),
             (llm or {}).get("n_decoded"),
+            e.get("sample_every"), e.get("context_gate"),
         ),
     )
 
 
 def _load_stats_line(db, e):
+    if e.get("v", 1) >= 9:
+        _validate_outcomes(e)
     segments = e.get("segments")
     llm_acted = e.get("llm_acted")
     # bool is an int subclass; a stats line never legitimately has `true` for
@@ -491,9 +685,14 @@ def _load_stats_line(db, e):
     # midway through skip_counts or trunc_counts must not leave this line's
     # `stats` row written while its child rows are half-missing -- the
     # exception the caller catches has no transaction to roll that back out.
-    db.execute("INSERT INTO stats VALUES (?,?,?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO stats VALUES (" + ",".join("?" for _ in range(21)) + ")",
               (e.get("ts"), segments, llm_acted, us_p50, us_p95, depth_p50, depth_p95,
-               fetch_chars, e.get("warm_extend_chars_p50")))
+               fetch_chars, e.get("warm_extend_chars_p50"),
+               *(e.get(k) for k in ("selections", "first_selected", "nonfirst_selected",
+                   "bailouts", "missing_candidates", "untraced", "events_dropped",
+                   "machine", "schema", "config_id", "model_id", "window_id"))))
+    for kind, count in e.get("context_gate_counts", {}).items():
+        db.execute("INSERT INTO context_gate VALUES (?,?,?)", (e.get("ts"), kind, count))
     for reason, count in (skip_counts or {}).items():
         db.execute("INSERT INTO skip VALUES (?,?,?)", (e.get("ts"), reason, count))
     for kind, count in (trunc_counts or {}).items():
@@ -549,7 +748,7 @@ def rate_table(db, title, expr, where="rr_from > 0", limit=None,
 # report could only sweep upward; this is the other direction.
 RECOVERY_THRESHOLDS = (0.5, 1.0, 1.5)
 
-# copilot/telemetry/sample_ok, which the log does not carry -- the value that
+# Legacy copilot/telemetry/sample_ok fallback (v9 carries sample_every). The value
 # was in force when the lines were written. It matters because ShouldRecord
 # (telemetry_event.h:235) keeps every promotion and every miss but only one
 # plain success in N, so the two sides of "what would a lower margin do" are
@@ -569,48 +768,23 @@ FULLY_RECORDED_SQL = (
 
 
 def accuracy_line(db):
-    """(hits, segments, rate) — first-candidate accuracy, or None.
+    """Exact acceptance for v9 closed windows ONLY, independent of event sampling.
 
-    `segments` comes from the stats lines, which count every segment
-    BuildCommitEvents walked; `misses` are the recorded events with
-    sel_idx != 0, which ShouldRecord keeps unconditionally. So the numerator
-    needs no sampling and no scaling.
-
-    Known bias, stated by the caller rather than hidden: `segments` includes
-    AutoSpacer's bail-out commits, for which no event is ever produced
-    (telemetry_commit.h), so the denominator is slightly larger than the
-    population the numerator is drawn from. Correcting it needs a second
-    counter on the stats line; deferred until it is shown to matter.
-
-    None when there are no stats lines at all: a v1 file, or a session that
-    ended before the first flush interval closed. A rate computed off the
-    events alone would be a rate over hard cases only, which is exactly the
-    misreading this function exists to replace.
+    Legacy stats include bailouts, and event and stats time ranges can differ.
+    Never reconstruct success as segments minus event misses.
     """
-    segments = db.execute("SELECT COALESCE(SUM(segments), 0) FROM stats").fetchone()[0]
-    if not segments:
-        return None
-    misses = db.execute("SELECT COUNT(*) FROM ev WHERE sel_idx != 0").fetchone()[0]
-    hits = max(0, segments - misses)
-    return hits, segments, hits / segments
+    hits, selections = db.execute(
+        "SELECT SUM(first_selected), SUM(selections) FROM stats WHERE selections IS NOT NULL"
+    ).fetchone()
+    return (hits, selections, hits / selections) if selections else None
 
 
 def _print_threshold_table(split, sample_ok, implied):
-    """What lowering `margin` would do, both sides, with the harm side weighted.
-
-    This used to be one line per threshold reading "margin X would have
-    recovered N" -- the benefit alone. It argued for the 2026-08-28 move from
-    2.0 to 1.0, which the outcome then vindicated, but it would have argued
-    for that move just as loudly had the outcome been the opposite: a count
-    that can only go up is not evidence. See decline_split.__doc__ for the
-    back-test that dates both bounds.
-    """
+    """Sampling-adjusted sensitivity estimate; not a causal threshold sweep."""
     print()
-    print("      What LOWERING the threshold would do. `hurt` weights the")
-    print(f"      declines the user resolved on the head by sample_ok={sample_ok},")
-    print(f"      because ShouldRecord keeps only 1 in {sample_ok} of those and every")
-    print(f"      one of the wins in full -- the two sides are not counted at")
-    print(f"      the same rate, and the raw counts are in the last column.")
+    print("      Lower-threshold sensitivity: wins and head harms use each v9 event's")
+    print(f"      sample_every; older sampled successes assume --sample-ok={sample_ok}.")
+    print("      Raw win/head/other counts are shown so small weighted samples stay visible.")
     print()
     print(f"      {'to':>6}  {'promotes':>8} {'helps':>6} {'hurts':>6}   "
          f"{'accept: naive':>13} {'weighted':>9}   raw win/head/other")
@@ -621,28 +795,18 @@ def _print_threshold_table(split, sample_ok, implied):
             print(f"      {threshold:>6}  {'--':>8} {'--':>6} {'--':>6}   "
                  f"{'(nothing blocked reaches this threshold)':>39}")
             continue
-        weighted = at["w_helped"] + at["w_hurt"]
+        weighted = at["w_helped"] + at["w_hurt"] + at["w_other"]
         print(f"      {threshold:>6}  {weighted:>8} {at['w_helped']:>6} {at['w_hurt']:>6}   "
              f"{at['naive_accept']:>12.0%} {at['weighted_accept']:>9.0%}   "
              f"{at['obs_helped']}/{at['obs_hurt_head']}/{at['obs_hurt_other']}")
     print()
-    print("      Read the pair as a range, never either half. Both bounds were")
-    print("      wrong at the one change with a known answer (78% / 38% against")
-    print("      a measured 66%), and they were wrong in opposite directions.")
-    print("      A threshold is worth taking when the RANGE clears the accept")
-    print("      rate the promotions already achieve, printed above as the")
-    print("      LLM path's own accepted share -- not when the naive half does.")
-    if implied is None:
-        print("      sample_ok could not be checked: no stats lines, or no sampled")
-        print("      hits to divide by. The weighted column rests on the flag alone.")
-    elif not 0.7 <= implied / sample_ok <= 1.4:
-        print(f"      !!  the stats lines imply sample_ok is about {implied:.0f}, not")
-        print(f"          {sample_ok}. The weighted column is scaled by the wrong")
-        print(f"          factor -- pass --sample-ok {implied:.0f}, or split the files by")
-        print("          the era in which the schema key changed.")
-    else:
-        print(f"      (sample_ok={sample_ok} checks out: the stats denominator implies "
-             f"{implied:.1f})")
+    print("      Raw and weighted rates are sensitivity estimates, NOT bounds or confidence intervals.")
+    print("      v9 uses each event's recorded sample_every; legacy rows use --sample-ok.")
+    print("      Periodic sampling and small samples can bias either estimate. Third choices are neutral,")
+    print("      not harms to the original head. Confirm a threshold change prospectively.")
+    if implied is not None:
+        print(f"      Legacy diagnostic only: pooled stats/events imply sample_ok ~{implied:.1f};")
+        print("      window mismatch and bailouts prevent treating this as verified sampling coverage.")
 
 
 def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
@@ -670,24 +834,13 @@ def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
     1 in `sample_ok`, so counting the two sides off the same raw log
     understates the harm `sample_ok`-fold.
 
-    Two rates come back because neither is trustworthy alone:
-
-      naive_accept     obs_helped / observations. What this function used to
-                       imply. Optimistic: the harm side is undercounted.
-      weighted_accept  w_helped / (w_helped + w_hurt), the sampled cases
-                       weighted back up. Pessimistic: `sample_ok` multiplies
-                       a count that is often a handful, so its Poisson noise
-                       is multiplied with it.
-
-    Back-tested against the only threshold change with a known answer. Over
-    the pre-2026-08-28 log the [1.0, 2.0) band read 78% naive and 38%
-    weighted; margin then moved 2.0 -> 1.0 and the band measured 66% on 99
-    promotions, which are recorded in full and so unbiased. The truth was
-    between the bounds and the naive number alone would have overstated the
-    case by 12 points. Quote the pair, not either half.
+    Raw acceptance is selection-biased; the weighted estimate uses v9's
+    per-event sample_every (or the supplied legacy fallback). These are
+    sensitivity estimates, not confidence bounds. Third-choice selections
+    remain neutral for net head accuracy even though they reject promotion.
     """
     rows = db.execute(
-        f"SELECT decline_kind, best_is_sel, llm_margin, sel_idx, {FULLY_RECORDED_SQL}"
+        f"SELECT decline_kind, best_is_sel, llm_margin, sel_idx, {FULLY_RECORDED_SQL}, sample_every"
         " FROM ev WHERE decline_kind IS NOT NULL"
     ).fetchall()
     split = {
@@ -697,10 +850,10 @@ def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
         "blocked_and_wanted": 0,
         "recovered_at": {t: 0 for t in RECOVERY_THRESHOLDS},
         "blocked_at": {t: {"obs_helped": 0, "obs_hurt_head": 0, "obs_hurt_other": 0,
-                           "w_helped": 0, "w_hurt": 0}
+                           "w_helped": 0, "w_hurt": 0, "w_other": 0}
                        for t in RECOVERY_THRESHOLDS},
     }
-    for kind, best_is_sel, margin, sel_idx, fully in rows:
+    for kind, best_is_sel, margin, sel_idx, fully, recorded_every in rows:
         if kind in ("agreed", "gated"):
             split[kind] += 1
             continue
@@ -714,7 +867,7 @@ def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
         # resolved the segment on the head -- i.e. every one of the cases a
         # lower threshold would HARM. Counting them raw is what makes the
         # one-sided number look like a recommendation.
-        weight = 1 if fully else sample_ok
+        weight = recorded_every if recorded_every is not None else (1 if fully else sample_ok)
         for threshold in RECOVERY_THRESHOLDS:
             if margin < threshold:
                 continue
@@ -726,12 +879,13 @@ def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
             else:
                 if sel_idx == 0:
                     at["obs_hurt_head"] += 1
+                    at["w_hurt"] += weight
                 else:
                     at["obs_hurt_other"] += 1
-                at["w_hurt"] += weight
+                    at["w_other"] += weight
     for at in split["blocked_at"].values():
         obs = at["obs_helped"] + at["obs_hurt_head"] + at["obs_hurt_other"]
-        weighted = at["w_helped"] + at["w_hurt"]
+        weighted = at["w_helped"] + at["w_hurt"] + at["w_other"]
         # None, not 0.0: "no blocked decline reached this threshold" and "every
         # one of them was wrong" are opposite findings.
         at["naive_accept"] = at["obs_helped"] / obs if obs else None
@@ -796,12 +950,28 @@ def main():
                         "written (default %(default)s). Only the LLM decline table uses "
                         "it; the report prints the value implied by the stats lines "
                         "beside it, so a wrong one is visible rather than silent.")
+    ap.add_argument("--since", help="inclusive local calendar date YYYY-MM-DD")
+    ap.add_argument("--until", help="exclusive local calendar date YYYY-MM-DD")
+    ap.add_argument("--machine", help="one machine only")
+    ap.add_argument("--config-id", help="one recorded configuration fingerprint only")
     args = ap.parse_args()
+    for bound in (args.since, args.until):
+        if bound:
+            try:
+                datetime.strptime(bound, "%Y-%m-%d")
+            except ValueError:
+                ap.error("date bounds must be YYYY-MM-DD")
+    if args.since and args.until and args.since >= args.until:
+        ap.error("--since must precede --until")
     if args.sample_ok < 1:
         ap.error("--sample-ok must be at least 1 (1 means nothing was sampled)")
 
     sample_ok = args.sample_ok
-    db, skipped = load(args.paths)
+    try:
+        db, skipped = load(args.paths, args.since, args.until, args.machine, args.config_id)
+    except RuntimeError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     # Before the `total` check, not after: a file whose every line was skipped
     # has total == 0, and reporting only "No events" would read as "telemetry is
     # not recording" when the truth is "the lines could not be parsed".
@@ -823,6 +993,7 @@ def main():
         return 0
     if not total:
         print("No per-event lines (only stats lines) in the given files.")
+        _print_quality(db)
         _print_skip_distribution(db)
         _print_latency_split(db)
         _print_warm_split(db)
@@ -836,22 +1007,8 @@ def main():
     print("OVERALL")
     print("=" * 64)
     _print_recorders(db)
-    acc = accuracy_line(db)
-    if acc:
-        hits, segments, rate = acc
-        print(f"  {'first-candidate accuracy':<44}{pct(hits, segments, 7)}  "
-              f"({hits} / {segments} segments)")
-        print("  Denominator counts every segment observed, including AutoSpacer's")
-        print("  bail-out commits, which produce no event; the numerator is therefore")
-        print("  slightly pessimistic. Misses are recorded in full, so this needs no")
-        print("  sampling correction.")
-        if segments < MIN_N:
-            print(f"  The counts are real; the rate is withheld under {MIN_N} segments,")
-            print("  because the first one printed becomes the baseline every later")
-            print("  change gets quoted against.")
-    else:
-        print("  first-candidate accuracy: n/a (no stats lines -- v1 file, or the "
-             "first flush interval has not closed)")
+    _print_quality(db)
+    _print_promotion_pairs(db)
     print(f"  {'events read':<44}{total:>8}")
     displaced = db.execute("SELECT COUNT(*) FROM ev WHERE head_displaced = 1").fetchone()[0]
     if altered:
@@ -937,9 +1094,7 @@ def main():
     print("\n" + "=" * 64)
     print("LLM DECISION QUALITY  acceptance rate by margin")
     print("=" * 64)
-    print("  The live version of the offline threshold sweep that set the current")
-    print("  copilot/rerank/llm/margin (2.0) -- see")
-    print("  docs/superpowers/specs/2026-08-16-llm-rerank-poc-results.md. Every")
+    print("  Recorded promotions, grouped by observed score margin. Every")
     print("  promotion here already cleared whatever margin the writing machine was")
     print("  configured with, so a bucket below that value is empty by construction,")
     print("  not evidence of anything -- it says what RAISING the threshold further")
@@ -1014,6 +1169,7 @@ def main():
     if not rows:
         print("  (no rejections recorded)")
 
+    _print_confusions(db, args.top)
     _print_skip_distribution(db)
     _print_latency_split(db)
     _print_warm_split(db)
@@ -1114,7 +1270,7 @@ def _print_path_split(db, total):
         print("    should have fired -- only that it did not.")
     if nets:
         print("\n  Promotions that moved a candidate: " + " | ".join(nets))
-        print("  This is the number that says whether re-ranking is a net gain.")
+        print("  Acceptance alone is not net gain; use the paired LLM outcomes above.")
 
 
 def _print_displaced_heads(db):

@@ -14,6 +14,7 @@
 #include <glog/logging.h>
 
 #include "scoring_form.h"  // BuildScoringContext, TokenizeScoringForm
+#include "telemetry_identity.h"
 #include "warm_cache.h"
 
 // This is a port of tools/score_candidates.cc (read that file first -- in
@@ -177,6 +178,7 @@ struct LlmScorer::Impl {
   }
 
   bool Loaded() const { return loaded_.load(std::memory_order_acquire); }
+  std::string ModelId() const { return Loaded() ? model_id_ : std::string(); }
 
   bool IsWarm(const std::string& context) const {
     return warm_cache_.Lookup(context) == WarmCache::State::kHot;
@@ -349,6 +351,7 @@ struct LlmScorer::Impl {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = options_.n_gpu_layers;
+    const std::string before_id = telemetry::FileFingerprint(model_path_);
     model_ = llama_model_load_from_file(model_path_.c_str(), model_params);
     if (!model_) {
       LOG(ERROR) << "[copilot] llm_scorer: failed to load model '" << model_path_ << "'";
@@ -389,6 +392,10 @@ struct LlmScorer::Impl {
     // drift from whatever llama_init_from_model actually derived.
     n_ctx_seq_ = llama_n_ctx_seq(ctx_);
 
+    // Both reads are on the worker. If the file changed during loading,
+    // leave identity unknown rather than attach the new file to an old model.
+    const std::string after_id = telemetry::FileFingerprint(model_path_);
+    if (before_id == after_id) model_id_ = after_id;
     loaded_.store(true, std::memory_order_release);
     return true;
   }
@@ -591,6 +598,7 @@ struct LlmScorer::Impl {
   }
 
   std::string model_path_;
+  std::string model_id_;  // immutable after loaded_ release publication
   WarmCache warm_cache_;
 
   std::thread worker_;
@@ -645,5 +653,7 @@ bool LlmScorer::IsWarm(const std::string& context) const { return impl_->IsWarm(
 void LlmScorer::WarmUp(const std::string& context) { impl_->WarmUp(context); }
 
 bool LlmScorer::Loaded() const { return impl_->Loaded(); }
+
+std::string LlmScorer::ModelId() const { return impl_->ModelId(); }
 
 }  // namespace rime

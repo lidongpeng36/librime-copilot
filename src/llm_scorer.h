@@ -65,6 +65,7 @@ class LlmScorer : public Scorer {
   // (rerank_filter.cc) reads this to decide whether to score at all, but
   // NOT to decide whether to call WarmUp() -- see Scorer::Loaded().
   bool Loaded() const override;
+  std::string ModelId() const override;
 
  private:
   struct Impl;

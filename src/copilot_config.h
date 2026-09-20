@@ -39,6 +39,7 @@
 // and an exported LoadFromStream, so test/copilot_config_test.cc drives real
 // YAML. Both clamps and every default are pinned there.
 
+#include <nlohmann/json.hpp>
 #include <string>
 
 #include "telemetry.h"  // telemetry::Options
@@ -76,5 +77,8 @@ CopilotSharedConfig ReadCopilotSharedConfig(Config* config);
 // Reads copilot/telemetry/* and runs telemetry::ClampOptions, which both old
 // sites did. Null `config` yields clamped defaults.
 telemetry::Options ReadTelemetryOptions(Config* config);
+
+// Explicit allowlist: never dump the user's schema, dictionary or paths.
+nlohmann::json TelemetryConfig(Config* config, int fetch_chars);
 
 }  // namespace rime

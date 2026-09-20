@@ -6,6 +6,8 @@
 #include <vector>
 
 #include "telemetry.h"
+#include "telemetry_identity.h"
+#include "telemetry_stats.h"
 
 using namespace rime::telemetry;
 namespace fs = std::filesystem;
@@ -396,4 +398,88 @@ TEST(Writer, TheNameAndTheFilenameCannotDisagree) {
     Writer w(dir, name, o);
     EXPECT_EQ(w.path().filename().string(), w.machine() + ".jsonl");
   }
+}
+
+TEST(TelemetryWriter, FailedOpenIsReportedAndLaterWriteCanRecover) {
+  auto dir = FreshDir("failed_open");
+  Options options;
+  Writer writer(dir, "m", options);
+  fs::create_directory(writer.path());  // a directory cannot be opened for append
+  EXPECT_FALSE(writer.Write("{}"));
+  fs::remove(writer.path());
+  EXPECT_TRUE(writer.Write("{}"));
+  EXPECT_EQ(ReadLines(writer.path()).size(), 1u);
+  fs::remove_all(dir);
+}
+
+TEST(TelemetryIdentity, ContentFingerprintsAndFailedReads) {
+  EXPECT_EQ(Fingerprint("abc"), "sha1:a9993e364706816aba3e25717850c26c9cd0d89d");
+  auto dir = FreshDir("identity");
+  auto path = dir / "model";
+  EXPECT_TRUE(FileFingerprint(path).empty());
+  {
+    std::ofstream file(path);
+    file << "abc";
+  }
+  EXPECT_EQ(FileFingerprint(path), Fingerprint("abc"));
+  {
+    std::ofstream file(path);
+    file << "abd";
+  }
+  EXPECT_NE(FileFingerprint(path), Fingerprint("abc"));
+  fs::remove_all(dir);
+}
+
+TEST(TelemetryIdentity, DistinctSessionsEventsAndStableRetryWindow) {
+  Session one, two;
+  auto first = one.Event("cfg", "model");
+  auto second = one.Event("cfg", "model");
+  EXPECT_NE(first.record_id, second.record_id);
+  EXPECT_EQ(first.window_id, second.window_id);
+  EXPECT_NE(one.Window("cfg", "model").record_id, two.Window("cfg", "model").record_id);
+  auto retry = one.Window("cfg", "model");
+  EXPECT_EQ(retry.record_id, one.Window("cfg", "model").record_id);
+  one.CloseWindow();
+  EXPECT_NE(retry.record_id, one.Window("cfg", "model").record_id);
+  EXPECT_EQ(first.session_id, one.Window("cfg", "model").session_id);
+}
+
+TEST(TelemetryWriter, FailedStatsFlushRetainsCountersAndWindowUntilRecovery) {
+  auto dir = FreshDir("failed_stats");
+  Writer writer(dir, "m", Options{});
+  StatsAccumulator stats;
+  Session session;
+  stats.Observe(nullptr, CommitOutcome::kFirst);
+  stats.EventDropped();
+  fs::create_directory(writer.path());
+  auto snapshot = stats.Snapshot("t");
+  snapshot.metadata = session.Window("cfg", "model");
+  EXPECT_FALSE(PersistStats(writer, stats, session, snapshot));
+  EXPECT_EQ(stats.Snapshot("t").first_selected, 1);
+  EXPECT_EQ(stats.Snapshot("t").events_dropped, 1);
+  EXPECT_EQ(session.Window("cfg", "model").record_id, snapshot.metadata.record_id);
+  fs::remove(writer.path());
+  EXPECT_TRUE(PersistStats(writer, stats, session, snapshot));
+  EXPECT_EQ(stats.segments(), 0);
+  EXPECT_NE(session.Window("cfg", "model").record_id, snapshot.metadata.record_id);
+  auto json = nlohmann::json::parse(ReadLines(writer.path()).at(0));
+  EXPECT_EQ(json["selections"], 1);
+  EXPECT_EQ(json["first_selected"], 1);
+  EXPECT_EQ(json["events_dropped"], 1);
+  fs::remove_all(dir);
+}
+
+TEST(TelemetryWriter, RestartAfterTornLineDoesNotSwallowNextRecord) {
+  auto dir = FreshDir("torn_restart");
+  {
+    std::ofstream old(dir / "m.jsonl");
+    old << "{\"torn\":";
+  }
+  Writer writer(dir, "m", Options{});
+  ASSERT_TRUE(writer.Write("{\"valid\":true}"));
+  auto lines = ReadLines(writer.path());
+  ASSERT_EQ(lines.size(), 2u);
+  EXPECT_EQ(lines[0], "{\"torn\":#incomplete");
+  EXPECT_EQ(lines[1], "{\"valid\":true}");
+  fs::remove_all(dir);
 }

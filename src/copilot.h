@@ -8,6 +8,7 @@
 #include "context_memory_step.h"
 #include "rerank_trace.h"
 #include "telemetry.h"
+#include "telemetry_identity.h"
 #include "telemetry_stats.h"
 #include "utils.h"  // copilot::PowerChangeToken
 
@@ -104,6 +105,9 @@ class Copilot : public Processor {
   an<RerankTraceStore> rerank_traces_;
   an<telemetry::Writer> telemetry_;
   telemetry::Options telemetry_options_;
+  telemetry::Session telemetry_session_;
+  nlohmann::json telemetry_config_;
+  std::string telemetry_config_id_;
   // Plain successes seen since construction, for Options::sample_ok's 1-in-N.
   // Never reset: the sampling only needs to be uniform, not windowed.
   int64_t telemetry_ok_seen_ = 0;

@@ -130,7 +130,7 @@ class AccuracyLine(unittest.TestCase):
     stated. Misses are recorded in full, so it needs no sampling and no
     scaling -- successes - misses over segments, exactly."""
 
-    def test_accuracy_is_segments_minus_misses_over_segments(self):
+    def test_legacy_stats_cannot_supply_exact_accuracy(self):
         db = load_all(
             events=[
                 {"v": 3, "sel": "那里", "sel_idx": 1, "top": ["哪里", "那里"]},
@@ -144,10 +144,7 @@ class AccuracyLine(unittest.TestCase):
                     "llm_acted": 8, "skip_counts": {"cold": 2},
                     "us_p50": 7723.0, "us_p95": 21472.0}],
         )
-        hits, segments, rate = analyze.accuracy_line(db)
-        self.assertEqual(segments, 10)
-        self.assertEqual(hits, 8)  # 10 segments - 2 misses
-        self.assertAlmostEqual(rate, 0.8)
+        self.assertIsNone(analyze.accuracy_line(db))
 
     def test_no_stats_lines_means_no_number_rather_than_a_wrong_one(self):
         db = load_all(events=[{"v": 3, "sel": "那里", "sel_idx": 1, "top": []}],
@@ -229,12 +226,13 @@ class LoweringTheThresholdHasTwoSides(unittest.TestCase):
     def test_a_decline_the_user_resolved_on_the_head_is_weighted(self):
         at = self._split(sample_ok=20)["blocked_at"][0.5]
         # 1 * 20 for the sampled head-pick, plus 1 for the third candidate.
-        self.assertEqual(at["w_hurt"], 21)
+        self.assertEqual(at["w_hurt"], 20)
+        self.assertEqual(at["w_other"], 1)
         self.assertEqual(at["w_helped"], 1)
 
     def test_the_weight_follows_sample_ok_rather_than_being_hard_coded(self):
-        self.assertEqual(self._split(sample_ok=1)["blocked_at"][0.5]["w_hurt"], 2)
-        self.assertEqual(self._split(sample_ok=50)["blocked_at"][0.5]["w_hurt"], 51)
+        self.assertEqual(self._split(sample_ok=1)["blocked_at"][0.5]["w_hurt"], 1)
+        self.assertEqual(self._split(sample_ok=50)["blocked_at"][0.5]["w_hurt"], 50)
 
     def test_both_bounds_are_reported_and_the_naive_one_is_the_optimistic_one(self):
         at = self._split()["blocked_at"][0.5]
@@ -457,8 +455,42 @@ class ImpliedSampleOk(unittest.TestCase):
         self.assertIsNone(analyze.implied_sample_ok(db))
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+
+def complete_current_fixture(e, machine, index):
+    """Supply v9 metadata for historical version/report fixtures only.
+
+    Dedicated quality tests below deliberately pass malformed v9 rows raw.
+    """
+    e = dict(e)
+    if e.get("type") == "stats" and not isinstance(e.get("segments"), int):
+        return e
+    if e.get("v", 1) < 9:
+        return e
+    session = f"fixture-{machine}"
+    e.setdefault("machine", machine)
+    e.setdefault("schema", "test")
+    e.setdefault("session_id", session)
+    e.setdefault("window_id", f"{session}:w:1")
+    e.setdefault("record_id", e["window_id"] if e.get("type") == "stats" else f"{session}:e:{index}")
+    e.setdefault("build_id", "test-build")
+    e.setdefault("config_id", "test-config")
+    if e.get("type") == "stats":
+        e.setdefault("config", {"sample_ok": 20})
+        e.setdefault("selections", e["segments"])
+        e.setdefault("first_selected", max(0, e["segments"] - 1))
+        e.setdefault("nonfirst_selected", min(1, e["segments"]))
+        e.setdefault("bailouts", 0)
+        e.setdefault("missing_candidates", 0)
+        e.setdefault("events_dropped", 0)
+        e.setdefault("untraced", e["segments"] - e["llm_acted"] - sum((e.get("skip_counts") or {}).values()))
+        e.setdefault("context_gate_counts", {})
+    else:
+        e.setdefault("sel_idx", 0)
+        e.setdefault("sel", "")
+        e.setdefault("top", [])
+        e.setdefault("sample_every", 1)
+    return e
 
 
 def load_files(files: dict) -> sqlite3.Connection:
@@ -471,7 +503,7 @@ def load_files(files: dict) -> sqlite3.Connection:
         paths = []
         for name, lines in files.items():
             p = Path(tmp) / name
-            p.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+            p.write_text("".join(json.dumps(complete_current_fixture(line, Path(name).stem, i)) + "\n" for i, line in enumerate(lines)), encoding="utf-8")
             paths.append(str(p))
         db, _ = analyze.load(paths)
     return db
@@ -693,7 +725,7 @@ class ReportNamesAStaleRecorder(unittest.TestCase):
             paths = []
             for name, lines in files.items():
                 p = Path(tmp) / name
-                p.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+                p.write_text("".join(json.dumps(complete_current_fixture(x, p.stem, i)) + "\n" for i, x in enumerate(lines)), encoding="utf-8")
                 paths.append(str(p))
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
@@ -737,9 +769,9 @@ class ReportNamesAStaleRecorder(unittest.TestCase):
                  "ts": "2026-08-21T10:01:00+0800", "segments": 6, "llm_acted": 5},
             ],
         })
-        line = next(x for x in text.splitlines() if "first-candidate accuracy" in x)
+        line = next(x for x in text.splitlines() if "exact first-candidate acceptance" in x)
         self.assertIn("n/a", line)
-        self.assertIn("5 / 6 segments", line)
+        self.assertIn("5/6", line)
 
 
 class MixedVersionMachine(unittest.TestCase):
@@ -904,7 +936,7 @@ class PathSplitVerdicts(unittest.TestCase):
                 {"v": analyze.SCHEMA_VERSION, "type": "stats",
                  "ts": "2026-08-21T10:01:00+0800", "segments": 40, "llm_acted": 30},
             ]
-            p.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+            p.write_text("".join(json.dumps(complete_current_fixture(x, p.stem, i)) + "\n" for i, x in enumerate(lines)), encoding="utf-8")
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 argv = sys.argv
@@ -1072,3 +1104,126 @@ class FetchDepthOnTheStatsLine(unittest.TestCase):
              "trunc_counts": {"config": 10, "full": 90}, "fetch_chars": 32},
         ])
         self.assertIn("!!", out)
+
+class QualityV9(unittest.TestCase):
+    def stats(self, **overrides):
+        e = {"v": 9, "type": "stats", "ts": "2026-09-20T12:00:00+0800",
+             "segments": 12, "llm_acted": 5, "skip_counts": {"noctx": 6},
+             "selections": 8, "first_selected": 6, "nonfirst_selected": 2,
+             "bailouts": 3, "missing_candidates": 1, "untraced": 1,
+             "events_dropped": 1, "context_gate_counts": {"non_han": 4, "empty": 2}}
+        e = complete_current_fixture(e, "M", 0)
+        e.update(overrides)
+        return e
+
+    def event(self, **overrides):
+        e = complete_current_fixture({"v": 9, "ts": "2026-09-20T11:59:59+0800",
+             "sel_idx": 0, "sel": "甲", "top": ["甲", "乙"], "sample_every": 37,
+             "llm_skip": "noctx", "context_gate": "non_han"}, "M", 1)
+        e.update(overrides)
+        return e
+
+    def load_raw(self, rows, copies=1, **filters):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "M.jsonl"
+            p.write_text("".join(json.dumps(e) + "\n" for e in rows), encoding="utf-8")
+            return analyze.load([str(p)] * copies, **filters)
+
+    def test_exact_rate_ignores_legacy_windows_unflushed_events_and_bailouts(self):
+        db, skipped = self.load_raw([self.stats(), self.event(),
+            {"v": 8, "type": "stats", "segments": 1000, "llm_acted": 0},
+            {"v": 8, "sel_idx": 1, "sel": "乙", "top": ["甲", "乙"]}])
+        self.assertEqual(skipped, 0)
+        self.assertEqual(analyze.accuracy_line(db), (6, 8, .75))
+
+    def test_duplicate_copies_deduplicate_parent_and_child_tables(self):
+        db, skipped = self.load_raw([self.stats(), self.event()], copies=2)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM ev").fetchone()[0], 1)
+        self.assertEqual(db.execute("SELECT SUM(segments) FROM stats").fetchone()[0], 12)
+        self.assertEqual(db.execute("SELECT SUM(count) FROM skip").fetchone()[0], 6)
+        self.assertEqual(db.execute("SELECT SUM(count) FROM context_gate").fetchone()[0], 6)
+        self.assertEqual(db.execute("SELECT SUM(n) FROM quality WHERE kind='duplicate_id'").fetchone()[0], 2)
+
+    def test_valid_json_without_newline_is_not_a_committed_v9_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "M.jsonl"
+            path.write_text(json.dumps(self.stats()), encoding="utf-8")
+            db, skipped = analyze.load([str(path)])
+        self.assertEqual(skipped, 1)
+        self.assertIsNone(analyze.accuracy_line(db))
+
+    def test_conflicting_identity_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, 'conflicting payloads'):
+            self.load_raw([self.stats(), self.stats(first_selected=5, nonfirst_selected=3)])
+
+    def test_legacy_same_second_rows_are_not_silently_deleted(self):
+        e = {"v": 8, "type": "stats", "ts": "t", "segments": 1, "llm_acted": 0}
+        db, skipped = self.load_raw([e, e])
+        self.assertEqual(skipped, 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM stats").fetchone()[0], 2)
+        self.assertEqual(db.execute("SELECT SUM(n) FROM quality").fetchone()[0], 1)
+
+    def test_bad_counters_and_missing_metadata_are_rejected(self):
+        for bad in [self.stats(first_selected=7), self.stats(bailouts=-1),
+                    self.stats(untraced=2), self.stats(selections=True),
+                    self.stats(record_id=""), self.stats(context_gate_counts={"non_han": 99}),
+                    self.event(sel="wrong"), self.event(sel_idx=1, sel="乙", sample_every=20)]:
+            with self.subTest(bad=bad):
+                db, skipped = self.load_raw([bad])
+                self.assertEqual(skipped, 1)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM provenance").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM ev").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM stats").fetchone()[0], 0)
+
+    def test_line_transaction_rolls_back_children_on_invalid_bind_value(self):
+        db, skipped = self.load_raw([self.stats(warm_extend_chars_p50=[]), self.stats()])
+        self.assertEqual(skipped, 1)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM stats").fetchone()[0], 1)
+        self.assertEqual(db.execute("SELECT SUM(count) FROM skip").fetchone()[0], 6)
+
+    def test_filters_apply_to_events_and_stats(self):
+        for filters in [{"machine": "Other"}, {"since": "2026-09-21"},
+                        {"until": "2026-09-20"}, {"config_id": "different"}]:
+            db, skipped = self.load_raw([self.stats(), self.event()], **filters)
+            self.assertEqual(skipped, 0)
+            self.assertIsNone(analyze.accuracy_line(db))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM ev").fetchone()[0], 0)
+        db, skipped = self.load_raw([self.stats()], since="2026-09-20", until="2026-09-21")
+        self.assertEqual(analyze.accuracy_line(db), (6, 8, .75))
+
+    def test_recorded_sampling_overrides_legacy_flag(self):
+        llm = {"skip": "margin", "best": "乙", "incumbent": "甲", "margin": .7,
+               "n_scored": 2, "dropped": []}
+        db, skipped = self.load_raw([self.event(llm=llm, llm_skip="none", context_gate="clear")])
+        self.assertEqual(skipped, 0)
+        self.assertEqual(analyze.decline_split(db, sample_ok=2)["blocked_at"][.5]["w_hurt"], 37)
+
+    def test_other_candidate_is_neutral_in_paired_promotions(self):
+        events = []
+        for i, selected in enumerate(["甲", "乙", "丙"]):
+            events.append(self.event(record_id=f"fixture-M:e:{i}", sel=selected, sel_idx=i,
+                top=["甲", "乙", "丙"], sample_every=1,
+                llm={"text": "甲", "incumbent": "乙", "skip": "none", "margin": 1.5}))
+        db, skipped = self.load_raw(events)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(analyze.promotion_pairs(db), [('<2', 3, 1, 1, 1)])
+
+
+class ConfusionRegressionCases(unittest.TestCase):
+    def test_all_paths_and_reverse_pairs_are_kept_without_counting_sampled_hits(self):
+        db = load_all([
+            {"v": 8, "input": "ba", "top": ["吧", "把"], "sel": "把", "sel_idx": 1,
+             "llm_skip": "noctx"},
+            {"v": 8, "input": "ba", "top": ["吧", "把"], "sel": "把", "sel_idx": 1,
+             "llm": {"skip": "none", "text": "吧", "incumbent": "把"}},
+            {"v": 8, "input": "ba", "top": ["把", "吧"], "sel": "吧", "sel_idx": 1},
+            {"v": 8, "input": "ba", "top": ["吧", "把"], "sel": "吧", "sel_idx": 0},
+        ], [])
+        self.assertEqual(tuple(analyze.confusion_pairs(db)[0]), ("ba", "吧", "把", 2, 2, 1, 1))
+        self.assertEqual(len(analyze.confusion_pairs(db)), 2)
+        self.assertEqual(len(analyze.confusion_pairs(db, 1)), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

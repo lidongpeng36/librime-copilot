@@ -48,6 +48,7 @@ enum class SkipReason {
   kBattery,    // on battery and battery_active is false
   kNoModel,    // model missing or failed to load
   kNoContext,  // nothing at all before the caret to score against
+  kNoSource,   // no surrounding-text source answered
   kCold,       // warm cache miss -- the one reason only live use can measure
   kNoHan,      // no all-Han candidate in the window
   kMargin,     // the best challenger did not beat the incumbent by `margin`
@@ -67,6 +68,8 @@ inline const char* SkipReasonName(SkipReason r) {
       return "nomodel";
     case SkipReason::kNoContext:
       return "noctx";
+    case SkipReason::kNoSource:
+      return "nosource";
     case SkipReason::kCold:
       return "cold";
     case SkipReason::kNoHan:
@@ -75,6 +78,16 @@ inline const char* SkipReasonName(SkipReason r) {
       return "margin";
   }
   return "none";
+}
+
+// Orthogonal to the ordered fallback chain: a cold model can ALSO have a
+// non-Han context gate. Record both without changing any ranking decision.
+inline const char* ContextGate(bool source_available, bool llm_empty, bool han_empty,
+                               bool require_han) {
+  if (!source_available) return "unavailable";
+  if (llm_empty) return "empty";
+  if (han_empty && require_han) return "non_han";
+  return "clear";
 }
 
 // The reason to record when the db-context gate (rerank_filter.cc's

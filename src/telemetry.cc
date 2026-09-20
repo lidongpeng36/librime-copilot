@@ -143,7 +143,7 @@ void Writer::Rotate() {
 bool Writer::Open() {
   std::error_code ec;
   std::filesystem::create_directories(dir_, ec);
-  fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
   if (fd_ < 0) {
     // Telemetry must never break input. Give up quietly and try again on the
     // next write.
@@ -157,26 +157,34 @@ bool Writer::Open() {
   // next write rotates again.
   const off_t end = ::lseek(fd_, 0, SEEK_END);
   size_ = end > 0 ? static_cast<int64_t>(end) : 0;
+  char last = '\n';
+  torn_line_ = end > 0 && ::pread(fd_, &last, 1, end - 1) == 1 && last != '\n';
   return true;
 }
 
-void Writer::Write(const std::string& line) {
+bool Writer::Write(const std::string& line) {
   if (!options_.enable) {
-    return;
+    return false;
   }
-  const std::string payload = line + "\n";
-  const int64_t pending = static_cast<int64_t>(payload.size());
-
+  // A previous partial write must not swallow the next record. Its fragment
+  // remains visibly malformed; the next complete line can still be loaded.
   if (fd_ < 0 && !Open()) {
-    return;
+    return false;
   }
 
+  // Do not merely finish a torn line with '\n': a short write can have
+  // written the entire JSON object but missed its delimiter. Completing it
+  // would turn an uncommitted stats snapshot into a second valid window.
+  const std::string torn_marker = "#incomplete\n";
+  const int64_t pending =
+      static_cast<int64_t>(line.size() + 1 + (torn_line_ ? torn_marker.size() : 0));
   if (ShouldRotate(size_, pending, options_.max_file_bytes)) {
     Rotate();
     if (!Open()) {
-      return;
+      return false;
     }
   }
+  const std::string payload = (torn_line_ ? torn_marker : "") + line + "\n";
 
   // Write all bytes, handling partial writes and EINTR.
   size_t bytes_written = 0;
@@ -187,15 +195,19 @@ void Writer::Write(const std::string& line) {
         continue;  // Retry on signal interrupt.
       }
       // Other errors: give up silently.
-      return;
+      torn_line_ = torn_line_ || bytes_written > 0;
+      return false;
     }
     if (n == 0) {
       // Shouldn't happen with write, but be defensive.
-      return;
+      torn_line_ = torn_line_ || bytes_written > 0;
+      return false;
     }
     bytes_written += n;
     size_ += n;
   }
+  torn_line_ = false;
+  return true;
 }
 
 }  // namespace telemetry

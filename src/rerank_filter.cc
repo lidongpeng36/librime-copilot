@@ -119,6 +119,8 @@ bool RerankTranslation::Replenish() {
   trace.start = span_.start;
   trace.end = span_.end;
   trace.ctx = ctx_;
+  trace.context_gate = llm_rerank::ContextGate(true, llm_ctx_.empty(), ctx_.empty(),
+                                               options_.llm.require_han_context);
   trace.src = src_;
   trace.before_depth = before_depth_;
   trace.truncation = truncation_;
@@ -341,7 +343,8 @@ bool RerankTranslation::Replenish() {
 // promoted to report.
 void RecordSkipTrace(const an<RerankTraceStore>& traces, const std::optional<TraceSpan>& span,
                      const std::string& input, const std::string& ctx, const std::string& src,
-                     int before_depth, Truncation truncation, llm_rerank::SkipReason llm_skip) {
+                     int before_depth, Truncation truncation, llm_rerank::SkipReason llm_skip,
+                     const std::string& context_gate) {
   if (!traces || !span) {
     return;
   }
@@ -351,6 +354,7 @@ void RecordSkipTrace(const an<RerankTraceStore>& traces, const std::optional<Tra
   trace.start = span->start;
   trace.end = span->end;
   trace.ctx = ctx;
+  trace.context_gate = context_gate;
   trace.src = src;
   trace.before_depth = before_depth;
   trace.truncation = truncation;
@@ -466,6 +470,8 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
   // would be guessing from commit history, which cannot see a mouse click.
   auto caret = GetCaretContext(engine_->context(), AllowReconstruction::kNo);
   if (!caret) {
+    RecordSkipTrace(traces_, span, engine_->context()->input(), "", "none", -1,
+                    Truncation::kUnknown, llm_rerank::SkipReason::kNoSource, "unavailable");
     return translation;
   }
   // Everything below comes from that ONE query. This used to call
@@ -556,7 +562,9 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
                                        options_.llm.require_han_context)) {
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
                     SurroundingSourceName(caret->source), caret->before_depth, caret->truncation,
-                    llm_rerank::SkipForEmptyDbContext(llm_skip));
+                    llm_rerank::SkipForEmptyDbContext(llm_skip),
+                    llm_rerank::ContextGate(true, llm_context.empty(), context.empty(),
+                                            options_.llm.require_han_context));
     return translation;
   }
   // A missing db only takes the db branch down with it -- the LLM branch above
@@ -571,7 +579,9 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
     // ruled out the LLM path.
     RecordSkipTrace(traces_, span, engine_->context()->input(), context,
                     SurroundingSourceName(caret->source), caret->before_depth, caret->truncation,
-                    llm_skip);
+                    llm_skip,
+                    llm_rerank::ContextGate(true, llm_context.empty(), context.empty(),
+                                            options_.llm.require_han_context));
     return translation;
   }
   DLOG(INFO) << "[copilot] rerank context: '" << context
@@ -594,14 +604,12 @@ CopilotRerankFilterComponent::CopilotRerankFilterComponent(
 
 CopilotRerankFilterComponent::~CopilotRerankFilterComponent() {}
 
-CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) {
+RerankOptions ReadRerankOptions(Config* config) {
   RerankOptions options;
-  Config* config = ticket.schema ? ticket.schema->config() : nullptr;
   // The seven keys the processor and/or the engine component read too,
   // including both length clamps -- copilot.cc used to carry its own copy of
   // each, kept in step by hand. See copilot_config.h.
   const CopilotSharedConfig shared = ReadCopilotSharedConfig(config);
-  string db_name = shared.db;
   options.enable = shared.rerank_enable;
   options.max_context_chars = shared.rerank_max_context_chars;
   options.llm.enable = shared.llm_enable;
@@ -630,6 +638,13 @@ CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) 
   options.llm.top_n = std::clamp(options.llm.top_n, 1, options.window);
   options.llm.margin = std::clamp(options.llm.margin, 0.0f, 100.0f);
   options.llm.length_exponent = std::clamp(options.llm.length_exponent, 0.0f, 2.0f);
+  return options;
+}
+
+CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) {
+  Config* config = ticket.schema ? ticket.schema->config() : nullptr;
+  const RerankOptions options = ReadRerankOptions(config);
+  const string db_name = ReadCopilotSharedConfig(config).db;
   an<CopilotDb> db;
   an<RerankTraceStore> traces;
   // The Scorer lives on CopilotEngine now (Task 5), so the processor's
