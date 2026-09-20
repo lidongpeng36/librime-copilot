@@ -63,8 +63,8 @@ struct RerankTrace {
   std::string input;  // the FULL context input at decision time
   size_t start = 0;   // the segment's span within that input
   size_t end = 0;
-  std::string ctx;  // TrailingCjkRun the decision was made against
-  std::string src;  // which surrounding-text source supplied it
+  std::string ctx;           // TrailingCjkRun the decision was made against
+  std::string src;           // which surrounding-text source supplied it
   std::string context_gate;  // separate from the ordered LLM fallback reason
   // What the surrounding fetch behind `ctx` actually managed, recorded at
   // decision time. Carried on the trace rather than re-read at commit because
