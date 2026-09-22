@@ -1262,6 +1262,64 @@ consumption, and the GPU is already awake rendering the candidate window at
 exactly those moments. `true` is the recommendation; the default stays `false`
 only because it is the shipped behaviour.
 
+### One-key inputs: the scorer asks the wrong question, and a fix is measured but not built
+
+Reported 2026-09-22: after 可以, typing the single key `a` put 安 first instead
+of 啊. Rime's own order is right (啊 5.37M against 安 0.98M in `8105`); the model
+promoted 安 from position 3 at margin 2.67, reproduced offline to the digit.
+**The scorer measures P(next text is the candidate), and for a single
+character that counts every word it begins**: 91% of P(安 | 可以) is 安装, 安排,
+安全 and four more words. A user who types by word would have typed those as
+words; one key and a commit means a standalone character. A committed promotion
+then lifts 安 in the user dictionary by recency (`formula_d`), so it stays first
+even where the model does not act, which is what made it look persistent.
+
+`score_candidates --word-end --lexicon` measures the fix: decode the
+candidate's last token too and add `end_logprob = log(1 - P(the next token
+continues a lexicon word))`, with jieba's `dict.txt` as the lexicon. Replaying
+the live rule (`top_n` 4, margin 1.0, same span, exponent 0.7):
+
+| population | current | word-end | |
+| --- | --- | --- | --- |
+| replay evalset, 8206 multi-key segments | 87.64% | 87.80% | +69 / -56, p=0.28 |
+| one-key rows mined from the corpus, 13,040 | 77.40% | 82.50% | +1076 / -411, p=9e-69 |
+| same, later half by time only (parameters picked on the earlier half) | 78.86% | 83.53% | +499 / -194, p=7e-32 |
+
+Where 啊 was the answer (583 rows), the current scorer put 安 first 60 times,
+and word-end did so 3 times. Two things are easy to get wrong here:
+
+- **The replay evalset cannot see this at all.** `replay_copilot` types full
+  codes (啊 is `aa`), so it contains zero one-key segments. The one-key rows
+  are synthesized from the corpus instead: single-character jieba tokens after
+  Han text, keyed by the first flypy key of their in-context reading, kept when
+  they sit in that key's first four candidates. The replay evalset is not
+  evidence either way about a one-key change.
+- **Softening the penalty does not help, and one key regresses.** Sweeping
+  lambda in {0, .25, .5, .75, 1} x a cap in {1, 2, 3, none} on the earlier half picked
+  lambda 1 with no cap on both base orders. `b` (不) drops from 81.9% to 58.9%
+  on an empty user dictionary but rises from 70.9% to 78.4% on a live one,
+  probably because jieba's segmentation (which labels the row) and jieba's
+  lexicon (which scores it) disagree on what a word is. That is inferred, not
+  shown.
+
+What is left after word-end (25 of the 583 rows go to 按) is register, not
+scoring: the training mix is Weibo chat plus web text, not work IM.
+
+**Not built.** The design is word-end on one-key segments only, behind a
+default-off key, with a lexicon in `private/`. The cost is one decode on
+windows that are free today (0.18ms to about 9ms). The full record,
+reproduction and scripts are kept locally (see "Where the design records
+live"): `specs/2026-09-22-onekey-word-end-results.md` and
+`scripts/2026-09-22-onekey-word-end/`.
+
+**A replay arm must not inherit the live socket path.** An arm copied from
+`~/Library/Rime` points `ime_bridge/socket_path` at `/tmp/rime_copilot_ime.sock`,
+and when `replay_copilot` exits, `ImeBridgeServer::Stop()` unlinks that path.
+That deletes the live Squirrel's socket, so every Neovim and tmux client is
+disconnected until `Squirrel --reload`. Give every arm its own path. Separately,
+replay could not run at all from `9b93910` (protocol v2) until `28d6e3d`: it
+sent `"v": 1` and every context push was dropped.
+
 ### What is NOT built
 
 Whole-sentence decoding (Path A of

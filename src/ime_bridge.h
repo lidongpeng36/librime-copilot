@@ -18,6 +18,15 @@
 
 namespace rime {
 
+// The wire protocol's version and namespace. In this header, not file-local to
+// ime_bridge.cc, because replay_copilot speaks the same protocol as a client:
+// it once hard-coded "v": 1, and when the version went to 2 every context it
+// pushed was dropped as "Unsupported protocol version" and the replay
+// harness could no longer run at all. Bumping this is still a coordinated
+// change with rime-copilot-clients -- see CLAUDE.md "Clients".
+inline constexpr int kImeBridgeProtocolVersion = 2;
+inline constexpr const char* kImeBridgeNamespace = "rime.ime";
+
 class Context;
 
 // Per-client 状态结构

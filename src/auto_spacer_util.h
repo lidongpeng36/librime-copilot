@@ -295,6 +295,17 @@ inline std::string DecorateCommitText(const std::string& text, const std::string
   return result;
 }
 
+// Whether a digit key typed with nothing composing should be committed as
+// " <digit>". Digits are not in the speller alphabet, so in Chinese mode such
+// a key passes straight through Rime and would land unspaced (`中文1`); this is
+// the only place that can space it. The digit is ASCII content whichever mode
+// typed it, so the ASCII-content rule applies. `composing` covers the copilot
+// prediction menu too, which has empty input but a segment -- a digit there
+// selects a candidate.
+inline bool ShouldSpaceBareDigit(const std::string& before, bool composing) {
+  return !composing && NeedSpaceBefore(before, /*content_is_ascii=*/true);
+}
+
 }  // namespace auto_spacer_detail
 
 // The history path's spacing decision, lifted verbatim out of

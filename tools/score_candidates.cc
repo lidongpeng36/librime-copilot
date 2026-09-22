@@ -13,6 +13,21 @@
 //
 //   score_candidates --model <gguf> --input <jsonl> --output <jsonl> \
 //                     [--limit N] [--n-ctx N] [--n-gpu-layers N] [--context-chars N]
+//                     [--word-end --lexicon <dict.yaml|wordlist> ...]
+//
+// --word-end additionally scores each candidate as a COMPLETE word: the raw
+// score is P(candidate is the next text), which for a single character counts
+// every word the character begins -- after 可以, 91% of P(安) is 安装/安排/
+// 安全/... -- while the user, who types by word, would have typed those as
+// words. So the candidate's last token is decoded too, and
+//
+//   end_logprob = log(1 - sum P(next token) over tokens whose first
+//                          character c makes (candidate + c) a prefix of
+//                          some lexicon word)
+//
+// i.e. the probability that the word stops here. It is written beside the raw
+// numbers, never folded into them, so any combination can be recomputed
+// offline; the `wordend` ranking below is simply raw + end_logprob.
 //
 #include <llama.h>
 
@@ -24,6 +39,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -80,6 +96,8 @@ struct Args {
   int n_ctx = 4096;
   int n_gpu_layers = 99;
   int context_chars = 64;
+  bool word_end = false;
+  std::vector<std::string> lexicons;
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -106,6 +124,10 @@ Args ParseArgs(int argc, char** argv) {
       a.n_gpu_layers = std::stoi(next());
     } else if (arg == "--context-chars") {
       a.context_chars = std::stoi(next());
+    } else if (arg == "--word-end") {
+      a.word_end = true;
+    } else if (arg == "--lexicon") {
+      a.lexicons.push_back(next());
     } else {
       throw std::runtime_error("unknown arg: " + arg);
     }
@@ -113,7 +135,13 @@ Args ParseArgs(int argc, char** argv) {
   if (a.model.empty() || a.input.empty() || a.output.empty()) {
     throw std::runtime_error(
         "usage: score_candidates --model M --input I --output O [--limit N] "
-        "[--n-ctx N] [--n-gpu-layers N] [--context-chars N]");
+        "[--n-ctx N] [--n-gpu-layers N] [--context-chars N] "
+        "[--word-end --lexicon L ...]");
+  }
+  // Without a lexicon every candidate's continuation set is empty and
+  // end_logprob is 0 everywhere -- a run that silently measures nothing.
+  if (a.word_end && a.lexicons.empty()) {
+    throw std::runtime_error("--word-end needs at least one --lexicon");
   }
   return a;
 }
@@ -123,7 +151,74 @@ struct CandScore {
   float raw = 0.0f;   // summed log-prob over candidate tokens
   float norm = 0.0f;  // raw / n_tokens
   int n_tokens = 0;
+  // --word-end only: log P(the word ends after this candidate), and the
+  // probability mass it removed.
+  float end_logprob = 0.0f;
+  float p_cont = 0.0f;
 };
+
+// Length in bytes of the UTF-8 character starting at s[i]; 1 for a stray byte.
+size_t Utf8Len(const std::string& s, size_t i) {
+  const unsigned char c = static_cast<unsigned char>(s[i]);
+  size_t n = (c & 0x80) == 0      ? 1
+             : (c & 0xE0) == 0xC0 ? 2
+             : (c & 0xF0) == 0xE0 ? 3
+             : (c & 0xF8) == 0xF0 ? 4
+                                  : 1;
+  return std::min(n, s.size() - i);
+}
+
+// Every multi-character word in the given files, sorted and unique. A Rime
+// *.dict.yaml is read from after its "..." header line, one word per line as
+// the text before the first tab; any other file is a plain word list (first
+// whitespace-separated field). Comment lines (#) are skipped either way.
+std::vector<std::string> LoadLexicon(const std::vector<std::string>& paths) {
+  std::vector<std::string> words;
+  for (const auto& path : paths) {
+    std::ifstream in(path);
+    if (!in) {
+      throw std::runtime_error("cannot open lexicon: " + path);
+    }
+    const bool yaml = path.size() > 5 && path.compare(path.size() - 5, 5, ".yaml") == 0;
+    bool in_body = !yaml;
+    std::string line;
+    size_t before = words.size();
+    while (std::getline(in, line)) {
+      if (!in_body) {
+        in_body = line == "...";
+        continue;
+      }
+      if (line.empty() || line[0] == '#') {
+        continue;
+      }
+      const std::string word = line.substr(0, line.find_first_of(yaml ? "\t" : " \t"));
+      if (!word.empty() && Utf8Len(word, 0) < word.size()) {
+        words.push_back(word);
+      }
+    }
+    std::cerr << "lexicon " << path << ": " << (words.size() - before) << " words\n";
+  }
+  std::sort(words.begin(), words.end());
+  words.erase(std::unique(words.begin(), words.end()), words.end());
+  return words;
+}
+
+// The characters that can follow `cand` inside a lexicon word: for 安, the 装
+// of 安装, the 排 of 安排, ... `words` is sorted, so every word starting with
+// `cand` sits in one contiguous run from its lower bound.
+std::vector<std::string> ContinuationChars(const std::vector<std::string>& words,
+                                           const std::string& cand) {
+  std::vector<std::string> out;
+  for (auto it = std::lower_bound(words.begin(), words.end(), cand);
+       it != words.end() && it->compare(0, cand.size(), cand) == 0; ++it) {
+    if (it->size() > cand.size()) {
+      out.push_back(it->substr(cand.size(), Utf8Len(*it, cand.size())));
+    }
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
 
 constexpr llama_seq_id kCtxSeq = 0;
 constexpr llama_seq_id kScratchSeq = 1;
@@ -152,6 +247,37 @@ int main(int argc, char** argv) {
   }
   const llama_vocab* vocab = llama_model_get_vocab(model);
   const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+  // --word-end: the lexicon, and every token indexed by the first character
+  // of its text, so "which tokens continue 安" is a lookup per continuation
+  // character rather than a scan of the vocabulary per candidate. A token
+  // whose text is empty (EOS and the other specials) or starts mid-character
+  // (a byte-fallback piece) indexes nowhere, so it always counts as an end.
+  std::vector<std::string> lexicon;
+  std::unordered_map<std::string, std::vector<llama_token>> tokens_by_first_char;
+  if (args.word_end) {
+    try {
+      lexicon = LoadLexicon(args.lexicons);
+    } catch (const std::exception& e) {
+      std::cerr << e.what() << "\n";
+      return 1;
+    }
+    char piece[256];
+    for (llama_token t = 0; t < n_vocab; ++t) {
+      const int n = llama_token_to_piece(vocab, t, piece, sizeof(piece), 0, /*special=*/false);
+      if (n <= 0) {
+        continue;
+      }
+      const std::string text(piece, static_cast<size_t>(n));
+      const size_t len = Utf8Len(text, 0);
+      if ((static_cast<unsigned char>(text[0]) & 0xC0) == 0x80 || len == 0) {
+        continue;
+      }
+      tokens_by_first_char[text.substr(0, len)].push_back(t);
+    }
+    std::cerr << "word-end: " << lexicon.size() << " words, " << tokens_by_first_char.size()
+              << " distinct token first characters\n";
+  }
 
   llama_context_params ctx_params = llama_context_default_params();
   ctx_params.n_ctx = args.n_ctx;
@@ -189,6 +315,7 @@ int main(int argc, char** argv) {
   int64_t n_bucket_c = 0, n_bucket_a = 0;
   int64_t n_hit_raw = 0, n_hit_norm = 0;
   int64_t n_false_promo_raw = 0, n_false_promo_norm = 0;
+  int64_t n_hit_wordend = 0, n_false_promo_wordend = 0;
   std::vector<double> prefill_us_all;
   std::vector<double> score_all_us_all;
 
@@ -306,7 +433,11 @@ int main(int argc, char** argv) {
 
         double logprob_sum = LogProbOf(ctx_last_logits.data(), n_vocab, cand_tokens[0]);
         int pos = n_ctx_tok;
-        for (size_t ti = 0; ti + 1 < cand_tokens.size(); ++ti) {
+        // With --word-end the LAST token is decoded too: its logits are the
+        // distribution over what follows the candidate.
+        const size_t n_decode = cand_tokens.size() - (args.word_end ? 0 : 1);
+        float end_logprob = 0.0f, p_cont = 0.0f;
+        for (size_t ti = 0; ti < n_decode; ++ti) {
           batch.n_tokens = 1;
           batch.token[0] = cand_tokens[ti];
           batch.pos[0] = pos;
@@ -319,11 +450,32 @@ int main(int argc, char** argv) {
             break;
           }
           float* logits = llama_get_logits_ith(ctx, -1);
-          logprob_sum += LogProbOf(logits, n_vocab, cand_tokens[ti + 1]);
           ++pos;
+          if (ti + 1 < cand_tokens.size()) {
+            logprob_sum += LogProbOf(logits, n_vocab, cand_tokens[ti + 1]);
+            continue;
+          }
+          // Past the candidate's end: P(continuing a lexicon word), in the
+          // same numerically stable form LogProbOf uses.
+          float max_logit = logits[0];
+          for (int32_t v = 1; v < n_vocab; ++v) max_logit = std::max(max_logit, logits[v]);
+          double sum_all = 0.0;
+          for (int32_t v = 0; v < n_vocab; ++v)
+            sum_all += std::exp((double)(logits[v] - max_logit));
+          double sum_cont = 0.0;
+          for (const auto& c : ContinuationChars(lexicon, cand_text)) {
+            auto it = tokens_by_first_char.find(c);
+            if (it == tokens_by_first_char.end()) continue;
+            for (llama_token t : it->second) sum_cont += std::exp((double)(logits[t] - max_logit));
+          }
+          p_cont = (float)(sum_cont / sum_all);
+          // Floored: a candidate the model is certain continues must still
+          // compare as very unlikely, not as -inf, so rankings stay total.
+          end_logprob = (float)std::log(std::max(1.0 - sum_cont / sum_all, 1e-6));
         }
         int n_tok = (int)cand_tokens.size();
-        scores.push_back({cand_text, (float)logprob_sum, (float)(logprob_sum / n_tok), n_tok});
+        scores.push_back({cand_text, (float)logprob_sum, (float)(logprob_sum / n_tok), n_tok,
+                          end_logprob, p_cont});
       }
       int64_t t_score1 = NowUs();
       double score_all_us = (double)(t_score1 - t_score0);
@@ -338,6 +490,11 @@ int main(int argc, char** argv) {
                        [&](int a, int b) { return scores[a].raw > scores[b].raw; });
       std::stable_sort(order_norm.begin(), order_norm.end(),
                        [&](int a, int b) { return scores[a].norm > scores[b].norm; });
+      std::vector<int> order_wordend = order_raw;
+      std::stable_sort(order_wordend.begin(), order_wordend.end(), [&](int a, int b) {
+        return scores[a].raw + scores[a].end_logprob > scores[b].raw + scores[b].end_logprob;
+      });
+      const std::string top1_wordend = scores[order_wordend.front()].text;
 
       std::string top1_raw = scores[order_raw.front()].text;
       std::string top1_norm = scores[order_norm.front()].text;
@@ -361,7 +518,12 @@ int main(int argc, char** argv) {
       // than implying it's always a plain token count.
       json cand_dump = json::array();
       for (const auto& s : scores) {
-        cand_dump.push_back({{"text", s.text}, {"logprob", s.raw}, {"n_tokens", s.n_tokens}});
+        json c = {{"text", s.text}, {"logprob", s.raw}, {"n_tokens", s.n_tokens}};
+        if (args.word_end) {
+          c["end_logprob"] = s.end_logprob;
+          c["p_cont"] = s.p_cont;
+        }
+        cand_dump.push_back(c);
       }
 
       json rec;
@@ -373,6 +535,9 @@ int main(int argc, char** argv) {
       rec["llm_top1_norm"] = top1_norm;
       rec["llm_rank_of_gold_raw"] = rank_of_gold_raw;
       rec["llm_rank_of_gold_norm"] = rank_of_gold_norm;
+      if (args.word_end) {
+        rec["llm_top1_wordend"] = top1_wordend;
+      }
       rec["n_candidates"] = (int)cands.size();
       rec["candidates"] = cand_dump;
       rec["times"] = {{"prefill_us", prefill_us}, {"score_all_us", score_all_us}};
@@ -385,10 +550,12 @@ int main(int argc, char** argv) {
         ++n_bucket_c;
         if (top1_raw == gold) ++n_hit_raw;
         if (top1_norm == gold) ++n_hit_norm;
+        if (top1_wordend == gold) ++n_hit_wordend;
       } else if (bucket == "A") {
         ++n_bucket_a;
         if (top1_raw != gold) ++n_false_promo_raw;
         if (top1_norm != gold) ++n_false_promo_norm;
+        if (top1_wordend != gold) ++n_false_promo_wordend;
       }
     }
 
@@ -431,6 +598,14 @@ int main(int argc, char** argv) {
             << n_bucket_a << ")\n";
   std::cerr << "false_promo (norm)    = " << fp_rate_norm << " (" << n_false_promo_norm << "/"
             << n_bucket_a << ")\n";
+  if (args.word_end) {
+    std::cerr << "hit_rate (wordend)    = "
+              << (n_bucket_c ? (double)n_hit_wordend / (double)n_bucket_c : 0.0) << " ("
+              << n_hit_wordend << "/" << n_bucket_c << ")\n";
+    std::cerr << "false_promo (wordend) = "
+              << (n_bucket_a ? (double)n_false_promo_wordend / (double)n_bucket_a : 0.0) << " ("
+              << n_false_promo_wordend << "/" << n_bucket_a << ")\n";
+  }
   std::cerr << "prefill_us median/p95 = " << median(prefill_us_all) << " / " << p95(prefill_us_all)
             << "\n";
   std::cerr << "score_all_us median/p95 = " << median(score_all_us_all) << " / "

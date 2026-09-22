@@ -22,8 +22,6 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr int kProtocolVersion = 2;
-constexpr const char* kNamespace = "rime.ime";
 constexpr size_t kMaxMessageSize = 4096;
 // Upper bound on one accumulated JSON line; a client that never sends '\n'
 // must not be able to grow the buffer without limit.
@@ -278,13 +276,13 @@ std::string ImeBridgeState::ProcessMessage(const std::string& message) {
     auto j = json::parse(message);
 
     int version = j.value("v", 0);
-    if (version != kProtocolVersion) {
+    if (version != kImeBridgeProtocolVersion) {
       LOG(WARNING) << "[ImeBridge] Unsupported protocol version: " << version;
       return "";
     }
 
     std::string ns = j.value("ns", "");
-    if (ns != kNamespace) {
+    if (ns != kImeBridgeNamespace) {
       LOG(WARNING) << "[ImeBridge] Unknown namespace: " << ns;
       return "";
     }
@@ -407,8 +405,8 @@ void ImeBridgeState::SetHostIdForTest(const std::string& host_id) {
 }
 
 std::string ImeBridgeState::BuildHello() const {
-  json msg = {{"v", kProtocolVersion},
-              {"ns", kNamespace},
+  json msg = {{"v", kImeBridgeProtocolVersion},
+              {"ns", kImeBridgeNamespace},
               {"type", "hello"},
               {"data", {{"host", HostId()}}}};
   return msg.dump() + "\n";

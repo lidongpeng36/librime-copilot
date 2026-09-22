@@ -281,3 +281,24 @@ TEST(DecorateCommitText, TrimsAndSkipsChinesePunct) {
   // Empty stays empty.
   EXPECT_EQ("", DecorateCommitText("", "中", "中", true, true));
 }
+
+// A bare digit typed while nothing is composing never reaches Rime's composer
+// (digits are not in the speller alphabet), so AutoSpacer is the only place
+// that can space it. It is ASCII content whichever mode typed it: `中文 1`.
+TEST(DecideBareDigitSpacing, SpacesAfterCjk) {
+  EXPECT_TRUE(ShouldSpaceBareDigit("中文", /*composing=*/false));
+  EXPECT_TRUE(ShouldSpaceBareDigit("第", false));
+}
+TEST(DecideBareDigitSpacing, NoSpaceWhereNoneBelongs) {
+  EXPECT_FALSE(ShouldSpaceBareDigit("中文 ", false));   // already spaced
+  EXPECT_FALSE(ShouldSpaceBareDigit("中文 1", false));  // continuing a number
+  EXPECT_FALSE(ShouldSpaceBareDigit("abc", false));     // ASCII word
+  EXPECT_FALSE(ShouldSpaceBareDigit("3.", false));      // decimal point
+  EXPECT_FALSE(ShouldSpaceBareDigit("中文，", false));  // Chinese punctuation
+  EXPECT_FALSE(ShouldSpaceBareDigit("", false));        // start of text
+}
+// A digit while composing -- including the empty-input copilot prediction
+// menu -- selects a candidate; that is HandleNumberKey's business, not this.
+TEST(DecideBareDigitSpacing, NeverWhileComposing) {
+  EXPECT_FALSE(ShouldSpaceBareDigit("中文", /*composing=*/true));
+}

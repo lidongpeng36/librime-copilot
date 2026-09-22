@@ -35,6 +35,7 @@
 #include <rime/ticket.h>
 
 #include "copilot_engine.h"  // CopilotEngineComponent, GetCopilotEngineComponentForTools
+#include "ime_bridge.h"      // kImeBridgeProtocolVersion, kImeBridgeNamespace
 #include "replay_align.h"
 #include "rerank.h"              // TrailingCjkRun
 #include "rerank_llm.h"          // llm_rerank::SkipReason, SkipReasonName
@@ -284,8 +285,8 @@ PushOutcome WaitForPush(const std::string& text, std::chrono::milliseconds timeo
 // that ordering.
 PushOutcome PushSurrounding(const std::string& text) {
   json msg = {
-      {"v", 1},
-      {"ns", "rime.ime"},
+      {"v", rime::kImeBridgeProtocolVersion},
+      {"ns", rime::kImeBridgeNamespace},
       {"type", "ascii"},
       {"src", {{"app", "replay_copilot"}, {"instance", "main"}}},
       {"data", {{"action", "context"}, {"before", text}, {"after", ""}}},
@@ -298,8 +299,8 @@ PushOutcome PushSurrounding(const std::string& text) {
 
 bool ClearSurrounding() {
   json msg = {
-      {"v", 1},
-      {"ns", "rime.ime"},
+      {"v", rime::kImeBridgeProtocolVersion},
+      {"ns", rime::kImeBridgeNamespace},
       {"type", "ascii"},
       {"src", {{"app", "replay_copilot"}, {"instance", "main"}}},
       {"data", {{"action", "clear_context"}}},
