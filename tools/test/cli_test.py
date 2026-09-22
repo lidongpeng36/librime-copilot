@@ -2103,13 +2103,13 @@ class ContextMemoryStatusTest(unittest.TestCase):
 
 class ProtocolVersionAgreementTest(unittest.TestCase):
     def test_matches_the_cpp_constant(self):
-        """CLIENTS_PROTOCOL_VERSION and kProtocolVersion are one number in two
+        """CLIENTS_PROTOCOL_VERSION and kImeBridgeProtocolVersion are one number in two
         languages. Nothing at runtime compares them -- the C++ side rejects a
         mismatched message and the Python side only reports -- so this test is
         the only thing that would notice one being bumped alone."""
-        src = (Path(__file__).resolve().parents[2] / "src" / "ime_bridge.cc").read_text()
-        m = re.search(r"constexpr int kProtocolVersion\s*=\s*(\d+)", src)
-        self.assertIsNotNone(m, "kProtocolVersion not found in src/ime_bridge.cc")
+        src = (Path(__file__).resolve().parents[2] / "src" / "ime_bridge.h").read_text()
+        m = re.search(r"constexpr int kImeBridgeProtocolVersion\s*=\s*(\d+)", src)
+        self.assertIsNotNone(m, "kImeBridgeProtocolVersion not found in src/ime_bridge.h")
         self.assertEqual(int(m.group(1)), cli.CLIENTS_PROTOCOL_VERSION)
 
 

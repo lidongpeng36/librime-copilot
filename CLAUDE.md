@@ -1694,7 +1694,7 @@ name each other, the same arrangement `MakeKey` and `MakeClientKey` already
 use (`src/context_memory.h:45-59`): the literal wire-format tests at the
 bottom of `test/ime_bridge_state_test.cc` name that repo's `scripts/report.sh`
 and `test/report_test.py`, and that repo's golden names this file back.
-Bumping `kProtocolVersion` (`src/ime_bridge.cc`) is therefore a coordinated
+Bumping `kImeBridgeProtocolVersion` (`src/ime_bridge.h`) is therefore a coordinated
 change across both repos; a version mismatch is inert, never wrong —
 `ProcessMessage` logs a warning and ignores the message.
 

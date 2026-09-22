@@ -87,8 +87,8 @@ def _context_memory_enabled(built_schemas: "list[Path]") -> bool:
     return False
 
 
-# The wire-protocol version this plugin speaks. Equal to kProtocolVersion in
-# src/ime_bridge.cc:25 and to the value rime-copilot-clients' tmux entry point
+# The wire-protocol version this plugin speaks. Equal to
+# kImeBridgeProtocolVersion in src/ime_bridge.h and to the value rime-copilot-clients' tmux entry point
 # publishes as @rime-copilot-clients-protocol. Nothing at runtime compares the
 # three; ProtocolVersionAgreementTest in tools/test/cli_test.py is what notices
 # one being bumped alone.

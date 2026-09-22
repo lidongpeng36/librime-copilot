@@ -450,7 +450,7 @@ TEST(ImeBridgeState, ContextDepthIsCountedAndTruncationIsUnknown) {
 // goldens are kept in step by hand, the way MakeKey and MakeClientKey are
 // (src/context_memory.h:45-59).
 //
-// Bumping kProtocolVersion is a coordinated change across both repos. A
+// Bumping kImeBridgeProtocolVersion is a coordinated change across both repos. A
 // mismatch is inert, never wrong: ProcessMessage logs a warning and ignores
 // the message.
 namespace {
@@ -476,7 +476,7 @@ std::string IdentityMessage(const char* pane, const char* command,
 // Every other test in this file uses that helper, so a change to the wire
 // format changes the helper and leaves all of them green. These two cannot be
 // satisfied that way. If one fails, either the format changed -- in which case
-// the other repo needs the same change and kProtocolVersion probably needs a
+// the other repo needs the same change and kImeBridgeProtocolVersion probably needs a
 // coordinated bump -- or somebody reformatted the literal, which is the same
 // thing wearing a different hat.
 //
