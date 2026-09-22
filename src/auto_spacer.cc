@@ -426,6 +426,9 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     // ("请求.  百炼") -- both reproduced over ssh.
     client_state.before = boundary_before;
     client_state.after = raw_after;
+    if (IsNumKey(keycode) && ShouldSpaceBareDigit(boundary_before, ctx->IsComposing())) {
+      return CommitThroughPlugin(engine_, ctx, AddSpace(keycode), /*learn=*/false);
+    }
     if (IsLetterKey(keycode)) {
       const bool after_period = !ascii_mode && (latest_text == "。" || latest_text == ".");
       if (after_period) {
@@ -631,6 +634,12 @@ ProcessResult AutoSpacer::ProcessWithCommitHistory(Context* ctx, const KeyEvent&
   }
 
   if (IsNumKey(keycode)) {
+    // Both modes: HandleNumberKey does nothing on empty input, and the
+    // alphabet branch below that spaces ASCII-mode letters is never reached
+    // for a digit.
+    if (!key_event.modifier() && ShouldSpaceBareDigit(latest_text, ctx->IsComposing())) {
+      return CommitThroughPlugin(engine_, ctx, AddSpace(keycode), /*learn=*/false);
+    }
     return HandleNumberKey(ctx, key_event);
   }
 
