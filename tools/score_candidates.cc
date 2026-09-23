@@ -29,6 +29,15 @@
 // numbers, never folded into them, so any combination can be recomputed
 // offline; the `wordend` ranking below is simply raw + end_logprob.
 //
+// Outcome, so nobody reads this as a feature waiting to be wired up: the
+// plugin does NOT and will not do this. It measured significantly better on a
+// synthesized one-key evalset and made no difference on the multi-key replay
+// evalset, but the live ceiling is 0.03% of segments and the harm it targets
+// turned out to sit on a single key, where a `pin_cand_filter` line costs
+// nothing and fixes more. See CLAUDE.md "One-key inputs". The flag stays
+// because it is the instrument that produced that negative -- same reason
+// bench_scorer keeps --idle-spin and --pre-spin-us.
+//
 #include <llama.h>
 
 #include <algorithm>

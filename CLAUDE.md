@@ -1262,7 +1262,7 @@ consumption, and the GPU is already awake rendering the candidate window at
 exactly those moments. `true` is the recommendation; the default stays `false`
 only because it is the shipped behaviour.
 
-### One-key inputs: the scorer asks the wrong question, and a fix is measured but not built
+### One-key inputs: the scorer asks the wrong question, and the fix is a config line
 
 Reported 2026-09-22: after 可以, typing the single key `a` put 安 first instead
 of 啊. Rime's own order is right (啊 5.37M against 安 0.98M in `8105`); the model
@@ -1305,11 +1305,47 @@ and word-end did so 3 times. Two things are easy to get wrong here:
 What is left after word-end (25 of the 583 rows go to 按) is register, not
 scoring: the training mix is Weibo chat plus web text, not work IM.
 
-**Not built.** The design is word-end on one-key segments only, behind a
-default-off key, with a lexicon in `private/`. The cost is one decode on
-windows that are free today (0.18ms to about 9ms). The full record,
-reproduction and scripts are kept locally (see "Where the design records
-live"): `specs/2026-09-22-onekey-word-end-results.md` and
+**Not built, and the ceiling is why.** The designed fix was word-end on
+one-key segments only, behind a default-off key, with a lexicon in `private/`,
+costing one decode on windows that are free today (0.18 ms to about 9 ms).
+What none of the three experiments above asked is how often this happens at
+all. Measured 2026-09-22 over **27,888 segments** across two machines
+(2026-08-31 -> 09-22): one-key segments are 2.3% of all segments, the
+model acts on 0.9%, it promotes on **0.15%** (43 promotions, recorded in full
+by `ShouldRecord`), and the promotions that are actually wrong are **~8, or
+0.03% of all segments**. The Han-gate ceiling this file already declined to act
+on was 0.74% -- this is 25x smaller.
+
+**Two things that measurement found, either of which changes the question:**
+
+- **`d` was never affected, and not because of anything here.** rime-ice's own
+  schema pins `d` -> 的 through `lua_filter@*pin_cand_filter`, which the
+  deployed `engine/filters` orders AFTER `copilot_rerank_filter`. So all 9 of
+  the `d` promotions in that window landed at displayed position 1, never 0,
+  and 100% of ~559 one-key `d` commits were 的. The telemetry experiment above
+  noted that 258 of 308 one-key events were `d` without noticing that none of
+  them had ever caused a complaint.
+- **The harm is one key.** Of 32 one-key `a` commits, 26 were 啊 and the other
+  6 (安 x4, 爱, 按) were **every one of them an LLM promotion** -- in three
+  weeks the user never once chose anything but 啊 on a bare `a`. Meanwhile the
+  other keys' promotions are mostly right (么->吗/们/没, 嗯->而, 先->想, 了->来,
+  吧->不, 一->已, 和->会), and every one of those characters is also a word
+  head, so a global word-end would put ~30 correct promotions at risk to buy
+  0.03%.
+
+**Shipped instead:** one line in `double_pinyin_flypy.custom.yaml` (vaulted, so
+it travels), `"pin_cand_filter/+": ["a\t啊"]`. `/+` appends
+(`config_compiler.cc`'s `AppendToList`), so rime-ice's `d` entry survives;
+verify in `build/double_pinyin_flypy.schema.yaml` that both are there. It also
+fixes the half word-end could not: the user dictionary's `formula_d` recency
+keeps a wrongly-committed 安 first even on keystrokes where the model never
+runs (`llm_skip: cold`), and a filter at the end of the chain blocks that too,
+while a change to the scorer cannot. Cost of being wrong: one extra keypress on
+a bare `a`, which the log says has never been wanted.
+
+The full record, the five telemetry queries behind these numbers, the
+reproduction and the scripts are kept locally (see "Where the design records
+live"): `specs/2026-09-22-onekey-word-end-results.md` section 12, and
 `scripts/2026-09-22-onekey-word-end/`.
 
 **A replay arm must not inherit the live socket path.** An arm copied from
