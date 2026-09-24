@@ -91,6 +91,7 @@ nlohmann::json TelemetryConfig(Config* config, int fetch_chars) {
           {"top_n", r.llm.top_n},
           {"margin", r.llm.margin},
           {"length_exponent", r.llm.length_exponent},
+          {"word_head_weight", r.llm.word_head_weight},
           {"n_gpu_layers", scorer.n_gpu_layers},
           {"n_threads", scorer.n_threads},
           {"backend", "llama"},

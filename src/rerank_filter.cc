@@ -4,8 +4,11 @@
 #include <rime/config.h>
 #include <rime/context.h>
 #include <rime/engine.h>
+#include <rime/gear/translator_commons.h>  // Phrase
+#include <rime/resource.h>
 #include <rime/schema.h>
 #include <rime/segmentation.h>
+#include <rime/service.h>
 #include <rime/ticket.h>
 #include <rime/translation.h>
 
@@ -32,7 +35,7 @@ class RerankTranslation : public PrefetchTranslation {
                     const RerankOptions& options, an<RerankTraceStore> traces, std::string input,
                     std::string ctx, std::string llm_ctx, std::string src, int before_depth,
                     Truncation truncation, TraceSpan span, Scorer* llm_scorer,
-                    llm_rerank::SkipReason llm_skip)
+                    llm_rerank::SkipReason llm_skip, const wordhead::Table* word_head)
       : PrefetchTranslation(translation),
         continuations_(std::move(continuations)),
         options_(options),
@@ -45,7 +48,8 @@ class RerankTranslation : public PrefetchTranslation {
         truncation_(truncation),
         span_(span),
         llm_scorer_(llm_scorer),
-        llm_skip_(llm_skip) {}
+        llm_skip_(llm_skip),
+        word_head_(word_head) {}
 
  protected:
   bool Replenish() override;
@@ -79,6 +83,11 @@ class RerankTranslation : public PrefetchTranslation {
   // the same "declined vs never ran" distinction rerank_llm.h documents.
   Scorer* llm_scorer_ = nullptr;
   llm_rerank::SkipReason llm_skip_ = llm_rerank::SkipReason::kDisabled;
+  // The word-head prior's table (wordhead_table.h). Borrowed: the filter's
+  // an<> outlives every translation it builds, same lifetime argument as
+  // llm_scorer_. Null means no prior at all -- weight is 0 or the file
+  // failed to load, decided once in CopilotRerankFilterComponent::Create.
+  const wordhead::Table* word_head_ = nullptr;
 };
 
 bool RerankTranslation::Replenish() {
@@ -209,7 +218,32 @@ bool RerankTranslation::Replenish() {
       raw_logprobs.push_back(s.logprob);
       n_tokens.push_back(s.n_tokens);
     }
-    const auto decision = llm_rerank::Decide(to_score, raw_logprobs, n_tokens, options_.llm);
+    // The word-head prior (wordhead_table.h). Empty -- no prior at all --
+    // unless the table loaded, the weight is > 0, and every all-Han candidate
+    // in the window is one character.
+    const std::vector<float> priors =
+        word_head_ ? wordhead::WindowPriors(*word_head_, to_score, options_.llm.word_head_weight)
+                   : std::vector<float>{};
+    const auto decision =
+        llm_rerank::Decide(to_score, raw_logprobs, n_tokens, priors, options_.llm);
+    trace.llm.prior_applied = !priors.empty();
+    trace.llm.prior_delta = decision.prior_delta;
+    trace.llm.prior_changed = decision.prior_changed_verdict;
+    if (decision.promote_index_noprior >= 0) {
+      trace.llm.best_noprior = to_score[static_cast<size_t>(decision.promote_index_noprior)];
+    }
+    // Phase-2 groundwork: Rime's own weight for each scored candidate, so the
+    // next question -- does Rime's ordering already carry the user's history?
+    // -- is answered from the log rather than from a userdb snapshot.
+    for (size_t i = 0; i < score_n; ++i) {
+      const an<Candidate>& cand = same_span[i];
+      trace.llm.cand_q.push_back(cand->quality());
+      if (auto phrase = As<Phrase>(Candidate::GetGenuineCandidate(cand))) {
+        trace.llm.cand_w.push_back(phrase->weight());
+      } else {
+        trace.llm.cand_w.push_back(std::nullopt);
+      }
+    }
     // A lost warm-cache race (LlmScorer::Score finds warmed_context_ != the
     // context it was asked to score under model_mutex_) returns {}, which
     // Decide reads as "no all-Han candidate" (kNoHan) exactly like a real
@@ -366,13 +400,15 @@ void RecordSkipTrace(const an<RerankTraceStore>& traces, const std::optional<Tra
 
 CopilotRerankFilter::CopilotRerankFilter(const Ticket& ticket, const an<CopilotDb>& db,
                                          const RerankOptions& options, an<RerankTraceStore> traces,
-                                         an<CopilotEngine> copilot_engine)
+                                         an<CopilotEngine> copilot_engine,
+                                         an<const wordhead::Table> word_head)
     : Filter(ticket),
       db_(db),
       options_(options),
       traces_(std::move(traces)),
       copilot_engine_(std::move(copilot_engine)),
-      scorer_(copilot_engine_ ? copilot_engine_->scorer() : nullptr) {
+      scorer_(copilot_engine_ ? copilot_engine_->scorer() : nullptr),
+      word_head_(std::move(word_head)) {
   LOG(INFO) << "[copilot] rerank: enable=" << options_.enable
             << ", max_context_chars=" << options_.max_context_chars
             << ", window=" << options_.window << ", max_rank=" << options_.max_rank
@@ -595,8 +631,47 @@ an<Translation> CopilotRerankFilter::Apply(an<Translation> translation, Candidat
       translation, continuations, options_, span ? traces_ : an<RerankTraceStore>(),
       engine_->context()->input(), context, llm_context, SurroundingSourceName(caret->source),
       caret->before_depth, caret->truncation, span.value_or(TraceSpan{}),
-      llm_eligible ? scorer_ : nullptr, llm_skip);
+      llm_eligible ? scorer_ : nullptr, llm_skip, word_head_.get());
 }
+
+namespace {
+
+// Same resolver shape as the model path (copilot_engine.cc: an empty
+// ResourceType resolves relative to the user data directory), so
+// "private/wordhead.txt" means the same file for both.
+const ResourceType kWordHeadResourceType = {"", "", ""};
+
+an<const wordhead::Table> LoadWordHead(const LlmRerankOptions& llm) {
+  // Nothing would read the table with the LLM path off, and "word-head prior
+  // on" in the log would then be false.
+  if (!llm.enable || llm.word_head_weight <= 0.0f) {
+    return nullptr;
+  }
+  auto resolver =
+      the<ResourceResolver>(Service::instance().CreateResourceResolver(kWordHeadResourceType));
+  const std::string path = resolver->ResolvePath(llm.word_head_table).string();
+  wordhead::ParseResult parsed;
+  std::string error;
+  if (!wordhead::Load(path, &parsed, &error)) {
+    LOG(WARNING) << "[copilot] rerank llm: word_head/weight is " << llm.word_head_weight
+                 << " but the table is missing (" << error
+                 << "); the prior is OFF. `rime-copilot wordhead` builds it.";
+    return nullptr;
+  }
+  if (parsed.bad_lines > 0) {
+    LOG(WARNING) << "[copilot] rerank llm: " << path << ": " << parsed.bad_lines
+                 << " malformed line(s) ignored";
+  }
+  if (parsed.table.empty()) {
+    LOG(WARNING) << "[copilot] rerank llm: " << path << " holds no entries; the prior is OFF.";
+    return nullptr;
+  }
+  LOG(INFO) << "[copilot] rerank llm: word-head prior on, weight " << llm.word_head_weight << ", "
+            << parsed.table.mass.size() << " characters from " << path;
+  return std::make_shared<const wordhead::Table>(std::move(parsed.table));
+}
+
+}  // namespace
 
 CopilotRerankFilterComponent::CopilotRerankFilterComponent(
     an<CopilotEngineComponent> engine_factory)
@@ -632,12 +707,17 @@ RerankOptions ReadRerankOptions(Config* config) {
     config->GetDouble("copilot/rerank/llm/length_exponent", &exponent_double);
     options.llm.margin = static_cast<float>(margin_double);
     options.llm.length_exponent = static_cast<float>(exponent_double);
+    double word_head_double = static_cast<double>(options.llm.word_head_weight);
+    config->GetDouble("copilot/rerank/llm/word_head/weight", &word_head_double);
+    options.llm.word_head_weight = static_cast<float>(word_head_double);
+    config->GetString("copilot/rerank/llm/word_head/table", &options.llm.word_head_table);
   }
   options.window = std::clamp(options.window, 1, 200);
   options.max_rank = std::clamp(options.max_rank, 1, 100000);
   options.llm.top_n = std::clamp(options.llm.top_n, 1, options.window);
   options.llm.margin = std::clamp(options.llm.margin, 0.0f, 100.0f);
   options.llm.length_exponent = std::clamp(options.llm.length_exponent, 0.0f, 2.0f);
+  options.llm.word_head_weight = std::clamp(options.llm.word_head_weight, 0.0f, 10.0f);
   return options;
 }
 
@@ -655,6 +735,7 @@ CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) 
   // keeps the returned an<> alive for as long as it lives, in case it is the
   // only component reaching this schema's CopilotEngine at all.
   an<CopilotEngine> copilot_engine;
+  an<const wordhead::Table> word_head;
   if (options.enable && engine_factory_) {
     db = engine_factory_->GetDb(db_name);
     if (!db) {
@@ -663,8 +744,9 @@ CopilotRerankFilter* CopilotRerankFilterComponent::Create(const Ticket& ticket) 
     traces =
         engine_factory_->GetRerankTraces(ticket.schema ? ticket.schema->schema_id() : string());
     copilot_engine = engine_factory_->GetInstance(ticket);
+    word_head = LoadWordHead(options.llm);
   }
-  return new CopilotRerankFilter(ticket, db, options, traces, copilot_engine);
+  return new CopilotRerankFilter(ticket, db, options, traces, copilot_engine, word_head);
 }
 
 }  // namespace rime

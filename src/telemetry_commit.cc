@@ -69,7 +69,12 @@ std::vector<Event> BuildCommitEvents(Context* ctx, const RerankTraceStore* trace
     // (telemetry_event.h), and a db-shaped check here silently drops every
     // LLM-only promotion, leaving Event::llm populated in principle but never
     // in practice.
-    const bool promoted = db_promoted || llm_promoted;
+    // A segment whose verdict the word-head prior changed is census too: when
+    // the prior BLOCKED a promotion it looks exactly like a plain success, and
+    // sampling it 1 in sample_ok while the prior's misses are kept in full is
+    // the one-sided count CLAUDE.md records under `margin`.
+    const bool prior_changed = llm_engaged && trace->llm.prior_changed;
+    const bool promoted = db_promoted || llm_promoted || prior_changed;
     const int sel_idx = static_cast<int>(seg.selected_index);
     // Without a counter there is no way to make 1-in-N deterministic, so a
     // caller that passes no `ok_seen` gets today's behaviour (no plain

@@ -29,6 +29,7 @@
 #include "rerank_trace.h"
 #include "scorer.h"
 #include "utils.h"  // copilot::PowerChangeToken
+#include "wordhead_table.h"
 
 namespace rime {
 
@@ -91,7 +92,8 @@ class CopilotRerankFilter : public Filter {
   // so the caller never asked CopilotEngineComponent for an instance -- in
   // which case scoring is simply unavailable, same as before.
   CopilotRerankFilter(const Ticket& ticket, const an<CopilotDb>& db, const RerankOptions& options,
-                      an<RerankTraceStore> traces, an<CopilotEngine> copilot_engine);
+                      an<RerankTraceStore> traces, an<CopilotEngine> copilot_engine,
+                      an<const wordhead::Table> word_head = nullptr);
   ~CopilotRerankFilter() override;
 
   an<Translation> Apply(an<Translation> translation, CandidateList* candidates) override;
@@ -125,6 +127,10 @@ class CopilotRerankFilter : public Filter {
   // see CopilotEngine::scorer() and rerank_filter.cc's constructor.
   an<CopilotEngine> copilot_engine_;
   Scorer* scorer_ = nullptr;  // borrowed from copilot_engine_, never owned
+
+  // The word-head prior's table, loaded once in Create(); null when the
+  // weight is 0 or the file is missing (Create logs which).
+  an<const wordhead::Table> word_head_;
 
   // Cached rather than queried on every keystroke -- same reason and same
   // pattern as LLMProvider (llm_provider.cc:63-78): kept current by a

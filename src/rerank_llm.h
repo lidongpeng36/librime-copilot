@@ -7,6 +7,7 @@
 // docs/superpowers/specs/2026-08-16-llm-rerank-poc-results.md. Do not tune them
 // by intuition -- the offline harness re-measures any change in minutes.
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -35,6 +36,14 @@ struct LlmRerankOptions {
   // not share -- see BailOnEmptyDbContext below for what it costs and why
   // lifting it is a measurement rather than an obvious win.
   bool require_han_context = true;
+  // v10: the word-head prior (wordhead_table.h). 0 is inert, and is the code
+  // default so nothing changes for a schema that does not opt in; the shipped
+  // schema patch sets 1.0 -- the same split `margin` has. Measured with the
+  // table built from the user's own corpus: 1.0 picked on the earlier half of
+  // 23 days, +145 against +120 net keystrokes on the held-out later half.
+  float word_head_weight = 0.0f;
+  // Relative to the Rime user directory, resolved like the model path.
+  std::string word_head_table = "private/wordhead.txt";
 };
 
 namespace llm_rerank {
@@ -157,6 +166,23 @@ struct Decision {
   int incumbent_index = -1;  // the first all-Han candidate
   float margin = 0.0f;       // challenger score minus incumbent score
   int n_scored = 0;
+  // v10. How much the word-head prior moved `margin`: this decision's margin
+  // minus the margin the same call reports with no priors. So
+  // `margin - prior_delta` is the pre-v10 quantity even when the prior changed
+  // which candidate is `best`. 0 when no prior was applied.
+  float prior_delta = 0.0f;
+  // Whether the prior changed which candidate (if any) is promoted, in either
+  // direction. telemetry_commit.cc records these segments in full: a
+  // prior-blocked promotion otherwise looks like a plain success and is
+  // sampled 1 in sample_ok -- the one-sided count CLAUDE.md records under
+  // `margin`.
+  bool prior_changed_verdict = false;
+  // What the same call promotes with no priors: `promote_index` of the
+  // no-prior DecideImpl. Set only when priors were given, -1 otherwise (and
+  // -1 when the no-prior call would have promoted nothing). `best_index` is
+  // the post-prior pick, so when the prior BLOCKS a promotion this is the
+  // only record of the challenger it blocked.
+  int promote_index_noprior = -1;
 };
 
 // Every codepoint is a Han ideograph. Deliberately strict: the raw-input
@@ -181,11 +207,15 @@ inline float NormalizedScore(float logprob, int n_tokens, float exponent) {
   return logprob / std::pow(static_cast<float>(n), exponent);
 }
 
-// `raw_logprobs` and `n_tokens` are parallel to `candidates` and cover at least
-// its first `top_n` entries.
-inline Decision Decide(const std::vector<std::string>& candidates,
-                       const std::vector<float>& raw_logprobs, const std::vector<int>& n_tokens,
-                       const LlmRerankOptions& options) {
+inline float PriorAt(const std::vector<float>& priors, int i) {
+  return i >= 0 && i < static_cast<int>(priors.size()) ? priors[i] : 0.0f;
+}
+
+namespace detail {
+
+inline Decision DecideImpl(const std::vector<std::string>& candidates,
+                           const std::vector<float>& raw_logprobs, const std::vector<int>& n_tokens,
+                           const std::vector<float>& priors, const LlmRerankOptions& options) {
   Decision d;
   const int limit =
       std::min<int>(static_cast<int>(candidates.size()), options.top_n > 0 ? options.top_n : 0);
@@ -201,7 +231,8 @@ inline Decision Decide(const std::vector<std::string>& candidates,
     if (d.incumbent_index < 0) {
       d.incumbent_index = i;  // first all-Han candidate wins the incumbency
     }
-    const float s = NormalizedScore(raw_logprobs[i], n_tokens[i], options.length_exponent);
+    const float s =
+        NormalizedScore(raw_logprobs[i], n_tokens[i], options.length_exponent) + PriorAt(priors, i);
     if (best < 0 || s > best_score) {
       best = i;
       best_score = s;
@@ -213,8 +244,10 @@ inline Decision Decide(const std::vector<std::string>& candidates,
     d.skip = SkipReason::kNoHan;
     return d;
   }
-  const float incumbent_score = NormalizedScore(
-      raw_logprobs[d.incumbent_index], n_tokens[d.incumbent_index], options.length_exponent);
+  const float incumbent_score =
+      NormalizedScore(raw_logprobs[d.incumbent_index], n_tokens[d.incumbent_index],
+                      options.length_exponent) +
+      PriorAt(priors, d.incumbent_index);
   d.margin = best_score - incumbent_score;
 
   if (best == d.incumbent_index || d.margin < options.margin) {
@@ -224,6 +257,32 @@ inline Decision Decide(const std::vector<std::string>& candidates,
   d.promote_index = best;
   d.skip = SkipReason::kNone;
   return d;
+}
+
+}  // namespace detail
+
+// `raw_logprobs`, `n_tokens` and `priors` are parallel to `candidates`;
+// `priors` may be shorter (missing entries are 0) or empty (no prior at all --
+// exactly the pre-v10 decision). The prior is added AFTER length
+// normalisation; see wordhead_table.h for where the values come from.
+inline Decision Decide(const std::vector<std::string>& candidates,
+                       const std::vector<float>& raw_logprobs, const std::vector<int>& n_tokens,
+                       const std::vector<float>& priors, const LlmRerankOptions& options) {
+  Decision d = detail::DecideImpl(candidates, raw_logprobs, n_tokens, priors, options);
+  if (priors.empty()) {
+    return d;
+  }
+  const Decision base = detail::DecideImpl(candidates, raw_logprobs, n_tokens, {}, options);
+  d.prior_delta = d.margin - base.margin;
+  d.prior_changed_verdict = base.promote_index != d.promote_index;
+  d.promote_index_noprior = base.promote_index;
+  return d;
+}
+
+inline Decision Decide(const std::vector<std::string>& candidates,
+                       const std::vector<float>& raw_logprobs, const std::vector<int>& n_tokens,
+                       const LlmRerankOptions& options) {
+  return Decide(candidates, raw_logprobs, n_tokens, std::vector<float>{}, options);
 }
 
 }  // namespace llm_rerank

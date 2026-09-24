@@ -19,6 +19,7 @@
 #include <sstream>
 
 #include "copilot_config.h"
+#include "rerank_filter.h"
 #include "surrounding_source.h"  // kMaxSurroundingPrefixChars
 
 namespace rime {
@@ -171,6 +172,51 @@ copilot:
   EXPECT_EQ(o.max_file_bytes, 64 * 1024);
   EXPECT_EQ(o.keep_generations, 1);
   EXPECT_EQ(o.sample_ok, 0);
+}
+
+TEST(WordHeadConfig, DefaultsToInertWithTheConventionalTablePath) {
+  const RerankOptions r = ReadRerankOptions(nullptr);
+  EXPECT_FLOAT_EQ(r.llm.word_head_weight, 0.0f);
+  EXPECT_EQ(r.llm.word_head_table, "private/wordhead.txt");
+}
+
+TEST(WordHeadConfig, ReadsTheNestedKeys) {
+  auto config = ConfigFrom(R"(
+copilot:
+  rerank:
+    llm:
+      word_head:
+        weight: 1.0
+        table: private/other.txt
+)");
+  const RerankOptions r = ReadRerankOptions(config.get());
+  EXPECT_FLOAT_EQ(r.llm.word_head_weight, 1.0f);
+  EXPECT_EQ(r.llm.word_head_table, "private/other.txt");
+}
+
+// What the plugin actually reads at runtime: the deployer writes flow maps
+// into build/*.schema.yaml.
+TEST(WordHeadConfig, ReadsTheDeployerFlowMapForm) {
+  auto config = ConfigFrom(
+      "copilot: {rerank: {llm: {word_head: {weight: 1.5, table: private/wordhead.txt}}}}\n");
+  EXPECT_FLOAT_EQ(ReadRerankOptions(config.get()).llm.word_head_weight, 1.5f);
+}
+
+TEST(WordHeadConfig, ClampsTheWeightAtBothEnds) {
+  auto low = ConfigFrom("copilot: {rerank: {llm: {word_head: {weight: -3}}}}\n");
+  auto high = ConfigFrom("copilot: {rerank: {llm: {word_head: {weight: 50}}}}\n");
+  EXPECT_FLOAT_EQ(ReadRerankOptions(low.get()).llm.word_head_weight, 0.0f);
+  EXPECT_FLOAT_EQ(ReadRerankOptions(high.get()).llm.word_head_weight, 10.0f);
+}
+
+TEST(WordHeadConfig, TelemetryRecordsTheWeightButNeverThePath) {
+  rime::Config config;
+  std::istringstream yaml(
+      "copilot: {rerank: {llm: {word_head: {weight: 1.0, table: /Users/x/private/w.txt}}}}\n");
+  ASSERT_TRUE(config.LoadFromStream(yaml));
+  const auto recorded = rime::TelemetryConfig(&config, 64);
+  EXPECT_EQ(recorded["word_head_weight"], 1.0);
+  EXPECT_EQ(recorded.dump().find("/Users/x"), std::string::npos);
 }
 
 }  // namespace

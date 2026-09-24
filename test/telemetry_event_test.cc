@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
+
 #include "telemetry_event.h"
 
 using namespace rime::telemetry;
@@ -408,4 +410,55 @@ TEST(SerializeStatsJsonl, AnUnrecordedFetchDepthIsOmittedNotZeroed) {
   s.segments = 40;
   auto j = nlohmann::json::parse(rime::telemetry::SerializeStatsJsonl(s));
   EXPECT_FALSE(j.contains("fetch_chars"));
+}
+
+TEST(SerializeJsonl, CarriesThePriorOnlyWhenItWasApplied) {
+  Event e = MinimalEvent();
+  LlmRecord llm;
+  llm.skip = "margin";
+  e.llm = llm;
+  auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_FALSE(j["llm"].contains("prior_delta"));
+  EXPECT_FALSE(j["llm"].contains("prior_changed"));
+
+  e.llm->prior_applied = true;
+  e.llm->prior_delta = -2.0f;
+  e.llm->prior_changed = true;
+  j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_EQ(j["llm"]["prior_delta"], -2.0);
+  EXPECT_EQ(j["llm"]["prior_changed"], true);
+}
+
+TEST(SerializeJsonl, CarriesWhatThePriorBlockedOnlyWhenItWasApplied) {
+  Event e = MinimalEvent();
+  LlmRecord llm;
+  llm.skip = "margin";
+  llm.best_noprior = "现";
+  e.llm = llm;
+  auto j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_FALSE(j["llm"].contains("best_noprior"));
+
+  e.llm->prior_applied = true;
+  j = nlohmann::json::parse(SerializeJsonl(e));
+  EXPECT_EQ(j["llm"]["best_noprior"], "现");
+
+  // Applied but nothing would have been promoted without it: an empty string,
+  // present, so "the prior blocked nothing" is distinguishable from "no prior".
+  e.llm->best_noprior.clear();
+  j = nlohmann::json::parse(SerializeJsonl(e));
+  ASSERT_TRUE(j["llm"].contains("best_noprior"));
+  EXPECT_EQ(j["llm"]["best_noprior"], "");
+}
+
+TEST(SerializeJsonl, CarriesRimesOwnCandidateWeightsWithNullForANonPhrase) {
+  Event e = MinimalEvent();
+  LlmRecord llm;
+  llm.cand_w = {std::optional<double>(-3.25), std::nullopt};
+  llm.cand_q = {1.5, 0.0};
+  e.llm = llm;
+  const auto j = nlohmann::json::parse(SerializeJsonl(e));
+  ASSERT_EQ(j["llm"]["cand_w"].size(), 2u);
+  EXPECT_EQ(j["llm"]["cand_w"][0], -3.25);
+  EXPECT_TRUE(j["llm"]["cand_w"][1].is_null());
+  EXPECT_EQ(j["llm"]["cand_q"][0], 1.5);
 }

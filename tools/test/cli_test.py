@@ -550,6 +550,28 @@ class Update(CliBase):
         self.assertTrue((self.rime / "private" / "private.predict.db").exists())
 
 
+    def test_update_regenerates_the_wordhead_table(self):
+        # Spec 6.6: `update` is how the table stays current on the machine
+        # that has the corpus. Every other step is stubbed; only the call
+        # order is under test.
+        calls = []
+
+        def step(name):
+            def run(args):
+                calls.append(name)
+                return 0
+            return run
+
+        with mock.patch("rime_copilot.cli.cmd_fetch", step("fetch")), \
+             mock.patch("rime_copilot.cli.cmd_personal", step("personal")), \
+             mock.patch("rime_copilot.cli.cmd_wordhead", step("wordhead")), \
+             mock.patch("rime_copilot.cli.cmd_build", step("build")), \
+             mock.patch("rime_copilot.cli.cmd_deploy", step("deploy")):
+            code, _ = self.run_cli("update")
+        self.assertEqual(0, code)
+        self.assertEqual(calls, ["fetch", "personal", "wordhead", "build", "deploy"])
+
+
 class Build(CliBase):
     def test_dry_run_reports_the_reason_and_builds_nothing(self):
         code, out = self.run_cli("--dry-run", "build")
@@ -2228,3 +2250,109 @@ class BridgeProtocolStatusTest(unittest.TestCase):
         s = d / "x.schema.yaml"
         s.write_text('copilot:\n  ime_bridge: {enable: true, socket_path: "/tmp/other.sock"}\n')
         self.assertEqual(cli._bridge_socket_path([s]), "/tmp/other.sock")
+
+
+class WordHeadState(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "build").mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, body: str) -> None:
+        (self.dir / "double_pinyin_flypy.custom.yaml").write_text(body, encoding="utf-8")
+
+    def table(self) -> None:
+        (self.dir / "private").mkdir(exist_ok=True)
+        (self.dir / "private" / "wordhead.txt").write_text("# h\n先\t0.3\n现\t0.9\n",
+                                                          encoding="utf-8")
+
+    def test_unset_weight_is_off_even_with_a_table(self):
+        self.write("patch:\n  melt_eng/enable_user_dict: true\n")
+        self.table()
+        self.assertEqual(cli.wordhead_state(self.dir)[0], "off")
+
+    def test_weight_and_table_is_ok_and_counts_characters(self):
+        self.write('patch:\n  "copilot/rerank/llm/word_head/weight": 1.0\n')
+        self.table()
+        state, detail = cli.wordhead_state(self.dir)
+        self.assertEqual(state, "ok")
+        self.assertIn("2 characters", detail)
+
+    def test_weight_without_table_is_missing_and_says_the_prior_is_off(self):
+        self.write('patch:\n  "copilot/rerank/llm/word_head/weight": 1.0\n')
+        state, detail = cli.wordhead_state(self.dir)
+        self.assertEqual(state, "missing")
+        self.assertIn("OFF", detail)
+
+    def test_a_header_only_table_is_not_ok_and_says_the_prior_is_off(self):
+        # The plugin logs "holds no entries; prior OFF" for this file; status
+        # saying `ok (0 characters)` would contradict it.
+        self.write('patch:\n  "copilot/rerank/llm/word_head/weight": 1.0\n')
+        (self.dir / "private").mkdir(exist_ok=True)
+        (self.dir / "private" / "wordhead.txt").write_text("# h\n# h2\n", encoding="utf-8")
+        state, detail = cli.wordhead_state(self.dir)
+        self.assertNotEqual(state, "ok")
+        self.assertIn("OFF", detail)
+
+    def test_only_valid_entries_are_counted(self):
+        self.write('patch:\n  "copilot/rerank/llm/word_head/weight": 1.0\n')
+        (self.dir / "private").mkdir(exist_ok=True)
+        (self.dir / "private" / "wordhead.txt").write_text(
+            "# h\n先\t0.3\n现\t1.7\nab\t0.5\n发\tx\n\n", encoding="utf-8")
+        state, detail = cli.wordhead_state(self.dir)
+        self.assertEqual(state, "ok")
+        self.assertIn("1 characters", detail)
+
+    def test_a_non_utf8_table_is_unreadable_not_a_crash(self):
+        self.write('patch:\n  "copilot/rerank/llm/word_head/weight": 1.0\n')
+        (self.dir / "private").mkdir(exist_ok=True)
+        (self.dir / "private" / "wordhead.txt").write_bytes(b"\xff\xfe\x00bad")
+        self.assertEqual(cli.wordhead_state(self.dir)[0], "unreadable")
+
+
+class WordHeadCommand(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        (self.dir / "private").mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def args(self, corpus: Path):
+        return argparse.Namespace(rime_dir=self.dir, corpus_dir=str(corpus), dry_run=False)
+
+    def test_refuses_to_regenerate_without_a_corpus_when_the_file_exists(self):
+        out = self.dir / "private" / "wordhead.txt"
+        out.write_text("# kept\n先\t0.3\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            code = cli.cmd_wordhead(self.args(self.dir / "no-such-corpus"))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.read_text(encoding="utf-8"), "# kept\n先\t0.3\n")
+        self.assertIn("leaving", buf.getvalue())
+
+    def test_an_empty_corpus_directory_leaves_an_existing_table_alone(self):
+        # CLAUDE.md's bootstrap `mkdir -p`s the corpus dir before symlinking
+        # the corpus into it, and it also holds the replay arms: a directory
+        # that exists is not a corpus.
+        corpus = self.dir / "corpus"
+        corpus.mkdir()
+        out = self.dir / "private" / "wordhead.txt"
+        out.write_text("# kept\n先\t0.3\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            code = cli.cmd_wordhead(self.args(corpus))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.read_text(encoding="utf-8"), "# kept\n先\t0.3\n")
+        self.assertIn("leaving", buf.getvalue())
+
+    def test_an_empty_corpus_directory_writes_no_table(self):
+        corpus = self.dir / "corpus"
+        corpus.mkdir()
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            code = cli.cmd_wordhead(self.args(corpus))
+        self.assertEqual(code, 0)
+        self.assertFalse((self.dir / "private" / "wordhead.txt").exists())
+        self.assertIn("stays off", buf.getvalue())
+
+    def test_the_table_is_vaulted(self):
+        from rime_copilot import vault
+        self.assertIn("private/wordhead.txt", vault.VAULTED_FILES)

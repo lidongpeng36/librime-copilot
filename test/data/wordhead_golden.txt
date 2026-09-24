@@ -1,0 +1,6 @@
+# rime-copilot wordhead: how often each character begins a multi-character word
+# in the user's own corpus. Generated -- `rime-copilot wordhead` rewrites it.
+先	0.3333
+发	0.6000
+现	0.6667
+走	0.4000

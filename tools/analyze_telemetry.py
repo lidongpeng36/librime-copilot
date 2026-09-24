@@ -58,10 +58,13 @@ CREATE TABLE ev (
   llm_dropped_n INT,     -- how many candidates the same-span gate removed
   sel_in_dropped INT,    -- 1 when the user chose one of them: the live cost
                          -- of copilot/rerank/same_span_only being true
-  decline_kind TEXT,     -- agreed | blocked | NULL. `agreed` is best ==
-                         -- incumbent (a model-quality signal; lowering the
-                         -- margin cannot help); `blocked` is the model
-                         -- preferring something the threshold refused.
+  decline_kind TEXT,     -- agreed | gated | blocked | prior | NULL. `agreed`
+                         -- is best == incumbent (a model-quality signal;
+                         -- lowering the margin cannot help); `blocked` is the
+                         -- model preferring something the threshold refused;
+                         -- `prior` (v10) is a decline the word-head prior
+                         -- caused -- without it the model would have
+                         -- promoted `llm_best_noprior`.
   best_is_sel INT,       -- 1 when the model's pick is what the user chose --
                          -- with decline_kind='blocked', the recoverable case
   engage_skip TEXT,      -- the event's TOP-LEVEL llm_skip: why the model did
@@ -82,7 +85,13 @@ CREATE TABLE ev (
   llm_lock_us INT,       -- of llm_us, the wait for the model mutex
   llm_work_us INT,       -- of llm_us, the part spent holding it
   llm_n_decoded INT,     -- candidate tokens decoded; 0 means none
-  sample_every INT, context_gate TEXT
+  sample_every INT, context_gate TEXT,
+  -- v10. NULL on any earlier line and on a v10 line whose window the prior
+  -- was not applied to (the gate failed or the weight is 0).
+  llm_prior_delta REAL, llm_prior_changed INT,
+  llm_best_noprior TEXT  -- what the no-prior decision would have promoted;
+                         -- '' when nothing. `llm_best` is the post-prior pick,
+                         -- so this is the only record of what the prior blocked
 );
 
 -- One row per `type":"stats"` line (telemetry_event.h:StatsLine). Disjoint
@@ -189,7 +198,7 @@ CREATE TABLE recorder (
 # backends currently re-decode the whole context on every warm, and whether
 # that is worth fixing depends entirely on how often the new context merely
 # extends the old one. A classification and a count, never the context itself.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Below this many samples a percentage is noise, and the first percentage this
 # report prints becomes the baseline every later change is quoted against. The
@@ -244,7 +253,9 @@ def _validate_event(e):
         raise ValueError("selection disagrees with displayed list")
     if not _count(e.get("sample_every")) or e["sample_every"] < 1:
         raise ValueError("invalid sampling denominator")
-    full = e["sel_idx"] != 0 or bool((e.get("rr") or {}).get("text")) or (e.get("llm") or {}).get("skip") == "none"
+    full = (e["sel_idx"] != 0 or bool((e.get("rr") or {}).get("text"))
+            or (e.get("llm") or {}).get("skip") == "none"
+            or bool((e.get("llm") or {}).get("prior_changed")))
     if full and e["sample_every"] != 1:
         raise ValueError("census event marked sampled")
     if e.get("context_gate") not in (None, "clear", "empty", "non_han", "unavailable"):
@@ -336,13 +347,179 @@ def _print_confusions(db, limit):
     print("  Reverse corrections are separate; evaluate context and time-held-out data before changing order.")
 
 
+# A promotion committed, then deleted and retyped, is recorded as TWO events:
+# the first with sel_idx 0 -- which reads as "the user took the promotion" --
+# and a second, same code, resolving to the candidate the promotion displaced.
+# Counting only sel_idx called 118 of 988 promotions accepted that the user had
+# in fact undone (2026-09-23, the word-head design record): true acceptance
+# was ~63%, not the 66-71% CLAUDE.md carried. 60/120/300 s windows agree.
+# Known undercount: the retype is missed when IT is a plain success sampled
+# out (sel_idx 0 at the head of an unpromoted list).
+RETYPE_WINDOW_S = 120
+
+
+def mark_retypes(db, window_s=RETYPE_WINDOW_S):
+    """Fill the retype columns; return how many PROMOTIONS were undone.
+
+    ev.retyped = 1 on a promoted event the user deleted and retyped to the
+    head it displaced; its llm_verdict becomes 'rejected' too, so every
+    acceptance rate printed after this call (the path split's headline, the
+    by-margin rate_table) is corrected, not only promotion_pairs.
+
+    The mirror, for v10's word-head prior: ev.prior_retyped_to names what a
+    prior-BLOCKED segment (prior_changed, nothing promoted) was retyped to,
+    when the user committed the kept head and then, same code, something
+    else. A separate column, so promotion_pairs' semantics stay exactly as
+    they were; prior_retypes() counts them.
+    """
+    cols = [r[1] for r in db.execute("PRAGMA table_info(ev)")]
+    if "retyped" not in cols:
+        db.execute("ALTER TABLE ev ADD COLUMN retyped INT DEFAULT 0")
+    if "prior_retyped_to" not in cols:
+        db.execute("ALTER TABLE ev ADD COLUMN prior_retyped_to TEXT")
+    # COALESCE: llm_prior_changed is NULL on every pre-v10 row.
+    rows = db.execute(
+        "SELECT rowid, machine, ts, input, sel, llm_promoted, llm_incumbent,"
+        " COALESCE(llm_prior_changed, 0) FROM ev "
+        "WHERE ts IS NOT NULL ORDER BY machine, ts").fetchall()
+
+    def when(ts):
+        # A row whose ts does not parse must be skipped, never raise: `load()`
+        # already treats "one bad line must never abort a report over weeks
+        # of data" as load-bearing, and this runs later, over already-loaded
+        # rows a caller has no chance to filter first.
+        try:
+            return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+        except (ValueError, TypeError):
+            return None
+
+    def retyped_to(i, machine, t0, code, sel):
+        """What the same code next resolved to within the window, if it
+        differs from `sel`; None otherwise."""
+        for _, m2, ts2, code2, sel2, _, _, _ in rows[i + 1:]:
+            if m2 != machine:
+                break
+            t2 = when(ts2)
+            if t2 is None:
+                continue
+            if (t2 - t0).total_seconds() > window_s:
+                break
+            if code2 is None or sel2 is None:
+                continue
+            if code2 == code and sel2 != sel:
+                return sel2
+        return None
+
+    marked = 0
+    for i, (rowid, machine, ts, code, sel, promoted, incumbent, prior_changed) in enumerate(rows):
+        if not incumbent or code is None or sel is None:
+            continue
+        # A promotion, or a promotion the prior blocked where the user
+        # committed the head it kept. Anything else has no retype question.
+        blocked_kept = prior_changed and not promoted and sel == incumbent
+        if not promoted and not blocked_kept:
+            continue
+        t0 = when(ts)
+        if t0 is None:
+            continue
+        target = retyped_to(i, machine, t0, code, sel)
+        if target is None:
+            continue
+        if promoted:
+            if target == incumbent:
+                db.execute("UPDATE ev SET retyped = 1, llm_verdict = 'rejected' WHERE rowid = ?",
+                           (rowid,))
+                marked += 1
+        else:
+            db.execute("UPDATE ev SET prior_retyped_to = ? WHERE rowid = ?", (target, rowid))
+    return marked
+
+
+def prior_retypes(db):
+    """Prior-blocked segments whose kept head was deleted and retyped to the
+    challenger the prior blocked -- harm the prior caused. Call mark_retypes
+    first."""
+    cols = [r[1] for r in db.execute("PRAGMA table_info(ev)")]
+    if "prior_retyped_to" not in cols:
+        return 0
+    return db.execute(
+        "SELECT COUNT(*) FROM ev WHERE prior_retyped_to IS NOT NULL"
+        " AND prior_retyped_to = llm_best_noprior").fetchone()[0]
+
+
+def wordhead_prior_split(db):
+    """Outcomes of the segments whose verdict the word-head prior changed (v10).
+
+    No sampling weight is needed: ShouldRecord keeps every prior-changed
+    segment in full (telemetry_commit.cc folds prior_changed into
+    `promoted`), so both sides of each question are census.
+
+      blocked  the prior stopped a promotion of `llm_best_noprior`. The user
+               then kept the head (prior right), took the blocked challenger
+               (prior wrong), or took something else (other). A kept head
+               deleted and retyped to the challenger is prior wrong
+               (mark_retypes); retyped to a third candidate, other.
+      created  the prior made a promotion the model alone would not have.
+               Accepted or rejected, on llm_verdict -- which mark_retypes has
+               already corrected for delete-and-retype. Rows whose promoted
+               head a later filter altered are excluded, as in rate_table.
+    """
+    cols = [r[1] for r in db.execute("PRAGMA table_info(ev)")]
+    retyped_to = "prior_retyped_to" if "prior_retyped_to" in cols else "NULL"
+    r = {"blocked_right": 0, "blocked_wrong": 0, "blocked_other": 0,
+         "created_accepted": 0, "created_rejected": 0}
+    for sel, incumbent, noprior, target in db.execute(
+            f"SELECT sel, llm_incumbent, llm_best_noprior, {retyped_to} FROM ev"
+            " WHERE COALESCE(llm_prior_changed, 0) = 1 AND llm_promoted = 0"
+            " AND COALESCE(llm_best_noprior, '') != ''"):
+        if target is not None:
+            r["blocked_wrong" if target == noprior else "blocked_other"] += 1
+        elif sel == incumbent:
+            r["blocked_right"] += 1
+        elif sel == noprior:
+            r["blocked_wrong"] += 1
+        else:
+            r["blocked_other"] += 1
+    for (verdict,) in db.execute(
+            "SELECT llm_verdict FROM ev WHERE COALESCE(llm_prior_changed, 0) = 1"
+            " AND llm_promoted = 1 AND llm_head_altered = 0"):
+        r["created_accepted" if verdict == "accepted" else "created_rejected"] += 1
+    return r
+
+
+def _print_wordhead_prior(db):
+    r = wordhead_prior_split(db)
+    blocked = r["blocked_right"] + r["blocked_wrong"] + r["blocked_other"]
+    created = r["created_accepted"] + r["created_rejected"]
+    print("\n  Word-head prior (v10), segments whose verdict the prior changed (census):")
+    if not blocked and not created:
+        print("    (none recorded -- no v10 line, or word_head/weight is 0)")
+        return
+    print(f"    prior BLOCKED a promotion{blocked:>18}")
+    print(f"      user kept the head (prior right){r['blocked_right']:>9}")
+    print(f"      user took the blocked pick (prior wrong){r['blocked_wrong']:>3}"
+          f"   of which by delete-and-retype: {prior_retypes(db)}")
+    print(f"      user took something else{r['blocked_other']:>17}")
+    print(f"    prior CREATED a promotion{created:>18}")
+    print(f"      accepted{r['created_accepted']:>35}")
+    print(f"      rejected (incl. delete-and-retype){r['created_rejected']:>7}")
+
+
 def promotion_pairs(db):
-    """Paired retrospective comparison, not a randomized treatment effect."""
-    return db.execute("""SELECT
+    """Paired retrospective comparison, not a randomized treatment effect.
+
+    A promotion undone by delete-and-retype (mark_retypes) is `hurt`, not
+    `helped`, whatever its own sel_idx says.
+    """
+    cols = [r[1] for r in db.execute("PRAGMA table_info(ev)")]
+    retyped = "COALESCE(retyped, 0)" if "retyped" in cols else "0"
+    return db.execute(f"""SELECT
         CASE WHEN llm_margin<2 THEN '<2' WHEN llm_margin<3 THEN '2-3'
              WHEN llm_margin<5 THEN '3-5' ELSE '5+' END AS band,
-        COUNT(*), SUM(sel=llm_text), SUM(sel=llm_incumbent),
-        SUM(sel!=llm_text AND sel!=llm_incumbent)
+        COUNT(*),
+        SUM(sel=llm_text AND {retyped}=0),
+        SUM(sel=llm_incumbent OR {retyped}=1),
+        SUM(sel!=llm_text AND sel!=llm_incumbent AND {retyped}=0)
         FROM ev WHERE llm_promoted=1 AND llm_head_altered=0
         GROUP BY 1 ORDER BY MIN(llm_margin)""").fetchall()
 
@@ -585,7 +762,14 @@ def _load_event_line(db, e):
     # Decide()'s verdict was `margin` AND we know what it preferred. Without
     # `best` the two kinds are indistinguishable, which is the whole reason
     # the field was added -- so a v2 line gets None, not a guess.
-    if llm and llm_skip == "margin" and llm_best is not None:
+    if llm and llm_skip == "margin" and llm.get("prior_changed"):
+        # v10: without the word-head prior the model would have promoted
+        # something, so this decline is the prior's, not the model's (best
+        # usually equals incumbent here, which would read as `agreed` --
+        # "the model is the limit" -- and point at a retrain) and not the
+        # threshold's either.
+        decline_kind = "prior"
+    elif llm and llm_skip == "margin" and llm_best is not None:
         if llm_best != llm.get("incumbent"):
             decline_kind = "blocked"
         elif (llm.get("n_scored") or 0) <= 1 or sel_in_dropped:
@@ -604,7 +788,7 @@ def _load_event_line(db, e):
     engage_skip = e.get("llm_skip")
 
     db.execute(
-        "INSERT INTO ev VALUES (" + ",".join("?" for _ in range(44)) + ")",
+        "INSERT INTO ev VALUES (" + ",".join("?" for _ in range(47)) + ")",
         (
             e.get("ts"), e.get("machine"), e.get("schema"), e.get("src"),
             e.get("input"), e.get("ctx"), e.get("sel_idx"), e.get("sel"),
@@ -630,6 +814,10 @@ def _load_event_line(db, e):
             (llm or {}).get("lock_us"), (llm or {}).get("work_us"),
             (llm or {}).get("n_decoded"),
             e.get("sample_every"), e.get("context_gate"),
+            (llm or {}).get("prior_delta"),
+            (None if (llm or {}).get("prior_changed") is None
+             else int(bool(llm["prior_changed"]))),
+            (llm or {}).get("best_noprior"),
         ),
     )
 
@@ -758,12 +946,24 @@ RECOVERY_THRESHOLDS = (0.5, 1.0, 1.5)
 # be trusted.
 DEFAULT_SAMPLE_OK = 20
 
-# ShouldRecord's own condition, in SQL. `promoted` there is db_promoted ||
-# llm_promoted, and db_promoted is "rr.text is non-empty" -- NOT "from > 0".
-# The agreed-and-moved-nothing control group therefore counts as promoted and
-# is kept in full, which is why this cannot be written as `rr_from > 0`.
+# ShouldRecord's own condition, in SQL -- mirrors telemetry_commit.cc's
+# `promoted`, which is `db_promoted || llm_promoted || prior_changed`.
+# `db_promoted` is "rr.text is non-empty" -- NOT "from > 0" -- so the
+# agreed-and-moved-nothing control group counts as promoted and is kept in
+# full, which is why this cannot be written as `rr_from > 0`. v10 added the
+# word-head prior's own census rule: a segment whose verdict the prior
+# changed is full even when nothing was promoted and sel_idx is 0 (a decline
+# that would otherwise look like a plain success). `llm_prior_changed` is
+# NULL on any pre-v10 row and on a v10 row the prior never touched; SQL's
+# three-valued logic makes `FALSE OR NULL` evaluate to NULL rather than
+# FALSE, which would have made `NOT FULLY_RECORDED_SQL` (implied_sample_ok's
+# "sampled" half) silently drop every such row from both sides of the count
+# instead of keeping it on the sampled side -- COALESCE to 0 first so the
+# clause is a no-op, not a third truth value, on every row that predates v10
+# or never triggered the prior.
 FULLY_RECORDED_SQL = (
-    "((rr_text IS NOT NULL AND rr_text != '') OR llm_promoted = 1 OR sel_idx != 0)"
+    "((rr_text IS NOT NULL AND rr_text != '') OR llm_promoted = 1 OR sel_idx != 0"
+    " OR COALESCE(llm_prior_changed, 0) = 1)"
 )
 
 
@@ -812,7 +1012,7 @@ def _print_threshold_table(split, sample_ok, implied):
 def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
     """How the LLM's declines break down, and what a lower margin would buy.
 
-    Two kinds with opposite fixes:
+    Kinds with different fixes:
       agreed   best == incumbent, over a field of more than one scored
                candidate -- the model endorsed the head and the user
                disagreed. Lowering `margin` cannot help; this is the share
@@ -825,6 +1025,9 @@ def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
                it. When that something is what the user then chose
                (`best_is_sel`), a lower threshold would have fixed the
                segment outright.
+      prior    (v10) the word-head prior turned a promotion into a decline.
+               Neither the model's quality nor the threshold; scored in
+               wordhead_prior_split instead.
 
     `blocked_at[threshold]` is what LOWERING the margin to `threshold` would
     actually do, and it has two sides. `recovered_at` (kept, and still the
@@ -846,6 +1049,7 @@ def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
     split = {
         "agreed": 0,
         "gated": 0,
+        "prior": 0,
         "blocked": 0,
         "blocked_and_wanted": 0,
         "recovered_at": {t: 0 for t in RECOVERY_THRESHOLDS},
@@ -854,9 +1058,11 @@ def decline_split(db, sample_ok=DEFAULT_SAMPLE_OK):
                        for t in RECOVERY_THRESHOLDS},
     }
     for kind, best_is_sel, margin, sel_idx, fully, recorded_every in rows:
-        if kind in ("agreed", "gated"):
+        if kind in ("agreed", "gated", "prior"):
             split[kind] += 1
             continue
+        if kind != "blocked":
+            continue  # a kind this reader does not know is not a threshold block
         split["blocked"] += 1
         if best_is_sel:
             split["blocked_and_wanted"] += 1
@@ -1008,7 +1214,11 @@ def main():
     print("=" * 64)
     _print_recorders(db)
     _print_quality(db)
+    retyped = mark_retypes(db)
+    print(f"  promotions undone by delete-and-retype within {RETYPE_WINDOW_S}s: {retyped}"
+          " (counted as harm, and as rejections, below)")
     _print_promotion_pairs(db)
+    _print_wordhead_prior(db)
     print(f"  {'events read':<44}{total:>8}")
     displaced = db.execute("SELECT COUNT(*) FROM ev WHERE head_displaced = 1").fetchone()[0]
     if altered:
@@ -1109,13 +1319,15 @@ def main():
               where="llm_from > 0", promoted_col="llm_promoted",
               verdict_col="llm_verdict", altered_col="llm_head_altered")
     split = decline_split(db, sample_ok=sample_ok)
-    total_declines = split["agreed"] + split["gated"] + split["blocked"]
+    total_declines = split["agreed"] + split["gated"] + split["prior"] + split["blocked"]
     if total_declines:
         print(f"\n  LLM declined on {total_declines} segment(s)")
         print(f"    {'model agreed with the head':<36}{split['agreed']:>6}"
              f"  {pct(split['agreed'], total_declines)}   <- model quality")
         print(f"    {'span gate left nothing to compare':<36}{split['gated']:>6}"
              f"  {pct(split['gated'], total_declines)}   <- same_span_only")
+        print(f"    {'word-head prior blocked it (v10)':<36}{split['prior']:>6}"
+             f"  {pct(split['prior'], total_declines)}   <- word_head/weight")
         print(f"    {'threshold blocked the models pick':<36}{split['blocked']:>6}"
              f"  {pct(split['blocked'], total_declines)}   <- margin")
         if total_declines < MIN_N:
@@ -1131,7 +1343,9 @@ def main():
         print("  is not the same thing: the model agreed with the only candidate it")
         print("  was shown, or never saw the one the user picked. That one is")
         print("  copilot/rerank/same_span_only, and reading it as `agreed` would")
-        print("  point at a retrain that could not have helped.")
+        print("  point at a retrain that could not have helped. `prior` is a decline")
+        print("  the word-head prior caused (the model alone would have promoted);")
+        print("  whether it was right is scored in the Word-head prior section above.")
 
     span = db.execute(
         "SELECT COUNT(*), COALESCE(SUM(sel_in_dropped), 0) FROM ev WHERE llm_dropped_n > 0"

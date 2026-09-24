@@ -242,3 +242,91 @@ TEST(ContextGate, SeparatesUnavailableEmptyAndNonHanWithoutChangingFallbackOrder
   EXPECT_STREQ(SkipReasonName(SkipReason::kNoSource), "nosource");
   EXPECT_EQ(SkipForEmptyDbContext(SkipReason::kCold), SkipReason::kCold);
 }
+
+// The prior is added AFTER length normalisation. Added before, it would be
+// divided by n^0.7 and the measured behaviour (spec section 4) would change.
+// This case promotes if the prior is (wrongly) added to raw_logprob.
+TEST(DecideWithPriors, PriorIsAddedAfterLengthNormalisation) {
+  LlmRerankOptions o = Opts();
+  o.margin = 1.0f;
+  std::vector<std::string> cands{"甲", "乙丙"};
+  std::vector<float> lp{-5.0f, -8.0f};
+  std::vector<int> nt{1, 4};  // 乙丙: -8 / 4^0.7 = -3.03 -> margin 1.97 unprimed
+  std::vector<float> priors{0.0f, -1.5f};
+  auto d = Decide(cands, lp, nt, priors, o);
+  // after: -3.03 - 1.5 = -4.53 -> margin 0.47 < 1 -> declined
+  // before (wrong): (-8 - 1.5) / 2.639 = -3.60 -> margin 1.40 -> promoted
+  EXPECT_EQ(d.promote_index, -1);
+  EXPECT_EQ(d.skip, SkipReason::kMargin);
+}
+
+TEST(DecideWithPriors, EmptyPriorsIsTodaysDecisionExactly) {
+  LlmRerankOptions o = Opts();
+  o.margin = 1.0f;
+  std::vector<std::string> cands{"guyide", "顾忌", "故意", "固意"};
+  std::vector<float> lp{-1.0f, -9.0f, -3.0f, -6.0f};
+  std::vector<int> nt{3, 2, 2, 2};
+  const auto a = Decide(cands, lp, nt, o);
+  const auto b = Decide(cands, lp, nt, std::vector<float>{}, o);
+  EXPECT_EQ(a.promote_index, b.promote_index);
+  EXPECT_EQ(a.best_index, b.best_index);
+  EXPECT_EQ(a.incumbent_index, b.incumbent_index);
+  EXPECT_EQ(a.skip, b.skip);
+  EXPECT_EQ(a.n_scored, b.n_scored);
+  EXPECT_FLOAT_EQ(a.margin, b.margin);
+  EXPECT_FLOAT_EQ(b.prior_delta, 0.0f);
+  EXPECT_FALSE(b.prior_changed_verdict);
+}
+
+// 先 -> 现, the measured worst pair: the prior on the word head blocks it.
+TEST(DecideWithPriors, APriorThatBlocksAPromotionIsFlaggedAndDated) {
+  LlmRerankOptions o = Opts();
+  o.margin = 1.0f;
+  std::vector<std::string> cands{"先", "现"};
+  std::vector<float> lp{-3.0f, -1.0f};  // unprimed margin 2.0 -> promotes 现
+  std::vector<int> nt{1, 1};
+  std::vector<float> priors{-0.04f, -3.73f};
+  auto d = Decide(cands, lp, nt, priors, o);
+  EXPECT_EQ(d.promote_index, -1);
+  EXPECT_EQ(d.best_index, 0);  // the model, with the prior, now agrees with the head
+  EXPECT_TRUE(d.prior_changed_verdict);
+  // margin - prior_delta recovers the unprimed margin, whatever `best` became.
+  EXPECT_NEAR(d.margin - d.prior_delta, 2.0f, 1e-5f);
+  // What the prior blocked: without it, 现 would have been promoted. `best`
+  // is the post-prior pick, so this is the only record of the challenger.
+  EXPECT_EQ(d.promote_index_noprior, 1);
+}
+
+TEST(DecideWithPriors, WithoutPriorsTheNoPriorPromotionIsUnset) {
+  LlmRerankOptions o = Opts();
+  o.margin = 1.0f;
+  std::vector<std::string> cands{"先", "现"};
+  std::vector<float> lp{-3.0f, -1.0f};
+  std::vector<int> nt{1, 1};
+  auto d = Decide(cands, lp, nt, std::vector<float>{}, o);
+  EXPECT_EQ(d.promote_index, 1);
+  EXPECT_EQ(d.promote_index_noprior, -1);
+}
+
+TEST(DecideWithPriors, AllZeroPriorsChangeNothing) {
+  LlmRerankOptions o = Opts();
+  o.margin = 1.0f;
+  std::vector<std::string> cands{"先", "现"};
+  std::vector<float> lp{-3.0f, -1.0f};
+  std::vector<int> nt{1, 1};
+  auto d = Decide(cands, lp, nt, std::vector<float>{0.0f, 0.0f}, o);
+  EXPECT_EQ(d.promote_index, 1);
+  EXPECT_FALSE(d.prior_changed_verdict);
+  EXPECT_FLOAT_EQ(d.prior_delta, 0.0f);
+}
+
+TEST(DecideWithPriors, AShortPriorsVectorReadsMissingEntriesAsZero) {
+  LlmRerankOptions o = Opts();
+  o.margin = 1.0f;
+  std::vector<std::string> cands{"先", "现", "线"};
+  std::vector<float> lp{-3.0f, -1.0f, -9.0f};
+  std::vector<int> nt{1, 1, 1};
+  auto d = Decide(cands, lp, nt, std::vector<float>{-0.1f}, o);  // only 先 has one
+  EXPECT_EQ(d.promote_index, 1);
+  EXPECT_FALSE(d.prior_changed_verdict);
+}

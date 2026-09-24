@@ -639,6 +639,8 @@ def _config_leaves(text: str):
 
 
 RERANK_MODEL_KEY = "copilot/rerank/llm/model"
+WORDHEAD_WEIGHT_KEY = "copilot/rerank/llm/word_head/weight"
+WORDHEAD_TABLE_NAME = "wordhead.txt"
 
 _GRAMMAR_LANGUAGE = re.compile(r"^\s*(?:[\"']?grammar/language[\"']?|language)\s*:\s*[\"']?([^\"'#\s]+)")
 
@@ -848,6 +850,51 @@ def model_state(rime_dir: Path) -> tuple[str, str]:
     return worst, "; ".join(parts)
 
 
+def wordhead_state(rime_dir: Path) -> tuple[str, str]:
+    """(state, detail) for the word-head prior: off | ok | missing | empty | unreadable.
+
+    `missing`, `empty` and `unreadable` are the ones to act on: the schema
+    turned the prior on, the plugin found no usable table, logged one warning
+    and is running without it.
+    """
+    weight = 0.0
+    try:
+        for path in _schema_sources(rime_dir):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for leaf, value in _config_leaves(text):
+                if leaf == WORDHEAD_WEIGHT_KEY and value:
+                    try:
+                        weight = max(weight, float(value))
+                    except ValueError:
+                        pass
+    except OSError as exc:
+        return "unreadable", str(exc)
+    table = _private(rime_dir) / WORDHEAD_TABLE_NAME
+    if weight <= 0:
+        return "off", "word_head/weight is unset or 0; the prior is inert"
+    if not table.is_file():
+        return "missing", (f"weight {weight:g} but {table} is MISSING -- the prior is OFF")
+    from . import wordhead
+    try:
+        n = wordhead.count_entries(table.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        return "unreadable", f"{table}: {exc} -- the prior is OFF"
+    if n == 0:
+        # What the plugin logs as "holds no entries; prior OFF". Counting
+        # non-comment lines instead once called a header-only table `ok`.
+        return "empty", (f"weight {weight:g} but {table} holds no valid entries "
+                         f"-- the prior is OFF")
+    return "ok", f"private/{WORDHEAD_TABLE_NAME} ({n} characters), weight {weight:g}"
+
+
+def _print_wordhead_status(rime_dir: Path) -> None:
+    state, detail = wordhead_state(rime_dir)
+    print(f"wordhead: {state} -- {detail}")
+    if state in ("missing", "empty", "unreadable"):
+        print("          `rime-copilot wordhead` builds it (needs the corpus), "
+              "or `restore` brings the vaulted copy")
+
+
 def _print_lexicon_status(rime_dir: Path) -> None:
     """Report the clean stamp *checked against the file it describes*.
 
@@ -1021,6 +1068,7 @@ def cmd_status(args) -> int:
     _print_lexicon_status(rime_dir)
     _print_grammar_status(rime_dir)
     _print_model_status(rime_dir)
+    _print_wordhead_status(rime_dir)
     _print_installed_status(rime_dir)
     # Both lines are gated on the feature actually being on. It ships off, and
     # a line that prints on every run on every machine -- including the ones
@@ -1642,6 +1690,46 @@ def cmd_personal(args) -> int:
     return 0
 
 
+def cmd_wordhead(args) -> int:
+    """Regenerate private/wordhead.txt from the corpus (src/wordhead_table.h)."""
+    from . import personal as personal_dict
+    from . import wordhead
+
+    corpus = personal_dict.corpus_dir(args.corpus_dir)
+    output = _private(args.rime_dir) / wordhead.TABLE_NAME
+    if not corpus.is_dir():
+        if output.is_file():
+            # Same guard as `personal`: this command cannot tell "no corpus,
+            # ever" from "the corpus is not HERE yet", and an empty rebuild
+            # would replace a good table with one that penalises nothing.
+            print(f"leaving {output} alone: no corpus at {corpus}")
+            print("          expected on a machine that only consumes the vault")
+        else:
+            print(f"no corpus at {corpus} and no {output}: the word-head prior "
+                  f"stays off until one exists")
+        return 0
+    if args.dry_run:
+        print(f"would write {output} from {corpus}")
+        return 0
+    table = wordhead.build(corpus)
+    if not table:
+        # A directory is not a corpus: the bootstrap `mkdir -p`s it before the
+        # symlinks exist, and it also holds the replay arms. Writing the
+        # header-only table this produces would turn the prior off, report
+        # success, and let the next `backup` push it over the vaulted one.
+        if output.is_file():
+            print(f"leaving {output} alone: the corpus at {corpus} yields no characters")
+            print("          (no *.jsonl there yet? see CLAUDE.md, the corpus symlinks)")
+        else:
+            print(f"the corpus at {corpus} yields no characters and there is no "
+                  f"{output}: the word-head prior stays off until one exists")
+        return 0
+    output.parent.mkdir(parents=True, exist_ok=True)
+    wordhead.write(table, output)
+    print(f"wrote {output}: {len(table)} characters")
+    return 0
+
+
 def _git_commit(source_root: Path) -> "str | None":
     # Best-effort only: install must still work when git is unavailable or
     # source_root is not a git repo (e.g. a tarball checkout).
@@ -1791,6 +1879,10 @@ def cmd_update(args) -> int:
     if code != 0:
         return code
 
+    code = cmd_wordhead(args)
+    if code != 0:
+        return code
+
     for step in (cmd_build, cmd_deploy):
         code = step(args)
         if code != 0:
@@ -1895,6 +1987,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="harvested corpus (default: $RIME_CORPUS_DIR, else "
              "~/.local/share/rime-corpus)")
     personal_cmd.set_defaults(func=cmd_personal)
+
+    wordhead_cmd = sub.add_parser(
+        "wordhead",
+        help="regenerate private/wordhead.txt (the word-head prior) from the corpus")
+    wordhead_cmd.add_argument(
+        "--corpus-dir",
+        help="harvested corpus (default: $RIME_CORPUS_DIR, else ~/.local/share/rime-corpus)")
+    wordhead_cmd.set_defaults(func=cmd_wordhead)
 
     deploy = sub.add_parser("deploy")
     deploy.add_argument("--squirrel")

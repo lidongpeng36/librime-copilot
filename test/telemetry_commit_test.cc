@@ -593,3 +593,28 @@ TEST(BuildCommitEvents, SampledSuccessCarriesActualSamplingDenominatorAndGate) {
   EXPECT_EQ(events[0].context_gate, "non_han");
   EXPECT_EQ(stats.Snapshot("t").context_gate_counts.at("non_han"), 1);
 }
+
+// A segment whose verdict the prior changed looks like a plain success when
+// the prior blocked a promotion (sel_idx 0, nothing promoted), so without this
+// it would be kept 1 in sample_ok while the prior's failures (sel_idx != 0)
+// are kept in full -- two sides of one question counted at different rates.
+TEST(BuildCommitEvents, APriorChangedSegmentIsCensusNeverSampled) {
+  Options o;
+  o.sample_ok = 20;
+  int64_t ok_seen = 1;  // index 1: a plain success here would NOT be sampled
+  Context ctx;
+  ctx.set_input("xm");
+  ctx.composition().Reset("xm");
+  ctx.composition().push_back(MakeSegment(0, 2, {"先", "现"}, 0));
+  RerankTrace t = TraceForLlm("xm", 0, 2, "", 0, "margin");
+  t.llm.incumbent = "先";
+  t.llm.prior_applied = true;
+  t.llm.prior_changed = true;
+  auto store = StoreOf({t});
+  auto events = BuildCommitEvents(&ctx, &store, o, "M1", "flypy", "2026-09-23T10:00:00+0800",
+                                  nullptr, true, &ok_seen);
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].sample_every, 1);
+  ASSERT_TRUE(events[0].llm.has_value());
+  EXPECT_TRUE(events[0].llm->prior_changed);
+}

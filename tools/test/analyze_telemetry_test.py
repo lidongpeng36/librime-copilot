@@ -948,9 +948,9 @@ class PathSplitVerdicts(unittest.TestCase):
         return out.getvalue()
 
     @staticmethod
-    def _llm_event(sel, top, text, from_, margin=3.0):
+    def _llm_event(sel, top, text, from_, margin=3.0, code="ab"):
         return {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
-                "machine": "M", "input": "ab", "ctx": "测试", "sel": sel,
+                "machine": "M", "input": code, "ctx": "测试", "sel": sel,
                 "sel_idx": top.index(sel), "top": top,
                 "llm": {"text": text, "incumbent": top[1], "from": from_,
                         "margin": margin, "skip": "none", "dropped": []}}
@@ -978,7 +978,10 @@ class PathSplitVerdicts(unittest.TestCase):
         text = self._section(self._report_over([
             # LLM: two promotions, one accepted one rejected.
             self._llm_event("好的", ["好的", "好地"], "好的", 1),
-            self._llm_event("好地", ["好的", "好地"], "好的", 1),
+            # A different code: same code, same second, resolved to the
+            # displaced head is exactly a delete-and-retype, which
+            # mark_retypes now also turns the first into a rejection.
+            self._llm_event("好地", ["好的", "好地"], "好的", 1, code="cd"),
             # LLM consulted, promoted nothing.
             {"v": analyze.SCHEMA_VERSION, "ts": "2026-08-21T10:00:00+0800",
              "machine": "M", "sel": "先", "sel_idx": 0, "top": ["先", "想"],
@@ -1208,6 +1211,189 @@ class QualityV9(unittest.TestCase):
         db, skipped = self.load_raw(events)
         self.assertEqual(skipped, 0)
         self.assertEqual(analyze.promotion_pairs(db), [('<2', 3, 1, 1, 1)])
+
+    def test_v10_prior_fields_are_loaded_and_absent_is_null(self):
+        with_prior = self.event(record_id="fixture-M:e:1", sel="先", sel_idx=0, sample_every=1,
+            top=["先", "现"], llm_skip="none",
+            llm={"skip": "margin", "incumbent": "先", "best": "先", "margin": 0.0,
+                 "n_scored": 2, "dropped": [], "prior_delta": -2.0, "prior_changed": True})
+        without = self.event(record_id="fixture-M:e:2", sel="先", sel_idx=1,
+            top=["现", "先"], sample_every=1, llm_skip="none",
+            llm={"skip": "none", "text": "现", "incumbent": "先", "margin": 2.0})
+        db, skipped = self.load_raw([with_prior, without])
+        self.assertEqual(skipped, 0)
+        rows = db.execute(
+            "SELECT llm_prior_delta, llm_prior_changed FROM ev ORDER BY sel_idx").fetchall()
+        self.assertEqual(rows, [(-2.0, 1), (None, None)])
+
+    def test_a_prior_changed_event_marked_sampled_is_rejected(self):
+        bad = self.event(sel="先", sel_idx=0, sample_every=20, top=["先", "现"], llm_skip="none",
+            llm={"skip": "margin", "incumbent": "先", "prior_delta": -2.0, "prior_changed": True})
+        db, skipped = self.load_raw([bad])
+        self.assertEqual(skipped, 1)
+
+    def test_a_prior_changed_decline_counts_as_fully_recorded_in_sql(self):
+        # sel_idx == 0, nothing promoted: without OR-ing in llm_prior_changed,
+        # FULLY_RECORDED_SQL (and implied_sample_ok, which is built on it)
+        # would misclassify this genuinely-census row as sampled.
+        e = self.event(sel="先", sel_idx=0, sample_every=1, top=["先", "现"], llm_skip="none",
+            llm={"skip": "margin", "incumbent": "先", "prior_delta": -2.0, "prior_changed": True})
+        db, skipped = self.load_raw([e])
+        self.assertEqual(skipped, 0)
+        row = db.execute(f"SELECT {analyze.FULLY_RECORDED_SQL} FROM ev").fetchone()
+        self.assertEqual(row[0], 1)
+
+    def _promo(self, i, ts, sel, sel_idx, top, text, incumbent, **kw):
+        return self.event(record_id=f"fixture-M:e:{i}", ts=ts, input="xm", sel=sel,
+            sel_idx=sel_idx, top=top, sample_every=1, llm_skip="none",
+            llm={"text": text, "incumbent": incumbent, "skip": "none", "margin": 1.5}, **kw)
+
+    def test_a_promotion_deleted_and_retyped_to_the_displaced_head_is_harm(self):
+        # 现 promoted and committed; 6 s later the same code resolves to 先.
+        first = self._promo(1, "2026-09-20T12:00:00+0800", "现", 0, ["现", "先"], "现", "先")
+        retype = self._promo(2, "2026-09-20T12:00:06+0800", "先", 1, ["现", "先"], "现", "先")
+        db, _ = self.load_raw([first, retype])
+        self.assertEqual(analyze.mark_retypes(db), 1)
+        # Before: first counted as helped. After: both are hurt.
+        self.assertEqual(analyze.promotion_pairs(db), [('<2', 2, 0, 2, 0)])
+
+    def test_a_retype_outside_the_window_or_to_a_third_candidate_is_not_harm(self):
+        first = self._promo(1, "2026-09-20T12:00:00+0800", "现", 0, ["现", "先", "线"], "现", "先")
+        late = self._promo(2, "2026-09-20T12:05:00+0800", "先", 1, ["现", "先", "线"], "现", "先")
+        db, _ = self.load_raw([first, late])
+        self.assertEqual(analyze.mark_retypes(db), 0)
+        first = self._promo(3, "2026-09-20T13:00:00+0800", "现", 0, ["现", "先", "线"], "现", "先")
+        third = self._promo(4, "2026-09-20T13:00:05+0800", "线", 2, ["现", "先", "线"], "现", "先")
+        db, _ = self.load_raw([first, third])
+        self.assertEqual(analyze.mark_retypes(db), 0)
+
+    def test_a_row_with_unparseable_ts_is_skipped_not_raised(self):
+        first = self._promo(1, "2026-09-20T12:00:00+0800", "现", 0, ["现", "先"], "现", "先")
+        retype = self._promo(2, "2026-09-20T12:00:06+0800", "先", 1, ["现", "先"], "现", "先")
+        bad = self._promo(3, "2026-09-20T12:10:00+0800", "现", 0, ["现", "先"], "现", "先")
+        db, _ = self.load_raw([first, retype, bad])
+        # Corrupt the third (unrelated) row's ts directly -- a shape mark_retypes
+        # must never crash on, and must not let poison the valid pair above.
+        db.execute("UPDATE ev SET ts = 'not-a-time' WHERE ts = ?",
+                   ("2026-09-20T12:10:00+0800",))
+        self.assertEqual(analyze.mark_retypes(db), 1)
+
+    def test_a_promoted_row_with_the_same_null_input_as_a_later_row_is_never_marked(self):
+        # Neither event overrides `input`, and the base fixture sets no
+        # default for it -- this is how a legacy row with no code at all
+        # loads: input IS NULL for both. Plain `None == None` equality would
+        # treat that as "same code" and wrongly mark the first as retyped.
+        first = self.event(record_id="fixture-M:e:1", ts="2026-09-20T12:00:00+0800",
+            sel="现", sel_idx=0, top=["现", "先"], sample_every=1, llm_skip="none",
+            llm={"text": "现", "incumbent": "先", "skip": "none", "margin": 1.5})
+        retype = self.event(record_id="fixture-M:e:2", ts="2026-09-20T12:00:06+0800",
+            sel="先", sel_idx=1, top=["现", "先"], sample_every=1, llm_skip="none",
+            llm={"text": "现", "incumbent": "先", "skip": "none", "margin": 1.5})
+        db, _ = self.load_raw([first, retype])
+        rows = db.execute("SELECT input FROM ev").fetchall()
+        self.assertEqual(rows, [(None,), (None,)])
+        self.assertEqual(analyze.mark_retypes(db), 0)
+
+
+    def test_a_retyped_promotion_is_a_rejection_in_every_later_rate(self):
+        # llm_verdict is sel_idx-only at load time; the path split's headline
+        # and the by-margin rate_table both read it, so the retype correction
+        # must reach it too, not only promotion_pairs.
+        first = self._promo(1, "2026-09-20T12:00:00+0800", "现", 0, ["现", "先"], "现", "先")
+        retype = self._promo(2, "2026-09-20T12:00:06+0800", "先", 1, ["现", "先"], "现", "先")
+        db, _ = self.load_raw([first, retype])
+        self.assertEqual(db.execute("SELECT llm_verdict FROM ev ORDER BY ts").fetchall(),
+                         [("accepted",), ("rejected",)])
+        analyze.mark_retypes(db)
+        self.assertEqual(db.execute("SELECT llm_verdict FROM ev ORDER BY ts").fetchall(),
+                         [("rejected",), ("rejected",)])
+
+
+class WordHeadPriorV10(unittest.TestCase):
+    """The analyser's reading of v10's word-head prior fields."""
+
+    # QualityV9's fixture builders, borrowed rather than inherited so its
+    # tests do not run twice.
+    stats = QualityV9.stats
+    event = QualityV9.event
+    load_raw = QualityV9.load_raw
+    _promo = QualityV9._promo
+
+    def blocked(self, i, ts, sel, sel_idx, noprior="现", **kw):
+        # The prior blocked 现: nothing promoted, the head 先 kept.
+        return self.event(record_id=f"fixture-M:e:{100 + i}", ts=ts, input="x", sel=sel,
+            sel_idx=sel_idx, top=["先", "现", "线"], sample_every=1, llm_skip="none",
+            llm={"skip": "margin", "incumbent": "先", "best": "先", "margin": 0.0,
+                 "n_scored": 3, "dropped": [], "prior_delta": -2.5, "prior_changed": True,
+                 "best_noprior": noprior}, **kw)
+
+    def created(self, i, ts, sel, sel_idx):
+        # The prior CREATED a promotion of 先 over the head 现.
+        return self.event(record_id=f"fixture-M:e:{100 + i}", ts=ts, input="x", sel=sel,
+            sel_idx=sel_idx, top=["先", "现"], sample_every=1, llm_skip="none",
+            llm={"skip": "none", "text": "先", "incumbent": "现", "best": "先", "margin": 1.2,
+                 "n_scored": 2, "dropped": [], "prior_delta": 2.0, "prior_changed": True,
+                 "best_noprior": ""})
+
+    def test_best_noprior_is_loaded_and_absent_is_null(self):
+        db, skipped = self.load_raw([self.blocked(1, "2026-09-20T12:00:00+0800", "先", 0),
+                                     self._promo(2, "2026-09-20T13:00:00+0800", "现", 0,
+                                                 ["现", "先"], "现", "先")])
+        self.assertEqual(skipped, 0)
+        self.assertEqual(db.execute("SELECT llm_best_noprior FROM ev ORDER BY ts").fetchall(),
+                         [("现",), (None,)])
+
+    def test_a_prior_blocked_decline_is_not_filed_as_model_agreement(self):
+        db, _ = self.load_raw([self.blocked(1, "2026-09-20T12:00:00+0800", "先", 0)])
+        self.assertEqual(db.execute("SELECT decline_kind FROM ev").fetchone()[0], "prior")
+        split = analyze.decline_split(db)
+        self.assertEqual((split["agreed"], split["blocked"], split["prior"]), (0, 0, 1))
+
+    def test_the_section_splits_blocked_and_created_outcomes(self):
+        rows = [
+            self.blocked(1, "2026-09-20T12:00:00+0800", "先", 0),   # kept head: prior right
+            self.blocked(2, "2026-09-20T12:10:00+0800", "现", 1),   # took blocked: prior wrong
+            self.blocked(3, "2026-09-20T12:20:00+0800", "线", 2),   # other
+            self.created(4, "2026-09-20T12:30:00+0800", "先", 0),   # accepted
+            self.created(5, "2026-09-20T12:40:00+0800", "现", 1),   # rejected
+        ]
+        db, skipped = self.load_raw(rows)
+        self.assertEqual(skipped, 0)
+        analyze.mark_retypes(db)
+        r = analyze.wordhead_prior_split(db)
+        self.assertEqual((r["blocked_right"], r["blocked_wrong"], r["blocked_other"]), (1, 1, 1))
+        self.assertEqual((r["created_accepted"], r["created_rejected"]), (1, 1))
+
+    def test_a_kept_head_retyped_to_the_blocked_challenger_is_the_prior_wrong(self):
+        # Committed 先 (the prior's choice), 5 s later the same code resolves
+        # to 现 -- the promotion the prior blocked. Counting sel alone calls
+        # it "prior right".
+        kept = self.blocked(1, "2026-09-20T12:00:00+0800", "先", 0)
+        retype = self.blocked(2, "2026-09-20T12:00:05+0800", "现", 1)
+        db, _ = self.load_raw([kept, retype])
+        analyze.mark_retypes(db)
+        self.assertEqual(analyze.prior_retypes(db), 1)
+        r = analyze.wordhead_prior_split(db)
+        self.assertEqual((r["blocked_right"], r["blocked_wrong"]), (0, 2))
+
+    def test_a_blocked_row_with_null_input_or_a_late_retype_is_not_marked(self):
+        kept = self.blocked(1, "2026-09-20T12:00:00+0800", "先", 0)
+        late = self.blocked(2, "2026-09-20T12:05:00+0800", "现", 1)
+        db, _ = self.load_raw([kept, late])
+        analyze.mark_retypes(db)
+        self.assertEqual(analyze.prior_retypes(db), 0)
+        db, _ = self.load_raw([kept, self.blocked(3, "2026-09-20T12:00:05+0800", "现", 1)])
+        db.execute("UPDATE ev SET input = NULL")
+        analyze.mark_retypes(db)
+        self.assertEqual(analyze.prior_retypes(db), 0)
+
+    def test_a_prior_retype_leaves_promotion_pairs_alone(self):
+        kept = self.blocked(1, "2026-09-20T12:00:00+0800", "先", 0)
+        retype = self.blocked(2, "2026-09-20T12:00:05+0800", "现", 1)
+        db, _ = self.load_raw([kept, retype])
+        self.assertEqual(analyze.mark_retypes(db), 0)  # the count is promotions only
+        self.assertEqual(analyze.promotion_pairs(db), [])
+        self.assertEqual(db.execute("SELECT SUM(COALESCE(retyped, 0)) FROM ev").fetchone()[0], 0)
 
 
 class ConfusionRegressionCases(unittest.TestCase):

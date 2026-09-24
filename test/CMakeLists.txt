@@ -34,7 +34,8 @@ set(copilot_test_src
   telemetry_test.cc
   tmux_source_test.cc
   tmux_source_util_test.cc
-  warm_cache_test.cc)
+  warm_cache_test.cc
+  wordhead_table_test.cc)
 
 # GTest include dirs are added globally by the librime root CMakeLists.
 #

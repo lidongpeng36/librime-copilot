@@ -82,7 +82,18 @@ namespace telemetry {
 // v9: exact commit outcomes, record/window/session identity, deployment
 // provenance, sampling denominator, and context-gate diagnostics. Old stats
 // cannot supply an exact acceptance denominator and must never be backfilled.
-inline constexpr int kSchemaVersion = 9;
+//
+// v10 adds the word-head prior to Event's `llm` object -- `prior_delta` and
+// `prior_changed`, present only when the prior was applied -- and Rime's own
+// candidate weights `cand_w`/`cand_q`. `best_noprior`, also present only when
+// the prior was applied, is what the model would have promoted without it
+// (empty: nothing) -- `best` is the post-prior pick, so a promotion the prior
+// blocked is otherwise recorded nowhere. `margin` on a v10 line with
+// `prior_delta` present is the margin AFTER the prior; subtract to compare
+// with any earlier line. A segment the prior changed is census (sample_every
+// 1), so v10 promotion and decline counts are not comparable with v9 ones
+// without that in mind.
+inline constexpr int kSchemaVersion = 10;
 
 struct RecordMetadata {
   std::string record_id;
@@ -163,6 +174,25 @@ struct LlmRecord {
                          // single-token candidates decodes nothing and costs
                          // ~0.18ms against ~11ms for one that decodes.
   std::string skip;      // none|disabled|battery|nomodel|noctx|cold|nohan|margin
+  // v10. Whether the word-head prior was applied to this window at all
+  // (wordhead_table.h's window-level gate passed and the weight is > 0). The
+  // two fields after it are meaningful -- and serialised -- only when it is.
+  bool prior_applied = false;
+  float prior_delta = 0.0f;    // Decision::prior_delta: margin - prior_delta is
+                               // the pre-v10 margin
+  bool prior_changed = false;  // the prior changed the verdict, either way;
+                               // telemetry_commit.cc keeps these in full
+  std::string best_noprior;    // the text the no-prior decision would have
+                               // promoted; empty when it would have promoted
+                               // nothing. With prior_changed and nothing
+                               // promoted, this is what the prior BLOCKED.
+  // v10, phase-2 groundwork: Rime's own view of each scored candidate, in
+  // scoring order. `cand_w` is Phrase::weight() of the genuine candidate, or
+  // null when it is not a Phrase; `cand_q` is Candidate::quality(), always.
+  // Two arrays rather than one with a fallback, because they are different
+  // scales and one array mixing them could not be read.
+  std::vector<std::optional<double>> cand_w;
+  std::vector<double> cand_q;
 };
 
 struct Event {
@@ -393,6 +423,29 @@ inline std::string SerializeJsonl(const Event& e) {
     }
     if (e.llm->n_decoded >= 0) {
       l["n_decoded"] = e.llm->n_decoded;
+    }
+    if (e.llm->prior_applied) {
+      l["prior_delta"] = RoundFloat(e.llm->prior_delta);
+      l["prior_changed"] = e.llm->prior_changed;
+      l["best_noprior"] = e.llm->best_noprior;
+    }
+    if (!e.llm->cand_w.empty()) {
+      nlohmann::ordered_json w = nlohmann::ordered_json::array();
+      for (const auto& v : e.llm->cand_w) {
+        if (v) {
+          w.push_back(std::round(*v * 10000.0) / 10000.0);
+        } else {
+          w.push_back(nullptr);
+        }
+      }
+      l["cand_w"] = std::move(w);
+    }
+    if (!e.llm->cand_q.empty()) {
+      nlohmann::ordered_json q = nlohmann::ordered_json::array();
+      for (double v : e.llm->cand_q) {
+        q.push_back(std::round(v * 10000.0) / 10000.0);
+      }
+      l["cand_q"] = std::move(q);
     }
     l["skip"] = e.llm->skip;
     j["llm"] = std::move(l);
