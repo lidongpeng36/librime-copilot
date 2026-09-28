@@ -308,6 +308,76 @@ wedged server to one 50 ms keystroke.
 measurement and the collision are both recorded above, so the work would start
 from the arbitration question rather than from the connection.
 
+### A commit with no composition behind it is DROPPED by winit terminals
+
+Alacritty — and every other winit terminal, the same set whose
+`selectedRange = NSNotFound` is why `tmux_source` exists at all — throws away
+an IME commit that was not preceded by a composition. In the shipped version
+(Alacritty 0.17.0, winit 0.30.13, `src/platform_impl/macos/view.rs:408-415`)
+the gate is one line of comment and one `if`:
+
+```rust
+// Commit only if we have marked text.
+if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
+```
+
+Current winit master replaces `hasMarkedText()` with a `pending_commit` flag
+that is set in exactly one place, `setMarkedText:`, under a comment that states
+the intent: "Only commit via IME if there was a real composition session. Some
+IMEs send insertText for all typing (e.g. spaces, English chars) which should
+go through keyboard input instead of paste." So the newer code drops our commit
+too, deliberately. **Waiting for upstream does not fix this**: PR #4478 (open,
+Korean-IME commits) moves further in the same direction — an `insertText` with
+no composition behind it is routed as ordinary key input, which is exactly how
+the space gets lost. When the commit is dropped the keystroke is then delivered
+as that ordinary key input, so **the character still appears, without whatever
+the plugin wrapped around it**, and nothing anywhere reports a failure.
+
+Every AutoSpacer site that commits from `input.empty()` is therefore inert in
+Alacritty: the ASCII-mode leading space, the bare-digit leading space, and the
+forced full-width punctuation. The sites that go through a composition are
+fine, which is the whole of why this took so long to notice — the same feature
+works or does not work depending on the key that reaches it:
+
+| what the user does | composition first? | in Alacritty |
+| --- | --- | --- |
+| Space-commits Chinese next to Latin (` 好的`) | yes | space kept |
+| Chinese mode, English letters, commits a candidate or Enter | yes | space kept |
+| ASCII mode, a letter after Chinese (`" x"`) | no | **space dropped**, bare `x` lands |
+| a bare digit after Chinese (`" 1"`) | no | **space dropped**, bare `1` lands |
+| a punctuation key in Chinese mode (`＠`, `，`) | no | **commit dropped**, ASCII punctuation lands |
+
+Measured 2026-09-28 with `copilot/surrounding_debug: true` plus a temporary
+probe in the digit branch: the decision was right (`need=1 verdict=1`), the
+committed string was ` 1`, the tmux scrape one keystroke later read
+`❯ 好的1`. The same input through `rime_api_console` — same dylib, same
+schema, bridge-pushed context — commits ` 1` with the space, which is what
+localises the loss past librime. `tmux send-keys ' 1'` into the same pane
+keeps the space, which rules out zsh, tmux and the capture. And the same
+keystrokes in DingTalk and in Chrome put the space in, which rules out
+Squirrel: the receiving application is the only variable left.
+
+**The receiving application is Alacritty even when the text is going to
+Neovim.** Neovim inside tmux inside Alacritty loses the space exactly as the
+shell prompt does; the bridge changes where `before` comes from, never how the
+commit is delivered. A report of "it does not work in nvim either" is therefore
+this same bug and not a second one.
+
+**So a leading space that must survive in a terminal has to ride on a
+composition**, the way `HistorySpaceAction::kPrependSpaceToInput` does
+(`ctx->set_input(" x")` — the space enters the preedit and is committed with
+it). `kCommitWithSpace` and the digit branch cannot work there, and no
+telemetry field would have shown it: the plugin's own view is that it
+committed.
+
+Not fixed. The options, none taken: put the space in the preedit and pay a
+key's delay before it is committed; inject it with `tmux send-keys` into the
+pane the source already identifies, then let the keystroke through; or report
+the condition upstream as too strict for an IME that legitimately commits
+without marked text. The first two both reopen something this tree is careful
+about (UX for one, the pane arbitration for the other), which is why the
+finding is recorded before any of them is built.
+
 ### AutoSpacer's commits and Rime's user dictionary
 
 AutoSpacer emits its own commits (`engine_->CommitText()`), so for a long time
@@ -1282,6 +1352,12 @@ character that counts every word it begins**: 91% of P(安 | 可以) is 安装, 
 words; one key and a commit means a standalone character. A committed promotion
 then lifts 安 in the user dictionary by recency (`formula_d`), so it stays first
 even where the model does not act, which is what made it look persistent.
+
+**In a winit terminal the reported symptom has a second cause, unrelated to
+this one**: the digit branch added in `7bc3a03` decides correctly there and its
+commit is then dropped by Alacritty -- see "A commit with no composition behind
+it is DROPPED by winit terminals". That is about the space, not about which
+candidate is first; the ordering analysis below stands on its own.
 
 `score_candidates --word-end --lexicon` measures the fix: decode the
 candidate's last token too and add `end_logprob = log(1 - P(the next token
