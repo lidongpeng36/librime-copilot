@@ -34,6 +34,16 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     needs: lint
+    # librime is checked out unpinned, and its action-install-linux.sh stopped
+    # apt-installing boost: it now runs install-boost.sh, which builds boost
+    # into $RIME_ROOT/deps/boost and reads `boost_libs` for which libraries to
+    # build. Neither is discoverable by cmake without these two, so the build
+    # failed with "Could NOT find Boost (missing: Boost_INCLUDE_DIR regex)"
+    # from the day upstream changed the script -- on a commit that touched one
+    # Python file. Both values are copied from librime's own linux-build.yml.
+    env:
+      BOOST_ROOT: ${{ github.workspace }}/deps/boost
+      boost_libs: regex
     steps:
       - name: Checkout librime
         uses: actions/checkout@v4
