@@ -23,7 +23,6 @@ DEFAULT_SQUIRREL = Path("/Library/Input Methods/Squirrel.app/Contents/MacOS/Squi
 SOGOU_DICT_NAME = "sogou.dict.yaml"
 PREDICT_DB_NAME = "private.predict.db"
 CONFIG_NAME = "dict.json"
-SHRINK_FLOOR = 0.9
 CLEAN_DIR_NAME = "clean_out"
 CUSTOM_DICT_NAME = "custom.dict.yaml"
 PERSONAL_DICT_NAME = "personal.dict.yaml"
@@ -1189,15 +1188,15 @@ def cmd_fetch(args) -> int:
                        "#   https://pinyin.sogou.com/dict/", "#", "# 包括:", "#",
                        *[f"# * {name}" for name in names]])
 
-    # A partly failed download must not silently shrink the vocabulary.
-    if target.is_file():
-        before = sum(1 for _ in open(target, encoding="utf-8"))
-        after = sum(1 for _ in open(staged, encoding="utf-8"))
-        if after < before * SHRINK_FLOOR:
-            staged.unlink()
-            print(f"refusing to overwrite: {after} lines is under "
-                 f"{SHRINK_FLOOR:.0%} of {before}")
-            return 1
+    # No size comparison against the existing file. There was one -- refuse
+    # when the rebuild came out under 90% of what was there -- and it fired
+    # for a year on a legitimate shrink: Sogou's 网络流行新词 is
+    # "自动生成的流行新词，每周更新" and went from 127,036 entries to 6,582,
+    # while the other three dictionaries unpacked byte-identically. What the
+    # guard was for is already covered upstream of it: download_all raises
+    # unless every download succeeded, and each file is validated against
+    # SCEL_MAGIC and MIN_SCEL_SIZE before it reaches disk. So a short rebuild
+    # now means the source is short, and the caller asked for the source.
     staged.replace(target)
     print(f"{written} entries -> {target}")
     return 0
