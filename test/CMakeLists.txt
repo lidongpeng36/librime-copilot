@@ -2,6 +2,26 @@ set(EXECUTABLE_OUTPUT_PATH ${CMAKE_CURRENT_BINARY_DIR})
 
 include_directories(../src)
 
+# Keep a partial X11/keysym.h from shadowing librime's bundled one.
+#
+# librime's root CMakeLists does find_path(X11Keysym X11/keysym.h), and on
+# macOS that can resolve to the SDK's Tk.framework/Headers, whose keysym.h
+# enables only six keysym groups -- no XK_XKB_KEYS, so no XK_ISO_Enter. The
+# plugin objects never notice: librime's own include/ reaches them as a plain
+# -I ahead of it. This target does not: the GTest imported target marks
+# include/ as a SYSTEM directory, clang searches every -I before any -isystem,
+# and Tk's copy wins. The failure is `use of undeclared identifier
+# 'XK_ISO_Enter'` in caret_witness_test.cc, which names neither Tk nor the
+# include order. Measured 2026-09-29.
+#
+# librime ships a complete X11/keysym.h in include/, so the found one is
+# redundant here whenever that exists.
+if(X11Keysym AND EXISTS "${rime_SOURCE_DIR}/include/X11/keysym.h")
+  get_property(_copilot_test_includes DIRECTORY PROPERTY INCLUDE_DIRECTORIES)
+  list(REMOVE_ITEM _copilot_test_includes "${X11Keysym}")
+  set_property(DIRECTORY PROPERTY INCLUDE_DIRECTORIES ${_copilot_test_includes})
+endif()
+
 set(copilot_test_src
   test_main.cc
   auto_spacer_util_test.cc
