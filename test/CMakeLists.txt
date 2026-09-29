@@ -15,8 +15,11 @@ include_directories(../src)
 # include order. Measured 2026-09-29.
 #
 # librime ships a complete X11/keysym.h in include/, so the found one is
-# redundant here whenever that exists.
-if(X11Keysym AND EXISTS "${rime_SOURCE_DIR}/include/X11/keysym.h")
+# redundant here whenever that exists -- unless the found one IS include/,
+# which is what Linux CI finds; removing it there drops darts.h and every
+# other bundled header with it.
+if(X11Keysym AND EXISTS "${rime_SOURCE_DIR}/include/X11/keysym.h"
+   AND NOT X11Keysym STREQUAL "${rime_SOURCE_DIR}/include")
   get_property(_copilot_test_includes DIRECTORY PROPERTY INCLUDE_DIRECTORIES)
   list(REMOVE_ITEM _copilot_test_includes "${X11Keysym}")
   set_property(DIRECTORY PROPERTY INCLUDE_DIRECTORIES ${_copilot_test_includes})
