@@ -378,6 +378,47 @@ without marked text. The first two both reopen something this tree is careful
 about (UX for one, the pane arbitration for the other), which is why the
 finding is recorded before any of them is built.
 
+### The commit witness has to notice the caret moving, and a modified newline is invisible to it
+
+When the screen and `commit_history` disagree about what is left of the caret,
+`ResolveBoundaryBefore` (`auto_spacer_util.h`) prefers the history: over ssh the
+tmux scrape was measured frozen for ~1.5 s while typing continued, so a
+disagreement usually means the screen is behind. That is only sound while the
+caret has not moved for some other reason, which is what
+`LocalCommitStillAtCaret` vouches for -- and the keys that cleared the witness
+were the arrows, Tab, the readline bindings and the delete keys.
+
+Reported 2026-09-29, in codex inside tmux inside WezTerm: in Chinese mode,
+press the composer's newline after Chinese and type a digit, and the digit
+gets a leading space at the start of the new line. The caret lands on a fresh,
+indented row, so the scrape reports blanks before it -- correctly -- and that
+reads as "the screen has not caught up", so the previous line's Chinese is
+substituted and earns the digit a space.
+
+Three things about it are worth keeping:
+
+- **A modified newline records nothing, and that is what makes this
+  reachable.** librime records an unhandled printable key as `{"thru", ch}`
+  only when it has no modifier (`commit_history.cc`), so a bare Return IS
+  recorded, `\r` is whitespace, and every spacing predicate refuses after
+  whitespace. codex takes Shift+Enter; a terminal sends Ctrl+J. Both carry a
+  modifier, both record nothing, and the witness therefore still names the
+  Chinese. **A reproduction that presses plain Enter shows nothing wrong** --
+  the first one written for this bug did exactly that and cleared the fix of
+  causing the change.
+- **Home/End/Page Up/Page Down were never covered either.** The old test was
+  `XK_Left <= k <= XK_Down` (0xff51-0xff54), and Home is 0xff50 while
+  End/Page Up/Page Down are 0xff55-0xff57 -- the range brackets them on both
+  sides.
+- **Alacritty cannot show any of this.** winit drops a commit with no
+  composition behind it (see above), so the same wrong decision is invisible
+  there; WezTerm is not winit, and that asymmetry is what the report came with.
+
+`CaretLeavesLastCommit` (`auto_spacer.h`) is now the single predicate that
+site uses, and `test/caret_witness_test.cc` pins the whole set -- including the
+keys that must NOT clear it, since the witness exists for exactly the next
+keystroke after a commit.
+
 ### AutoSpacer's commits and Rime's user dictionary
 
 AutoSpacer emits its own commits (`engine_->CommitText()`), so for a long time

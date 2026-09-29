@@ -26,6 +26,19 @@ class Context;
 // chance to pick 枢.
 bool SelectionLeavesUnconvertedInput(Context* ctx, const an<Candidate>& cand);
 
+// Whether `key_event` leaves the caret somewhere our own last commit is no
+// longer immediately to the left of it, so a `LocalCommitWitness` taken before
+// it must be dropped (auto_spacer_util.h). Arrows, Tab, the readline bindings
+// and the delete keys were always here; NEWLINES and the caret jumps
+// (Home/End/Page Up/Page Down) were not, and the miss was reachable rather
+// than theoretical -- see test/caret_witness_test.cc for the codex case that
+// found it.
+//
+// Declared here so it can be driven with real KeyEvents from a test; the
+// spacing predicates it serves stay in auto_spacer_util.h, which is
+// deliberately free of Rime types.
+bool CaretLeavesLastCommit(const KeyEvent& key_event);
+
 // Compute the text to commit when Space finalizes the current composition,
 // including CJK/Latin auto-spacing against the surrounding `before`/`after`.
 //

@@ -144,6 +144,29 @@ inline bool IsNavigating(const KeyEvent& key_event) {
           keycode == XK_n || keycode == XK_p);
 }
 
+// A newline, or a jump the arrow range never covered: XK_Home (0xff50) sits
+// just below XK_Left and End/Page Up/Page Down just above XK_Down, so
+// `Left <= k <= Down` missed all four. Ctrl+J is the character a terminal
+// sends for a newline; modifiers are ignored on Return because Shift+Enter and
+// Alt+Enter are how TUI composers take one.
+inline bool IsNewlineOrCaretJump(const KeyEvent& key_event) {
+  const auto keycode = key_event.keycode();
+  switch (keycode) {
+    case XK_Return:
+    case XK_KP_Enter:
+    case XK_ISO_Enter:
+    case XK_Linefeed:
+    case XK_Home:
+    case XK_End:
+    case XK_Page_Up:
+    case XK_Page_Down:
+      return true;
+    default:
+      break;
+  }
+  return key_event.ctrl() && keycode == XK_j;
+}
+
 // How long after a commit a screen that disagrees with it is still assumed to
 // be lagging rather than showing a caret that moved. Over ssh the tmux scrape
 // was measured frozen for ~1.5 s while typing continued.
@@ -201,6 +224,10 @@ AutoSpacer::AutoSpacer(const Ticket& ticket, CommitCallback on_commit)
   if (auto* config = engine_->schema()->config()) {
     config->GetBool("copilot/auto_spacer/enable_right_space", &enable_right_space_);
   }
+}
+
+bool CaretLeavesLastCommit(const KeyEvent& key_event) {
+  return IsNavigating(key_event) || IsDelete(key_event) || IsNewlineOrCaretJump(key_event);
 }
 
 ProcessResult AutoSpacer::HandleNumberKey(Context* ctx, const KeyEvent& key_event) const {
@@ -306,7 +333,7 @@ ProcessResult AutoSpacer::ProcessWithSurroundingContext(Context* ctx, const KeyE
     seen_history_size_ = history_size;
     commit_witness_ = LocalCommitWitness{latest_text, prev_client_key_, prev_key_ms_};
   }
-  if (IsNavigating(key_event) || IsDelete(key_event)) {
+  if (CaretLeavesLastCommit(key_event)) {
     commit_witness_ = LocalCommitWitness{};
   }
   prev_client_key_ = effective_client_key;
