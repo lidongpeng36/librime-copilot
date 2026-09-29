@@ -31,37 +31,11 @@ jobs:
       - name: Python tool tests
         run: python3 -m unittest discover -s tools/test -p '*_test.py' -v
 
-  build:
-    runs-on: ubuntu-24.04
-    needs: lint
-    # librime is checked out unpinned, and its action-install-linux.sh stopped
-    # apt-installing boost: it now runs install-boost.sh, which builds boost
-    # into $RIME_ROOT/deps/boost and reads `boost_libs` for which libraries to
-    # build. Neither is discoverable by cmake without these two, so the build
-    # failed with "Could NOT find Boost (missing: Boost_INCLUDE_DIR regex)"
-    # from the day upstream changed the script -- on a commit that touched one
-    # Python file. Both values are copied from librime's own linux-build.yml.
-    env:
-      BOOST_ROOT: ${{ github.workspace }}/deps/boost
-      boost_libs: regex
-    steps:
-      - name: Checkout librime
-        uses: actions/checkout@v4
-        with:
-          repository: rime/librime
 
-      - name: Checkout last commit
-        uses: actions/checkout@v4
-        with:
-          path: plugins/copilot
-
-      - name: Install dependency
-        run: ./action-install-linux.sh
-
-      - name: Build librime with plugin
-        run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_ASAN=ON
-          cmake --build build
-
-      - name: Run plugin unit tests
-        run: ctest --test-dir build -R copilot_test --output-on-failure
+  # There is no build job, deliberately (2026-09-30). It checked out librime
+  # unpinned on ubuntu and built the plugin with ASAN, and it went red far more
+  # often for reasons that were not this repo's -- upstream moving boost out of
+  # apt, a Linux-only include-path difference -- than for a real regression.
+  # The plugin only ships on macOS. Build and run copilot_test locally before
+  # pushing (CLAUDE.md, "Build & lint"); this workflow gates lint and the
+  # Python tool tests only.

@@ -48,7 +48,9 @@ symlink rather than copying, or the two diverge.
 
 ## Build & lint
 
-Mirror CI (`.github/workflows/ci.yml`) — check out librime and nest this repo under `plugins/copilot`:
+Check out librime and nest this repo under `plugins/copilot`. **CI does not
+build the plugin** (see below), so this build and `copilot_test` are run
+locally, before pushing, or not at all:
 
 ```sh
 # from a fresh librime checkout, with this repo at plugins/copilot
@@ -57,10 +59,10 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_ASAN=ON
 cmake --build build
 ```
 
-- **That command mirrors CI, and CI does not need the deployable dylib.**
+- **That command is what the removed CI build job ran, and it does not produce the deployable dylib.**
   `BUILD_MERGED_PLUGINS` is librime's own option and defaults to **ON**
   (librime `CMakeLists.txt:16`), which folds the plugin into `librime.dylib`
-  and emits no `lib/rime-plugins/` at all. CI is fine that way — `copilot_test`
+  and emits no `lib/rime-plugins/` at all. Tests are fine that way — `copilot_test`
   links the plugin objects directly — but every deploy recipe below copies
   `build/lib/rime-plugins/librime-copilot.dylib`, so **a tree configured with
   the command above has nothing to copy.** For a tree you will deploy from:
@@ -102,7 +104,11 @@ cmake --build build
   `test/ime_bridge_socket_test.cc` is the one exception to "pure logic": it stands up a real
   `ImeBridgeServer` on a Unix socket (no Rime engine) to cover the parts that only exist over
   a real connection — the greeting, connection refcounting, `Stop()` draining.
-  CI runs lint + build-with-ASAN + the GTest suite. The Neovim client's Lua specs
+  **CI runs lint and the Python tool tests only.** The Linux build-with-ASAN +
+  GTest job was removed on 2026-09-30: it checked out librime unpinned, and it
+  failed on upstream changes (boost leaving apt) and Linux-only include-path
+  differences more often than on regressions. The plugin ships only on macOS,
+  so the local macOS build + `ctest` is the gate. The Neovim client's Lua specs
   (`endpoint_spec.lua`, `verify_spec.lua`) moved with it to `rime-copilot-clients` and run
   there — this repo has no Lua tests of its own any more.
 
@@ -111,7 +117,8 @@ cmake --build build
 `src/imk_client.mm` (Objective-C++, IMK integration for surrounding text) is compiled
 **only on Apple** — `CMakeLists.txt` explicitly `REMOVE_ITEM`s it from the auto-globbed
 sources and re-adds it under `if(APPLE)`. When editing macOS-only code, keep it out of the
-default source set so Linux CI (no ObjC++ toolchain) still builds.
+default source set so a Linux build (no ObjC++ toolchain) still works — CI no
+longer checks that, so nothing will tell you if it stops.
 
 ## Architecture
 
@@ -586,7 +593,7 @@ to `score_candidates`'s CMake target to reach `copilot::UTF8` for the new
 alignment code, and that made the target's *link* silently depend on
 `CMAKE_BUILD_TYPE`: `history.cc` calls glog's `DLOG(INFO)`, which expands to a
 real, glog-linking `LOG()` whenever `NDEBUG` is undefined. This file's own
-"Build & lint" command does not reproduce it, and neither does CI — both pass
+"Build & lint" command does not reproduce it, and neither did CI — both passed
 `-DCMAKE_BUILD_TYPE=Release`, which defines `NDEBUG`. The failure needs a
 configure with **no** `CMAKE_BUILD_TYPE` at all, which is what a plain
 `cmake -B build` gives and nothing documented here ever passes — precisely why
