@@ -1210,7 +1210,23 @@ class QualityV9(unittest.TestCase):
                 llm={"text": "甲", "incumbent": "乙", "skip": "none", "margin": 1.5}))
         db, skipped = self.load_raw(events)
         self.assertEqual(skipped, 0)
-        self.assertEqual(analyze.promotion_pairs(db), [('<2', 3, 1, 1, 1)])
+        self.assertEqual(analyze.promotion_pairs(db), [('1.5-2', 3, 1, 1, 1)])
+
+    def test_paired_promotions_resolve_the_band_the_threshold_sits_in(self):
+        # One '<2' band hid where promotions stop paying: the deployed margin
+        # is 1.0 and the question is what 1.5 or 2.0 would shed. Each edge is
+        # inclusive below, so a margin exactly on a threshold belongs to the
+        # band that threshold would KEEP.
+        events = []
+        for i, margin in enumerate([1.0, 1.49, 1.5, 2.0, 2.5, 3.0, 5.0]):
+            events.append(self.event(record_id=f"fixture-M:e:{i}", sel="甲", sel_idx=0,
+                top=["甲", "乙"], sample_every=1,
+                llm={"text": "甲", "incumbent": "乙", "skip": "none", "margin": margin}))
+        db, skipped = self.load_raw(events)
+        self.assertEqual(skipped, 0)
+        self.assertEqual([(band, n) for band, n, *_ in analyze.promotion_pairs(db)],
+                         [('<1.5', 2), ('1.5-2', 1), ('2-2.5', 1), ('2.5-3', 1),
+                          ('3-5', 1), ('5+', 1)])
 
     def test_v10_prior_fields_are_loaded_and_absent_is_null(self):
         with_prior = self.event(record_id="fixture-M:e:1", sel="先", sel_idx=0, sample_every=1,
@@ -1255,7 +1271,7 @@ class QualityV9(unittest.TestCase):
         db, _ = self.load_raw([first, retype])
         self.assertEqual(analyze.mark_retypes(db), 1)
         # Before: first counted as helped. After: both are hurt.
-        self.assertEqual(analyze.promotion_pairs(db), [('<2', 2, 0, 2, 0)])
+        self.assertEqual(analyze.promotion_pairs(db), [('1.5-2', 2, 0, 2, 0)])
 
     def test_a_retype_outside_the_window_or_to_a_third_candidate_is_not_harm(self):
         first = self._promo(1, "2026-09-20T12:00:00+0800", "现", 0, ["现", "先", "线"], "现", "先")

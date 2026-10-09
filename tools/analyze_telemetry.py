@@ -514,7 +514,8 @@ def promotion_pairs(db):
     cols = [r[1] for r in db.execute("PRAGMA table_info(ev)")]
     retyped = "COALESCE(retyped, 0)" if "retyped" in cols else "0"
     return db.execute(f"""SELECT
-        CASE WHEN llm_margin<2 THEN '<2' WHEN llm_margin<3 THEN '2-3'
+        CASE WHEN llm_margin<1.5 THEN '<1.5' WHEN llm_margin<2 THEN '1.5-2'
+             WHEN llm_margin<2.5 THEN '2-2.5' WHEN llm_margin<3 THEN '2.5-3'
              WHEN llm_margin<5 THEN '3-5' ELSE '5+' END AS band,
         COUNT(*),
         SUM(sel=llm_text AND {retyped}=0),
@@ -526,9 +527,14 @@ def promotion_pairs(db):
 
 def _print_promotion_pairs(db):
     print("\n  Paired LLM promotion outcomes (fixed selected-text assumption, not causal lift):")
-    print("  margin       n   picked promoted   picked incumbent   picked other   net")
+    print("  margin       n   picked promoted   picked incumbent   picked other   net   promoted share")
     for band, n, helped, hurt, other in promotion_pairs(db):
-        print(f"  {band:<8}{n:>6}{helped:>18}{hurt:>19}{other:>15}{helped-hurt:>6}")
+        decided = helped + hurt
+        share = f"{helped / decided:>16.0%}" if decided else f"{'--':>16}"
+        print(f"  {band:<8}{n:>6}{helped:>18}{hurt:>19}{other:>15}{helped-hurt:>6}{share}")
+    print("  Promotions are census, so both columns are counted at the same rate. A band whose")
+    print("  promoted share sits near 50% is not paying for its promotions. Retrospective: it says")
+    print("  where to look, and a threshold change still has to be confirmed prospectively.")
 
 
 def load(paths, since=None, until=None, machine=None, config_id=None):
