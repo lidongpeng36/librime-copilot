@@ -1320,6 +1320,92 @@ behaviour and is left for real use — or a better instrument — to decide:
   between bands were made with one ruler and still order the same way; the
   absolute rates do not hold.
 
+  **Re-measured 2026-10-09 with the retype-corrected ruler, the band 1.0
+  unlocked is a coin flip, and the 66% above does not survive.** 1369
+  promotions on three machines (2026-08-17 -> 10-09), `promotion_pairs`, which
+  now resolves the bands the threshold sits among. "Share" is picked-promoted
+  over picked-promoted plus picked-incumbent; a retype counts as incumbent:
+
+  | margin | promotions | promoted | incumbent | net | share |
+  | --- | --- | --- | --- | --- | --- |
+  | <1.5 | 284 | 123 | 150 | -27 | 45% |
+  | 1.5-2 | 239 | 114 | 116 | -2 | 50% |
+  | 2-2.5 | 211 | 109 | 91 | +18 | 55% |
+  | 2.5-3 | 151 | 92 | 46 | +46 | 67% |
+  | 3-5 | 297 | 230 | 58 | +172 | 80% |
+  | 5+ | 187 | 178 | 7 | +171 | 96% |
+
+  So the margin is a steep, well-ordered signal above 2.5 and flat below 2.0,
+  and 38% of all promotions sit in the flat part. Below 2.0 it is 237 against
+  266, net -29, which on its own is not significant (p ~ 0.2) -- **the
+  measurement says those promotions buy nothing, not that they cost**. The
+  shape is the same after the word-head prior shipped (2026-09-24 on: 37
+  against 40 below 2.0) and in every slice tried that holds more than 30
+  promotions: by keys typed, by context length, by surrounding-text source, by
+  promoted-from position, the [1, 2) band reads 39-52%. Promotions are census, so unlike `decline_split` both
+  columns here are counted at the same rate.
+
+  **The shipped value stays 1.0.** Decided 2026-10-09: a retrospective net of
+  -29 at p ~ 0.2 is not a reason to move a threshold, and this file's own rule
+  is that a threshold change is confirmed prospectively.
+
+  **The offline ruler is about 15 points optimistic in exactly this band, and
+  that is what moved the margin to 1.0 in the first place.** The same rule
+  replayed over the evalset (8206 segments, `rime40m-v2-q8.gguf`,
+  `score_candidates`, word-head prior on) against the live table:
+
+  | margin | offline share | live share |
+  | --- | --- | --- |
+  | 1-1.5 | 57% | 45% |
+  | 1.5-2 | 69% | 50% |
+  | 2-2.5 | 73% | 55% |
+  | 2.5-3 | 81% | 67% |
+  | 3-5 | 85% | 80% |
+  | 5+ | 95% | 96% |
+
+  Offline, margin 1.0 beats 2.0 (held-out later half: net +225 against +213);
+  live, nothing below 2.0 pays. The two agree only where the model is sure.
+  Three explanations were tested and none carries it:
+
+  - **The eval arm's empty user dictionary** -- a weaker incumbent is easier to
+    beat. Split by time at 2025-03-01, warm on the earlier 2827 utterances,
+    measure the later 2601 with no reset (`run_warmed_arm`): the [1, 2) band
+    goes 70% cold -> 63% warm, against 47% live. Right direction, a third of
+    the gap, and not significant on its own. Note the "cold" arm is not cold
+    either: it self-trains over the half it is measuring.
+  - **The word-head prior**, since most of the live log predates it: replayed
+    offline with the prior off, the single-character [1, 2) band is 59%
+    against 58% with it on.
+  - **One population dragging the rest**: see the slices above. The worst live
+    slice is one-syllable input at 39%; its offline counterpart is 58%.
+
+  Not tested, and all that is left: the live user dictionary has learned from
+  everything typed in every application, not from 2827 messages; replay types a
+  maximal Han run where a person types word by word, so the candidate windows
+  differ; and 72% of live fetches come from a terminal while the corpus is IM
+  and prompts. **Until one of those is shown, an offline net or an offline
+  threshold in the low-margin band is not evidence about live use.** A paired
+  offline comparison of two MODELS is still sound -- both face the same bias --
+  which is the only thing the evalset should be trusted for here.
+
+  **A window softmax separates slightly better than the margin, and is not
+  worth building.** The idea came from decision models that return a
+  probability over the options (TypeSafe's Jev and its open reproductions):
+  threshold on `p(best)` over the scored window rather than on a difference of
+  two scores. Over the 1516 evalset windows where the model prefers a
+  challenger, AUROC for gain-against-loss is 0.744 for the margin, 0.766 for
+  `p(best)`, 0.768 for window entropy; restricted to margin < 2.5 every signal
+  sits at 0.62-0.68. At the deployed promotion count `p(best)` is worth +19 net
+  of 8206 segments (0.23%), bootstrap 95% interval -8 to +46. What it buys is
+  mostly neutral promotions exchanged for decided ones (margin-only: 38 gain /
+  37 loss / 52 neither; `p(best)`-only: 69 / 49 / 9) -- it notices the model
+  splitting its mass among wrong answers. Live telemetry cannot re-check it:
+  the log carries `margin` and no per-candidate scores, so it would need a
+  schema bump first. **No score-derived signal makes the low-margin band pay;
+  the limit there is what the model knows, not how its output is thresholded.**
+  The scripts are kept locally (see "Where the design records live"):
+  `scripts/2026-10-09-margin-calibration/`.
+
   `analyze_telemetry.py` now prints the pair (`_print_threshold_table`), never
   either half, and checks the `sample_ok` it was told against the factor the
   stats lines imply (`implied_sample_ok` — the stats stream counts every
